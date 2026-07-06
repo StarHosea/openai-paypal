@@ -827,6 +827,14 @@ def _navigator_probe_names() -> list[str]:
     ]
 
 
+def _mtr_date_pair(dfp: dict[str, object], *, now_ms: int, timezone_offset: int) -> list[int]:
+    raw = dfp.get("mtr_s45") or dfp.get("date_pair")
+    if isinstance(raw, list) and len(raw) >= 2:
+        values = cast(list[object], raw)
+        return [_int_value(values[0]), _int_value(values[1])]
+    return [now_ms, now_ms - timezone_offset * 60 * 1000]
+
+
 def _build_mtr_js_like_signals(
     state: _MtrState,
     *,
@@ -853,7 +861,7 @@ def _build_mtr_js_like_signals(
     timezone_offset = _int_value(profile.get("timezone_offset_minutes"), 180)
     heap_limit = _int_value(dfp.get("js_heap_size_limit"), 4_395_630_592)
     device_pixel_ratio = _float_value(profile.get("device_pixel_ratio"), 1.0)
-    now_ms = int(time.time() * 1000)
+    now_ms = _int_value(dfp.get("mtr_now_ms"), int(time.time() * 1000))
     script_url = state.mtr_dfp_script_url or DEFAULT_DFP_SCRIPT_URL
     canvas_hash = _str_value(dfp.get("cv_sig"), "cf845af5c17f8505dbe10c1afc548dcd")
     canvas_geometry_hash = _str_value(dfp.get("canvas_geometry_hash"), "2179b48bae2d564d33eadf7e35c993d8")
@@ -900,7 +908,7 @@ def _build_mtr_js_like_signals(
         "s42": 0,
         "s43": False,
         "s44": False,
-        "s45": [now_ms, now_ms - timezone_offset * 60 * 1000],
+        "s45": _mtr_date_pair(dfp, now_ms=now_ms, timezone_offset=timezone_offset),
         "s46": canvas_hash,
         "s48": s48_values,
         "s49": [0.09999999962747097, 0.10000000055879354],
@@ -1002,7 +1010,7 @@ def _build_mtr_js_like_signals(
         "s163": True,
         "s165": {"isTrusted": False},
         "s166": {"l": 80, "p": [{"i": 21, "n": "onLine"}, {"i": 22, "n": "webdriver"}, {"i": 27, "n": "getGamepads"}]},
-        "s200": float(now_ms) + 0.8,
+        "s200": _float_value(dfp.get("mtr_s200"), float(now_ms) + 0.8),
         "s201": False,
         "s202": language,
     }
