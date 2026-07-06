@@ -854,7 +854,6 @@ def _build_mtr_js_like_signals(
     heap_limit = _int_value(dfp.get("js_heap_size_limit"), 4_395_630_592)
     device_pixel_ratio = _float_value(profile.get("device_pixel_ratio"), 1.0)
     now_ms = int(time.time() * 1000)
-    timings = _timing_module(dfp)
     script_url = state.mtr_dfp_script_url or DEFAULT_DFP_SCRIPT_URL
     canvas_hash = _str_value(dfp.get("cv_sig"), "cf845af5c17f8505dbe10c1afc548dcd")
     canvas_geometry_hash = _str_value(dfp.get("canvas_geometry_hash"), "2179b48bae2d564d33eadf7e35c993d8")
@@ -943,7 +942,7 @@ def _build_mtr_js_like_signals(
             "parameters": _str_value(dfp.get("webgl_parameters_hash"), "57a2cddb99538d50a0138430ed0720c5"),
             "parameters2": _str_value(dfp.get("webgl_parameters2_hash"), "3649a5f2a375c04762da32de699eb915"),
             "shaderPrecisions": _str_value(dfp.get("webgl_shader_precisions_hash"), "38a06fe03c499fb674a257f2e361878a"),
-            "extensions": webgl_hash,
+            "extensions": _str_value(dfp.get("webgl_extensions_hash"), "a96513a0dc5a765b2c5cc7b5cc6d7c18"),
             "extensionParameters": _str_value(dfp.get("webgl_extension_parameters_hash"), "f40866fd9bd8241231c0fe773d5f67fe"),
             "extensionParameters2": _str_value(dfp.get("webgl_extension_parameters2_hash"), "003f43d00ddcea29c1b1a9be057f4f31"),
             "unsupportedExtensions": [],
