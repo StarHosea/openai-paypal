@@ -156,6 +156,8 @@ class RoxyCaptureConfig:
     workspace_id: int | None = None
     project_id: int | None = None
     headless: bool = True
+    force_open: bool = False
+    close_before_open: bool = False
     timeout_seconds: float = 12.0
     close_after_capture: bool = True
     delete_after_capture: bool = True
@@ -186,12 +188,15 @@ def load_roxy_capture_config(proxy_url: str | None = None) -> RoxyCaptureConfig:
         str(BROWSER_PROFILE.get("timezone") or "America/Sao_Paulo"),
         int(BROWSER_PROFILE.get("timezone_offset_minutes") or 180),
     )
+    headless = _env_bool("PAYPAL_ROXY_HEADLESS", ROXY_HEADLESS)
     return RoxyCaptureConfig(
         api_base=api_base,
         api_key=configured_roxy_api_key(),
         workspace_id=_env_int("PAYPAL_ROXY_WORKSPACE_ID", ROXY_WORKSPACE_ID),
         project_id=_env_int("PAYPAL_ROXY_PROJECT_ID", ROXY_PROJECT_ID),
-        headless=_env_bool("PAYPAL_ROXY_HEADLESS", ROXY_HEADLESS),
+        headless=headless,
+        force_open=_env_bool("PAYPAL_ROXY_FORCE_OPEN", False),
+        close_before_open=_env_bool("PAYPAL_ROXY_CLOSE_BEFORE_OPEN", False),
         timeout_seconds=max(2.0, _env_float("PAYPAL_ROXY_API_TIMEOUT_SECONDS", 12.0)),
         close_after_capture=_env_bool("PAYPAL_ROXY_CLOSE_AFTER_CAPTURE", True),
         delete_after_capture=_env_bool("PAYPAL_ROXY_DELETE_AFTER_CAPTURE", True),
@@ -206,7 +211,11 @@ def load_roxy_capture_config(proxy_url: str | None = None) -> RoxyCaptureConfig:
         core_version=_env_str("PAYPAL_ROXY_CORE_VERSION", ""),
         os_name=_env_str("PAYPAL_ROXY_OS", "Windows"),
         os_version=_env_str("PAYPAL_ROXY_OS_VERSION", "11"),
-        proxy_url=(proxy_url or _env_str("PAYPAL_ROXY_PROXY_URL") or "").strip(),
+        # `proxy_url` is tri-state:
+        #   None => standalone/default mode may use PAYPAL_ROXY_PROXY_URL;
+        #   ""   => explicit no-proxy, used when the Web/CLI flow disables proxy;
+        #   URL  => use the exact same proxy as the HTTP session.
+        proxy_url=(str(proxy_url).strip() if proxy_url is not None else _env_str("PAYPAL_ROXY_PROXY_URL")),
     )
 
 
@@ -254,6 +263,7 @@ class RoxyApiClient:
         return workspace_id, project_id
 
     def create_profile(self, workspace_id: int, project_id: int | None) -> str:
+        proxy_info = _roxy_proxy_info(self.config.proxy_url)
         payload: dict[str, Any] = {
             "workspaceId": workspace_id,
             "windowName": f"paypal-fp-{uuid.uuid4().hex[:10]}",
@@ -264,7 +274,7 @@ class RoxyApiClient:
             "searchEngine": "Google",
             "defaultOpenUrl": ["about:blank"],
             "windowRemark": "paypal runtime fingerprint capture",
-            "proxyInfo": _roxy_proxy_info(self.config.proxy_url),
+            "proxyInfo": proxy_info,
             "fingerInfo": {
                 "isLanguageBaseIp": self.config.follow_ip,
                 "language": self.config.language,
@@ -332,6 +342,13 @@ class RoxyApiClient:
             payload["coreVersion"] = self.config.core_version
         if project_id is not None:
             payload["projectId"] = project_id
+        logger.debug(
+            "Creating Roxy profile workspace_id={} project_id={} proxy={} category={}",
+            workspace_id,
+            project_id,
+            _redact_proxy_url(self.config.proxy_url) or "noproxy",
+            proxy_info.get("proxyCategory"),
+        )
         response = self.request("POST", "/browser/create", json=payload)
         dir_id = ((response.get("data") or {}).get("dirId") or "").strip()
         if not dir_id:
@@ -342,17 +359,29 @@ class RoxyApiClient:
         self.request("POST", "/browser/random_env", json={"workspaceId": workspace_id, "dirId": dir_id})
 
     def open_profile(self, workspace_id: int, dir_id: str) -> dict[str, Any]:
-        # Roxy 的 Local API 用 `headless` 字段控制无头模式。不要把
-        # `--headless` 写进 args：Roxy 文档说明部分内置/启动参数会被软件接管，
-        # 用参数开关反而可能仍拉起可见窗口。
+        # Roxy 的 Local API 用 `headless` 字段控制无头模式。当前默认直接打开：
+        # 不先 close，不强制 forceOpen；如需处理旧可见窗口复用，可通过环境变量
+        # PAYPAL_ROXY_CLOSE_BEFORE_OPEN / PAYPAL_ROXY_FORCE_OPEN 显式开启。
         args = ["--remote-allow-origins=*", "--disable-audio-output"]
+        if self.config.headless and self.config.close_before_open:
+            try:
+                self.close_profile(dir_id)
+            except Exception as exc:
+                logger.debug("Roxy pre-open close skipped/failed for {}: {}", dir_id, exc)
         payload = {
             "workspaceId": workspace_id,
             "dirId": dir_id,
             "args": args,
-            "forceOpen": False,
-            "headless": bool(self.config.headless),
+            "forceOpen": bool(self.config.force_open),
+            "headless": True if self.config.headless else False,
         }
+        logger.debug(
+            "Opening Roxy browser dir_id={} headless={} forceOpen={} args={}",
+            dir_id,
+            payload["headless"],
+            payload["forceOpen"],
+            args,
+        )
         response = self.request("POST", "/browser/open", json=payload)
         data = response.get("data") or {}
         if not data.get("ws") and not data.get("http"):
@@ -378,6 +407,52 @@ def _sha256_hex(value: Any) -> str:
     if not isinstance(value, (bytes, bytearray)):
         value = str(value).encode("utf-8", "ignore")
     return hashlib.sha256(value).hexdigest()
+
+
+def _canonical_proxy_url(proxy_url: object = None) -> str:
+    return str(proxy_url or "").strip()
+
+
+def _redact_proxy_url(proxy_url: object = None) -> str:
+    value = _canonical_proxy_url(proxy_url)
+    if not value:
+        return ""
+    try:
+        parsed = urllib.parse.urlsplit(value)
+    except Exception:
+        return value
+    if not parsed.hostname:
+        return value
+    netloc = parsed.hostname
+    if parsed.port:
+        netloc = f"{netloc}:{parsed.port}"
+    if parsed.username:
+        netloc = f"{urllib.parse.unquote(parsed.username)}:***@{netloc}"
+    return urllib.parse.urlunsplit((parsed.scheme or "http", netloc, parsed.path, parsed.query, parsed.fragment))
+
+
+def _proxy_url_hash(proxy_url: object = None) -> str:
+    return _sha256_hex(_canonical_proxy_url(proxy_url))
+
+
+def roxy_browser_matches_proxy(roxy_browser: dict[str, Any], proxy_url: object = None) -> bool:
+    """Return True when an existing Roxy browser was created for this proxy.
+
+    This prevents reusing a browser profile opened with a different outbound IP
+    from the HTTP session/proxy used by the protocol flow.
+    """
+    expected_hash = _proxy_url_hash(proxy_url)
+    if not isinstance(roxy_browser, dict):
+        return expected_hash == _proxy_url_hash("")
+    actual_hash = str(roxy_browser.get("proxy_url_hash") or "")
+    if actual_hash:
+        return actual_hash == expected_hash
+    # Backward compatibility for older in-memory state that might have stored a
+    # raw value. New code stores only a hash/redacted label.
+    if "proxy_url" in roxy_browser:
+        return _proxy_url_hash(roxy_browser.get("proxy_url")) == expected_hash
+    # Legacy browser state without proxy metadata cannot prove IP consistency.
+    return False
 
 
 def _sha256_b64(value: Any) -> str:
@@ -783,6 +858,8 @@ def capture_roxy_runtime_profile(
     proxy_url: str | None = None,
 ) -> dict[str, Any]:
     config = config or load_roxy_capture_config(proxy_url=proxy_url)
+    if proxy_url is not None:
+        config.proxy_url = _canonical_proxy_url(proxy_url)
     if keep_browser:
         config.close_after_capture = False
         config.delete_after_capture = False
@@ -813,6 +890,8 @@ def capture_roxy_runtime_profile(
                 "cdp_info": cdp_info,
                 "api_base": config.api_base,
                 "headless": config.headless,
+                "proxy_url_hash": _proxy_url_hash(config.proxy_url),
+                "proxy_label": _redact_proxy_url(config.proxy_url) or "noproxy",
                 "created_for": "fingerprint",
             }
         return runtime

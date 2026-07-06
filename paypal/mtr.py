@@ -659,9 +659,32 @@ def _default_signal_value(kind: str) -> object:
     return None
 
 
-def _chrome_brand_signals(profile: dict[str, object]) -> tuple[list[dict[str, str]], list[dict[str, str]], str]:
+def _uses_runtime_profile(profile: dict[str, object]) -> bool:
+    return _str_value(profile.get("fingerprint_source")).lower() in {"roxy", "runtime", "browser"}
+
+
+def _mtr_profile_str(profile: dict[str, object], key: str, default: str) -> str:
+    override = _str_value(profile.get(f"mtr_{key}"))
+    if override:
+        return override
+    runtime_value = _str_value(profile.get(key))
+    if _uses_runtime_profile(profile) and runtime_value:
+        return runtime_value
+    return default
+
+
+def _mtr_profile_int(profile: dict[str, object], key: str, default: int) -> int:
+    override = profile.get(f"mtr_{key}")
+    if override is not None:
+        return _int_value(override, default)
+    if _uses_runtime_profile(profile):
+        return _int_value(profile.get(key), default)
+    return default
+
+
+def _chrome_brand_signals(profile: dict[str, object]) -> tuple[list[dict[str, str]], list[dict[str, str]], str, str]:
     chrome_major = _str_value(profile.get("chrome_major"), "150")
-    chrome_full_version = _str_value(profile.get("chrome_full_version"), f"{chrome_major}.0.0.0")
+    chrome_full_version = _mtr_profile_str(profile, "chrome_full_version", "150.0.7871.46")
     brands = [
         {"b": "Not;A=Brand", "v": "8"},
         {"b": "Chromium", "v": chrome_major},
@@ -674,7 +697,7 @@ def _chrome_brand_signals(profile: dict[str, object]) -> tuple[list[dict[str, st
         [{"brand": item["b"], "version": item["v"]} for item in brands],
         separators=(",", ":"),
     )
-    return brands, full_version_list, brand_json
+    return brands, full_version_list, brand_json, chrome_full_version
 
 
 def _plugin_signal_value(plugins: list[dict[str, object]]) -> list[dict[str, object]]:
@@ -730,8 +753,12 @@ def _browser_detect_flags() -> dict[str, bool]:
 def _webgl_signal_value(profile: dict[str, object]) -> dict[str, object]:
     vendor = _str_value(profile.get("webgl_vendor"), "WebKit")
     renderer = _str_value(profile.get("webgl_renderer"), "WebKit WebGL")
-    unmasked_vendor = _str_value(profile.get("gpu_vendor"), "Google Inc. (Google)")
-    unmasked_renderer = _str_value(profile.get("gpu_renderer"), "ANGLE (Google, Vulkan 1.3.0, SwiftShader driver)")
+    unmasked_vendor = _mtr_profile_str(profile, "gpu_vendor", "Google Inc. (Google)")
+    unmasked_renderer = _mtr_profile_str(
+        profile,
+        "gpu_renderer",
+        "ANGLE (Google, Vulkan 1.3.0 (SwiftShader Device (Subzero) (0x0000C0DE)), SwiftShader driver)",
+    )
     return {
         "version": "WebGL 1.0 (OpenGL ES 2.0 Chromium)",
         "vendor": vendor,
@@ -829,9 +856,10 @@ def _navigator_probe_names() -> list[str]:
 
 def _mtr_date_pair(dfp: dict[str, object], *, now_ms: int, timezone_offset: int) -> list[int]:
     raw = dfp.get("mtr_s45") or dfp.get("date_pair")
-    if isinstance(raw, list) and len(raw) >= 2:
+    if isinstance(raw, list):
         values = cast(list[object], raw)
-        return [_int_value(values[0]), _int_value(values[1])]
+        if len(values) >= 2:
+            return [_int_value(values[0]), _int_value(values[1])]
     return [now_ms, now_ms - timezone_offset * 60 * 1000]
 
 
@@ -849,7 +877,7 @@ def _build_mtr_js_like_signals(
     plugins = _plugin_inventory(dfp)
     languages = _profile_languages(profile)
     language = languages[0] if languages else "pt-BR"
-    platform = _str_value(profile.get("platform"), "Win32")
+    platform = _mtr_profile_str(profile, "platform", "Linux x86_64")
     user_agent = _str_value(profile.get("user_agent"))
     app_version = user_agent.removeprefix("Mozilla/") if user_agent.startswith("Mozilla/") else user_agent
     width = _int_value(viewport.get("width"), 567)
@@ -868,9 +896,10 @@ def _build_mtr_js_like_signals(
     canvas_text_hash = _str_value(dfp.get("canvas_text_hash"), "eb611ff983beb6aa8d103977e0bf5db7")
     webgl_hash = _str_value(dfp.get("webgl_ext_hash"), "61910b3d5a471a8fdfd2ba33d12bc53b")
     font_hash = _str_value(dfp.get("font_hash"), _stable_hash({"fonts": profile}))
-    brands, full_version_list, brand_json = _chrome_brand_signals(profile)
-    platform_name = _str_value(profile.get("sec_ch_platform"), '"Windows"').strip('"') or "Windows"
-    architecture = _str_value(profile.get("sec_ch_arch"), '"x86"').strip('"') or "x86"
+    brands, full_version_list, brand_json, chrome_full_version = _chrome_brand_signals(profile)
+    platform_name = _mtr_profile_str(profile, "sec_ch_platform", '"Linux"').strip('"') or "Linux"
+    platform_version = _mtr_profile_str(profile, "sec_ch_platform_version", '""').strip('"')
+    architecture = _mtr_profile_str(profile, "sec_ch_arch", '"x86"').strip('"') or "x86"
 
     signals: dict[str, dict[str, object]] = {
         key: _mtr_signal(status, _default_signal_value(kind))
@@ -882,7 +911,7 @@ def _build_mtr_js_like_signals(
         "s4": 32,
         "s5": [height, width],
         "s6": [0, 0, 0, 0],
-        "s7": _int_value(profile.get("hardware_concurrency"), 8),
+        "s7": _mtr_profile_int(profile, "hardware_concurrency", 12),
         "s9": timezone,
         "s10": True,
         "s11": True,
@@ -924,11 +953,11 @@ def _build_mtr_js_like_signals(
                 "brands": brand_json,
                 "mobile": "false",
                 "platform": platform_name,
-                "platformVersion": "10.0",
+                "platformVersion": platform_version,
                 "architecture": architecture,
                 "bitness": _str_value(profile.get("sec_ch_bitness"), "64"),
                 "model": "",
-                "uaFullVersion": _str_value(profile.get("chrome_full_version"), "150.0.0.0"),
+                "uaFullVersion": chrome_full_version,
                 "fullVersionList": json.dumps(full_version_list, separators=(",", ":")),
             },
             "nah": [],
@@ -1035,7 +1064,7 @@ def _profile_languages(profile: dict[str, object]) -> list[str]:
 def _client_hints(profile: dict[str, object]) -> dict[str, object]:
     chrome_major = _str_value(profile.get("chrome_major"), "150")
     chrome_full_version = _str_value(profile.get("chrome_full_version"), f"{chrome_major}.0.0.0")
-    platform = _str_value(profile.get("sec_ch_platform"), '"Windows"').strip('"')
+    platform = _str_value(profile.get("sec_ch_platform"), '"Linux"').strip('"')
     architecture = _str_value(profile.get("sec_ch_arch"), '"x86"').strip('"')
     return {
         "brands": [
@@ -1049,7 +1078,7 @@ def _client_hints(profile: dict[str, object]) -> dict[str, object]:
             {"brand": "Not_A Brand", "version": "24.0.0.0"},
         ],
         "mobile": False,
-        "platform": platform or "Windows",
+        "platform": platform or "Linux",
         "architecture": architecture or "x86",
         "bitness": _str_value(profile.get("sec_ch_bitness"), "64").strip('"'),
         "model": _str_value(profile.get("sec_ch_model")),
@@ -1477,13 +1506,30 @@ def _send_mtr_with_roxy_browser(session: _MtrSession, state: _MtrState, *, page_
         _RoxyMtrRunner,
         getattr(roxy_module, "run_mtr_with_roxy_browser"),
     )
+    roxy_browser_matches_proxy = cast(
+        Callable[[dict[str, object], object], bool],
+        getattr(roxy_module, "roxy_browser_matches_proxy"),
+    )
+    close_roxy_browser = cast(
+        Callable[..., None],
+        getattr(roxy_module, "close_roxy_browser"),
+    )
 
+    proxy_url = getattr(session, "proxy_url", None) or ""
     roxy_browser_value = getattr(state, "roxy_browser", {}) or {}
     roxy_browser = _dict_value(roxy_browser_value)
+    if roxy_browser.get("cdp_info") and not roxy_browser_matches_proxy(roxy_browser, proxy_url):
+        logger.info("Existing Roxy browser proxy does not match current HTTP proxy; reopening with current proxy.")
+        try:
+            close_roxy_browser(roxy_browser, delete=True)
+        except Exception as exc:
+            logger.debug("Roxy mismatched-proxy browser cleanup failed: %s", exc)
+        roxy_browser = {}
+        setattr(state, "roxy_browser", roxy_browser)
     if not roxy_browser.get("cdp_info"):
         runtime = capture_roxy_runtime_profile(
             keep_browser=True,
-            proxy_url=getattr(session, "proxy_url", None),
+            proxy_url=proxy_url,
         )
         roxy_browser = _dict_value(runtime.get("roxy_browser"))
         setattr(state, "roxy_browser", roxy_browser)

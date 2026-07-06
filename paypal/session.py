@@ -1,5 +1,6 @@
 import json
 import os
+import re
 from http.cookiejar import Cookie
 from pathlib import Path
 import tempfile
@@ -22,6 +23,7 @@ from paypal.traffic_recorder import get_global_traffic_recorder
 from config import USER_AGENT, BROWSER_PROFILE
 
 
+EUAT_COOKIE_NAME = "AV894Kt2TSumQQrJwe-8mzmyREO"
 CAPTCHA_SOLVED_CFCI = "modxo_vaulted_not_recurring-CAPTCHA_SOLVED"
 CAPTCHA_FRONTEND_DISABLE_MODE = "frontend_disable"
 CAPTCHA_MANUAL_REQUIRED_MODE = "manual_required"
@@ -305,6 +307,57 @@ def _paypal_debug_id(headers: httpx.Headers) -> str:
     return ""
 
 
+def _header_values(headers: Any, name: str) -> list[str]:
+    values: list[str] = []
+    for method_name in ("get_list", "get_all"):
+        getter = getattr(headers, method_name, None)
+        if callable(getter):
+            try:
+                got = getter(name)
+                if got:
+                    values.extend(str(item) for item in got if item is not None)
+            except Exception:
+                pass
+
+    for key in (name, name.lower(), name.title()):
+        try:
+            value = headers.get(key)
+        except Exception:
+            value = None
+        if value:
+            values.append(str(value))
+
+    raw = getattr(headers, "raw", None)
+    if raw:
+        for key, value in raw:
+            try:
+                key_text = key.decode("latin1") if isinstance(key, bytes) else str(key)
+                if key_text.lower() != name.lower():
+                    continue
+                value_text = value.decode("latin1") if isinstance(value, bytes) else str(value)
+                values.append(value_text)
+            except Exception:
+                continue
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        deduped.append(value)
+    return deduped
+
+
+def _extract_cookie_value_from_headers(headers: Any, cookie_name: str) -> str:
+    pattern = re.compile(r"(?:^|,\s*)" + re.escape(cookie_name) + r"=([^;,]*)")
+    for header in _header_values(headers, "set-cookie"):
+        match = pattern.search(header or "")
+        if match:
+            return urllib.parse.unquote(match.group(1) or "")
+    return ""
+
+
 def looks_like_paypal_authchallenge(text: str) -> bool:
     """Return True when a PayPal endpoint answered with authchallenge HTML.
 
@@ -554,6 +607,19 @@ class PayPalSession:
                 if isinstance(cookie, Cookie):
                     cookie_dict[cookie.name] = cookie.value
         self.state.update_from_cookies(cookie_dict)
+
+    def _sync_state_response_headers(self, resp: Any) -> None:
+        """Capture auth cookies directly from Set-Cookie in case the jar misses them."""
+        try:
+            token = _extract_cookie_value_from_headers(
+                getattr(resp, "headers", {}),
+                EUAT_COOKIE_NAME,
+            )
+        except Exception:
+            token = ""
+        if token and token != self.state.euat_token:
+            self.state.euat_token = token
+            logger.info("EUAT cookie captured from response Set-Cookie header len={}", len(token))
 
     def export_cookies_for_browser(self) -> list[dict[str, Any]]:
         """Export current HTTP-session cookies in Playwright add_cookies shape."""
@@ -927,6 +993,7 @@ class PayPalSession:
             raise
         self._check_accept_ch(resp)
         self._sync_state_cookies()
+        self._sync_state_response_headers(resp)
         if self.traffic_recorder is not None and req_id is not None:
             self.traffic_recorder.record_response(req_id, "GET", url, resp)
         logger.debug(f"  -> {resp.status_code} ({len(resp.content)} bytes)")
@@ -989,6 +1056,7 @@ class PayPalSession:
                     pass
         self._check_accept_ch(resp)
         self._sync_state_cookies()
+        self._sync_state_response_headers(resp)
         if self.traffic_recorder is not None and req_id is not None:
             self.traffic_recorder.record_response(req_id, "POST", url, resp)
         logger.debug(f"  -> {resp.status_code} ({len(resp.content)} bytes)")
@@ -1018,12 +1086,17 @@ class PayPalSession:
         )
         profile = getattr(self.state, "browser_profile", None) or BROWSER_PROFILE
         app_name = "checkoutuinodeweb" if operation_name == "authorize" else "checkoutuinodeweb_weasley"
+        # Browser/Roxy checkoutweb sends the active checkout token (EC/BA) as
+        # both PayPal-Client-Context and PayPal-Client-Metadata-Id.  Keep the
+        # random per-session UUID only as a last-resort fallback for requests
+        # that genuinely do not have a checkout context token.
+        metadata_id = context_token or self.state.paypal_client_metadata_id
         headers = {
             "Content-Type": "application/json",
             "X-App-Name": app_name,
             "X-Requested-With": "fetch",
             "PayPal-Client-Context": context_token,
-            "PayPal-Client-Metadata-Id": self.state.paypal_client_metadata_id or context_token,
+            "PayPal-Client-Metadata-Id": metadata_id,
             "X-Country": str(profile.get("country") or "BR"),
             "X-Locale": str(profile.get("locale") or "pt_BR"),
             "Origin": "https://www.paypal.com",

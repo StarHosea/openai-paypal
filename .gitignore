@@ -14,3 +14,6 @@ captures/
 
 # Ad-hoc archives / generated artifacts
 *.zip
+
+# Local backup files
+backups/

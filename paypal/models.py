@@ -178,11 +178,13 @@ _BR_DISTRICTS = [
 
 _KNOWN_BR_ADDRESSES = [
     ("Avenida Cristóvão Colombo", "287", "Savassi", "Belo Horizonte", "MG", "30140-140"),
-    ("Rua Siqueira Campos, 946", "1001", "Centro Histórico", "Porto Alegre", "RS", "90010-001"),
+    ("Rua Siqueira Campos", "1001", "Centro Histórico", "Porto Alegre", "RS", "90010-001"),
     ("Avenida Paulista", "1000", "Bela Vista", "São Paulo", "SP", "01310-100"),
-    ("Rua da Assembleia", "10", "Centro", "Rio de Janeiro", "RJ", "20011-901"),
+    ("Rua da Assembléia", "10", "Centro", "Rio de Janeiro", "RJ", "20011-901"),
     ("Rua XV de Novembro", "100", "Centro", "Curitiba", "PR", "80020-310"),
-    ("Avenida Sete de Setembro", "1200", "Centro", "Salvador", "BA", "40060-001"),
+    ("Avenida Sete de Setembro", "1555", "Vitória", "Salvador", "BA", "40080-002"),
+    ("Avenida Doutor Antônio Gouveia", "4662", "Pajuçara", "Maceió", "AL", "57030-170"),
+    ("Avenida Fernandes Lima", "1497", "Farol", "Maceió", "AL", "57055-000"),
 ]
 
 

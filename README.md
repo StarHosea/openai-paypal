@@ -149,7 +149,7 @@ python main.py --ba-token BA-xxx --phone +5591980133818 --proxy-url "http://user
 
 ## 浏览器指纹来源
 
-默认仍使用程序内随机指纹。现在可以切换到 RoxyBrowser Local API：程序会创建一个随机指纹 Profile，按 `headless=true` 打开，通过 CDP 读取真实 Chromium runtime 中的 UA、screen、viewport、canvas、WebGL、audio、JS heap、connection 等字段，再关闭并删除临时 Profile。
+默认仍使用程序内随机指纹。现在可以切换到 RoxyBrowser Local API：程序会创建一个随机指纹 Profile，默认按 `headless=true` 打开无头窗口，通过 CDP 读取真实 Chromium runtime 中的 UA、screen、viewport、canvas、WebGL、audio、JS heap、connection 等字段，再关闭并删除临时 Profile。当前示例为直接打开，不会先 close 再重新打开。Web 前端/CLI 启用代理时，同一个 `ProxyConfig.url` 会同步写入 Roxy `proxyInfo`，确保协议请求和 Roxy 浏览器使用同一代理 IP；前端未启用代理时会显式传空代理，Roxy `proxyInfo` 为 `noproxy`，不会使用 `PAYPAL_ROXY_PROXY_URL` 兜底代理。
 
 `.env` 示例：
 
@@ -159,6 +159,8 @@ PAYPAL_ROXY_API_KEY="..."
 PAYPAL_ROXY_API_HOST=127.0.0.1
 PAYPAL_ROXY_API_PORT=50000
 PAYPAL_ROXY_HEADLESS=1
+PAYPAL_ROXY_FORCE_OPEN=0
+PAYPAL_ROXY_CLOSE_BEFORE_OPEN=0
 PAYPAL_ROXY_FINGERPRINT_FALLBACK=random
 
 # DataDome 两种方法保留，通过开关选择：

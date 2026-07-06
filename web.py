@@ -498,6 +498,13 @@ class WebPayPalFlow(PayPalFlow):
         )
         self.job.set_generated(public_generated_payload(self.user, self.card, self.address))
 
+    def _on_signup_retry_generated(self, signup_attempt: int, reason: str):
+        self.job.set_status(
+            "running",
+            f"注册资料重试 {signup_attempt}/{self.max_card_attempts}：已更换账号/卡信息",
+        )
+        self.job.set_generated(public_generated_payload(self.user, self.card, self.address))
+
     def _prompt_operator(self, prompt: str) -> str:
         logger.info(prompt)
         return self.job.wait_for_input(prompt)

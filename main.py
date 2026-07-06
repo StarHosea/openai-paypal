@@ -122,6 +122,12 @@ def main():
         default=None,
         help="MTR sealedResult source: python_generated protocol template, roxy browser runtime, auto, block, or off",
     )
+    parser.add_argument(
+        "--risk-signals-mode",
+        choices=["protocol", "python", "synthetic", "template", "roxy", "browser", "auto", "off"],
+        default=None,
+        help="Phase1 risk signal source: protocol templates, roxy browser runtime, auto, or off",
+    )
 
     args = parser.parse_args()
 
@@ -134,6 +140,8 @@ def main():
         os.environ["PAYPAL_DATADOME_MODE"] = args.datadome_mode
     if args.mtr_runtime:
         os.environ["PAYPAL_MTR_RUNTIME"] = args.mtr_runtime
+    if args.risk_signals_mode:
+        os.environ["PAYPAL_RISK_SIGNALS_MODE"] = args.risk_signals_mode
 
     traffic_recorder = None
     if args.record_traffic or args.traffic_dir or args.compare_roxy_capture:
@@ -176,6 +184,9 @@ def main():
         card_retry_jitter_seconds=args.card_retry_jitter,
         proxy_config=proxy_config,
         fingerprint_source=args.fingerprint_source,
+        datadome_mode=args.datadome_mode,
+        mtr_runtime=args.mtr_runtime,
+        risk_signals_mode=args.risk_signals_mode,
     )
 
     try:

@@ -1,5 +1,5 @@
 USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36"
 )
 
@@ -28,20 +28,21 @@ BROWSER_PROFILE = {
     "timezone_offset_ms": 180 * 60 * 1000,
     "dst": False,
     "chrome_major": 150,
-    "chrome_full_version": "150.0.7857.1",
-    "platform": "Win32",
-    "sec_ch_platform": '"Windows"',
+    "chrome_full_version": "150.0.7871.46",
+    "platform": "Linux x86_64",
+    "sec_ch_platform": '"Linux"',
+    "sec_ch_platform_version": '""',
     "sec_ch_arch": '"x86"',
     "device_memory": 8,
-    "hardware_concurrency": 8,
-    "device_pixel_ratio": 1.25,
+    "hardware_concurrency": 12,
+    "device_pixel_ratio": 1,
     "connection_effective_type": "4g",
     "connection_rtt": "150",
     "connection_downlink": "10",
-    "gpu_vendor": "Google Inc. (NVIDIA Corporation)",
+    "gpu_vendor": "Google Inc. (Google)",
     "gpu_renderer": (
-        "ANGLE (NVIDIA Corporation, NVIDIA GeForce RTX 4060/PCIe/SSE2, "
-        "OpenGL ES 3.2)"
+        "ANGLE (Google, Vulkan 1.3.0 (SwiftShader Device (Subzero) "
+        "(0x0000C0DE)), SwiftShader driver)"
     ),
     "webgl_vendor": "WebKit",
     "webgl_renderer": "WebKit WebGL",
