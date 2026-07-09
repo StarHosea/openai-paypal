@@ -226,6 +226,69 @@ def test_signup_context_allows_paypal_analytics_script() -> None:
     assert decision.reason == "signup_context_observability_script"
 
 
+def test_headless_default_policy_uses_frozen_learned_cache_rules() -> None:
+    rules = seed_headless_optimized_rules("checkout")
+
+    ddbm_decision = headless_optimized_request_decision(
+        "https://ddbm2.paypal.com/js/runtime",
+        method="POST",
+        resource_type="xhr",
+        rules=rules,
+    )
+    identity_ping_decision = headless_optimized_request_decision(
+        "https://www.paypal.com/identity/di/log",
+        method="POST",
+        resource_type="ping",
+        rules=rules,
+    )
+    datadog_ping_decision = headless_optimized_request_decision(
+        "https://browser-intake-us5-datadoghq.com/api/v2/rum",
+        method="POST",
+        resource_type="ping",
+        rules=rules,
+    )
+
+    assert ddbm_decision.action == "allow"
+    assert ddbm_decision.reason == "learned_ddbm"
+    assert identity_ping_decision.action == "allow"
+    assert identity_ping_decision.reason == "learned_identity_di_log"
+    assert datadog_ping_decision.action == "allow"
+    assert datadog_ping_decision.reason == "learned_datadog_rum"
+
+
+def test_headless_dynamic_allowlist_cache_and_learning_are_opt_in(monkeypatch: Any, tmp_path: Any) -> None:
+    rule_class = getattr(local_headless, "HeadlessAllowlistRule")
+    save_rules = cast(Callable[[list[object]], list[dict[str, object]]], getattr(local_headless, "_save_headless_cached_rules"))
+    build_rules = cast(Callable[[str], list[object]], getattr(local_headless, "_headless_rules"))
+    learning_enabled = cast(Callable[[], bool], getattr(local_headless, "headless_allowlist_learning_enabled"))
+    cache_path = tmp_path / "headless_allowlist_cache.json"
+
+    monkeypatch.setenv("PAYPAL_HEADLESS_ALLOWLIST_CACHE", str(cache_path))
+    monkeypatch.delenv("PAYPAL_HEADLESS_ALLOWLIST_CACHE_ENABLED", raising=False)
+    monkeypatch.delenv("PAYPAL_HEADLESS_DYNAMIC_ALLOWLIST_CACHE", raising=False)
+    monkeypatch.delenv("PAYPAL_HEADLESS_ALLOWLIST_LEARNING", raising=False)
+
+    save_rules([
+        rule_class(
+            "dynamic-cache.example",
+            "/learned",
+            methods=("GET",),
+            resource_types=("fetch",),
+            reason="learned_dynamic_cache",
+        )
+    ])
+
+    default_rules = build_rules("checkout")
+    assert all(getattr(rule, "host") != "dynamic-cache.example" for rule in default_rules)
+    assert learning_enabled() is False
+
+    monkeypatch.setenv("PAYPAL_HEADLESS_ALLOWLIST_CACHE_ENABLED", "1")
+    monkeypatch.setenv("PAYPAL_HEADLESS_ALLOWLIST_LEARNING", "1")
+    enabled_rules = build_rules("checkout")
+    assert any(getattr(rule, "host") == "dynamic-cache.example" for rule in enabled_rules)
+    assert learning_enabled() is True
+
+
 def test_signup_context_allowlist_does_not_open_checkout_or_static_styles() -> None:
     checkout_decision = headless_optimized_request_decision(
         "https://www.paypal.com/graphql?CheckoutSessionDataQuery=",

@@ -1047,6 +1047,13 @@ def _seed_headless_optimized_rules(stage: str = "checkout") -> list[HeadlessAllo
         HeadlessAllowlistRule("browser-intake-us5-datadoghq.com", "/api/v2/rum", methods=("POST",), resource_types=("xhr", "fetch", "beacon"), reason="datadog_rum"),
         HeadlessAllowlistRule("www.paypalobjects.com", "/rdaAssets/fraudnet/", methods=("GET",), resource_types=("script",), reason="fraudnet_script"),
         HeadlessAllowlistRule("www.paypalobjects.com", "/", methods=("GET",), resource_types=("script",), reason="dfp_script", path_contains="dfp.js"),
+        # Frozen rules promoted from the completed allowlist-learning cache.
+        # Keep these as deterministic seed rules so production no longer needs
+        # the fail-open learning pass or a mutable cache file for these request
+        # shapes.
+        HeadlessAllowlistRule("ddbm2.paypal.com", "/js/", methods=("POST",), resource_types=("xhr",), reason="learned_ddbm"),
+        HeadlessAllowlistRule("www.paypal.com", "/identity/di/log", methods=("POST",), resource_types=("ping",), reason="learned_identity_di_log"),
+        HeadlessAllowlistRule("browser-intake-us5-datadoghq.com", "/api/v2/rum", methods=("POST",), resource_types=("ping",), reason="learned_datadog_rum"),
     ]
     if stage == "signup_context":
         rules.extend(
@@ -1086,6 +1093,28 @@ def _load_headless_optimized_cached_rules() -> list[HeadlessAllowlistRule]:
         if rule:
             rules.append(rule)
     return rules
+
+
+def _headless_dynamic_allowlist_cache_enabled() -> bool:
+    raw = _env_text(
+        "PAYPAL_HEADLESS_ALLOWLIST_CACHE_ENABLED",
+        "PAYPAL_HEADLESS_OPTIMIZED_ALLOWLIST_CACHE_ENABLED",
+        "PAYPAL_HEADLESS_DYNAMIC_ALLOWLIST_CACHE",
+        "PAYPAL_HEADLESS_OPTIMIZED_DYNAMIC_ALLOWLIST_CACHE",
+    ).strip().lower()
+    if not raw:
+        return False
+    return raw in {"1", "true", "yes", "on", "enable", "enabled"}
+
+
+def headless_allowlist_learning_enabled() -> bool:
+    raw = _env_text(
+        "PAYPAL_HEADLESS_ALLOWLIST_LEARNING",
+        "PAYPAL_HEADLESS_OPTIMIZED_ALLOWLIST_LEARNING",
+    ).strip().lower()
+    if not raw:
+        return False
+    return raw in {"1", "true", "yes", "on", "enable", "enabled"}
 
 
 def clear_headless_optimized_allowlist_cache() -> None:
@@ -1320,7 +1349,8 @@ def _headless_optimized_request_decision(
 
 def _headless_optimized_rules(stage: str = "checkout") -> list[HeadlessAllowlistRule]:
     rules = _seed_headless_optimized_rules(stage)
-    rules.extend(_load_headless_optimized_cached_rules())
+    if _headless_dynamic_allowlist_cache_enabled():
+        rules.extend(_load_headless_optimized_cached_rules())
     return rules
 
 
@@ -1874,7 +1904,11 @@ class LocalHeadlessSession:
                 reason=f"{stage}_headless_paypal_observability_without_datadog_sdk",
             )
         required_missing = self._required_missing()
-        if (required_missing or (run_mtr and not self._mtr_ready())) and self.policy.blocked:
+        if (
+            (required_missing or (run_mtr and not self._mtr_ready()))
+            and self.policy.blocked
+            and headless_allowlist_learning_enabled()
+        ):
             attempts = 2
             self.policy.fail_open = True
             run_once(reload_page=True)
