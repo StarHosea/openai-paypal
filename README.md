@@ -40,6 +40,8 @@ python -m playwright install chromium
 
 只运行协议模式时可以不安装 `requirements-headless.txt`；生产推荐安装 headless 依赖。
 
+> **运行模式建议**：纯 Python/协议模拟的风控信号仍未完全完善，`random`、`python_generated`、`protocol` 等模式仅建议用于调试或回退。生产环境建议优先使用本地 `headless`（Playwright/Chromium）或 `roxy`（RoxyBrowser）执行浏览器侧指纹、DataDome、MTR 和 signup-context risk signals。
+
 ## 配置 `.env`
 
 在项目根目录创建 `.env`，按实际环境填写。不要提交 `.env`。
