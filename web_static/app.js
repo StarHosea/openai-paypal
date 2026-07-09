@@ -3,6 +3,8 @@ const state = {
   currentJobId: localStorage.getItem("paypal-web-current-job") || "",
   pollTimer: null,
   lastLogCount: 0,
+  logsSignature: "",
+  currentLogLines: [],
 };
 
 function fmtTime(ts) {
@@ -125,19 +127,36 @@ function syncSmsFields() {
 function selectJob(jobId) {
   state.currentJobId = jobId || "";
   state.lastLogCount = 0;
+  state.logsSignature = "";
+  state.currentLogLines = [];
   if (jobId) localStorage.setItem("paypal-web-current-job", jobId);
   else localStorage.removeItem("paypal-web-current-job");
   refreshJobs();
   pollCurrent(true);
 }
 
+function formatLogLine(line) {
+  const t = new Date((Number(line?.time) || 0) * 1000).toLocaleTimeString();
+  const level = String(line?.level || "").padEnd(7);
+  return `[${t}] ${level} ${line?.message ?? ""}`;
+}
+
 function renderLogs(logs) {
-  const text = (logs || []).map(line => {
-    const t = new Date((line.time || 0) * 1000).toLocaleTimeString();
-    return `[${t}] ${line.level.padEnd(7)} ${line.message}`;
-  }).join("\n");
+  const rows = (logs || []).map(formatLogLine);
   const box = $("#logsBox");
-  box.textContent = text;
+  const signature = `${rows.length}:${rows[rows.length - 1] || ""}`;
+  if (signature === state.logsSignature) return;
+  state.logsSignature = signature;
+  state.currentLogLines = rows;
+  box.innerHTML = (logs || []).map((line, index) => {
+    const level = String(line?.level || "INFO").replace(/[^A-Z]/gi, "").toUpperCase() || "INFO";
+    return `
+      <div class="log-line log-${esc(level)}" data-log-index="${index}">
+        <span class="log-message">${esc(rows[index] || "")}</span>
+        <button class="log-copy" type="button" title="复制这一行">复制</button>
+      </div>`;
+  }).join("");
+  $("#copyLogs").disabled = rows.length === 0;
   if ($("#autoScroll").checked) box.scrollTop = box.scrollHeight;
 }
 
@@ -181,6 +200,10 @@ async function pollCurrent(force = false) {
     $("#currentBody").classList.add("hidden");
     $("#currentMeta").textContent = "未选择任务";
     $("#copyResult").disabled = true;
+    $("#copyLogs").disabled = true;
+    $("#logsBox").innerHTML = "";
+    state.logsSignature = "";
+    state.currentLogLines = [];
     return;
   }
   try {
@@ -271,11 +294,38 @@ async function copyResult() {
   }
 }
 
+async function copyLogs() {
+  const text = state.currentLogLines.join("\n");
+  if (!text) return toast("暂无日志可复制");
+  try {
+    await navigator.clipboard.writeText(text);
+    toast("日志已复制");
+  } catch (err) {
+    toast(err.message);
+  }
+}
+
+async function copyLogLine(evt) {
+  const button = evt.target.closest(".log-copy");
+  if (!button) return;
+  const line = button.closest(".log-line");
+  const message = line?.querySelector(".log-message")?.textContent || "";
+  if (!message) return;
+  try {
+    await navigator.clipboard.writeText(message);
+    toast("已复制该行日志");
+  } catch (err) {
+    toast(err.message);
+  }
+}
+
 function bind() {
   $("#runForm").addEventListener("submit", startJob);
   $("#otpForm").addEventListener("submit", submitOtp);
   $("#refreshJobs").addEventListener("click", refreshJobs);
   $("#copyResult").addEventListener("click", copyResult);
+  $("#copyLogs").addEventListener("click", copyLogs);
+  $("#logsBox").addEventListener("click", copyLogLine);
   $("#clearCurrent").addEventListener("click", () => selectJob(""));
   $("#proxyEnabled").addEventListener("change", syncProxyFields);
   $("#proxyMode").addEventListener("change", syncProxyFields);

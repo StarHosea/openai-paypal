@@ -4,7 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>PayPal 协议支付网页端</title>
-  <link rel="stylesheet" href="/static/app.css?v=traffic-record-1" />
+  <link rel="stylesheet" href="/static/app.css?v=ui-log-copy-1" />
 </head>
 <body>
   <div class="shell">
@@ -201,15 +201,18 @@
 
           <div class="logs-head">
             <h3>实时日志</h3>
-            <label class="check-row small"><input id="autoScroll" type="checkbox" checked />自动滚动</label>
+            <div class="toolbar logs-toolbar">
+              <button id="copyLogs" class="ghost small-button" type="button" disabled>复制日志</button>
+              <label class="check-row small"><input id="autoScroll" type="checkbox" checked />自动滚动</label>
+            </div>
           </div>
-          <pre id="logsBox" class="logs-box"></pre>
+          <div id="logsBox" class="logs-box" role="log" aria-live="polite"></div>
         </div>
       </section>
     </main>
   </div>
 
   <div id="toast" class="toast hidden"></div>
-  <script src="/static/app.js?v=traffic-record-1"></script>
+  <script src="/static/app.js?v=ui-log-copy-1"></script>
 </body>
 </html>
