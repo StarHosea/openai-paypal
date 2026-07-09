@@ -1834,30 +1834,40 @@ class BrowserFlowOrderTest(unittest.TestCase):
         self.assertEqual(getattr(fail_open_decision, "action"), "allow")
         self.assertEqual(getattr(fail_open_decision, "reason"), "fail_open_unknown")
 
-    def test_headless_allowlist_cache_and_debug_log_are_private_and_structured(self):
-        rule_class = getattr(local_headless_module, "HeadlessAllowlistRule")
-        save_rules = cast(Callable[[list[object]], list[dict[str, object]]], getattr(local_headless_module, "_save_headless_cached_rules"))
-        load_rules = cast(Callable[[], list[object]], getattr(local_headless_module, "_load_headless_cached_rules"))
+    def test_headless_allowlist_cache_is_ignored_and_debug_log_is_private_and_structured(self):
+        build_rules = cast(Callable[[str], list[object]], getattr(local_headless_module, "_headless_rules"))
         network_log_class = getattr(local_headless_module, "HeadlessOptimizedNetworkLog")
 
         with tempfile.TemporaryDirectory() as tmp:
             cache_path = Path(tmp) / "var" / "headless_allowlist_cache.json"
             with patch.dict(os.environ, {"PAYPAL_HEADLESS_ALLOWLIST_CACHE": str(cache_path)}, clear=True):
-                written = save_rules([
-                    rule_class(
-                        "c.paypal.com",
-                        "/v1/r/d/b/p1",
-                        methods=("POST",),
-                        resource_types=("fetch",),
-                        reason="learned_fraudnet_p1",
-                    )
-                ])
-                loaded = load_rules()
+                cache_path.parent.mkdir(parents=True, exist_ok=True)
+                cache_path.write_text(
+                    json.dumps(
+                        {
+                            "version": 1,
+                            "updated_at": time.time(),
+                            "rules": [
+                                {
+                                    "host": "c.paypal.com",
+                                    "path_prefix": "/v1/r/d/b/p1",
+                                    "methods": ["POST"],
+                                    "resource_types": ["fetch"],
+                                    "reason": "learned_fraudnet_p1",
+                                    "created_at": time.time(),
+                                    "last_seen": time.time(),
+                                }
+                            ],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                rules = build_rules("checkout")
 
-            self.assertEqual(written[0]["host"], "c.paypal.com")
-            self.assertEqual(getattr(loaded[0], "reason"), "learned_fraudnet_p1")
-            self.assertEqual(cache_path.stat().st_mode & 0o777, 0o600)
-            self.assertEqual(cache_path.parent.stat().st_mode & 0o777, 0o700)
+            self.assertFalse(any(getattr(rule, "host") == "c.paypal.com" and getattr(rule, "reason") == "learned_fraudnet_p1" for rule in rules))
+            self.assertTrue(any(getattr(rule, "reason") == "learned_ddbm" for rule in rules))
+            self.assertTrue(any(getattr(rule, "reason") == "learned_identity_di_log" for rule in rules))
+            self.assertTrue(any(getattr(rule, "reason") == "learned_datadog_rum" for rule in rules))
 
             log_root = Path(tmp) / "debug" / "job-1"
             network_log = network_log_class(job_id="job-1", root=log_root)
@@ -2559,6 +2569,92 @@ class BrowserFlowOrderTest(unittest.TestCase):
         self.assertEqual(flow.state.datadome_browser_result["runtime"], "headless")
         self.assertEqual(flow.state.datadome_browser_result["reason"], "unit_test")
 
+    def test_phase0_headless_uses_browser_document_after_datadome_preflight_when_enabled(self):
+        with patch.dict(
+            os.environ,
+            {"PAYPAL_FINGERPRINT_SOURCE": "random", "PAYPAL_DATADOME_PHASE0_PREFLIGHT": "1"},
+            clear=True,
+        ):
+            flow, fake = make_flow()
+        setattr(flow, "datadome_mode", "headless")
+        phase0 = cast(Callable[[], None], getattr(flow, "_phase0_initial_load"))
+        apply_result = cast(Callable[..., bool], getattr(flow, "_apply_datadome_browser_result"))
+        html = """
+        <html>
+          <head><title>PayPal checkout</title></head>
+          <body>
+            <script>window.__INITIAL_DATA__ = {"checkout": {"ok": true}};</script>
+            <script>window.paypal = {"ctxId":"ctx-browser-doc"};</script>
+            <a href="https://www.paypal.com/checkoutweb/signup?token=EC-TEST123&ssrt=123">signup</a>
+          </body>
+        </html>
+        """
+
+        def solve_with_browser_document(_url: str, *, reason: str) -> bool:
+            return apply_result(
+                {
+                    "ok": True,
+                    "runtime": "headless",
+                    "status": 200,
+                    "url": "https://www.paypal.com/agreements/approve?ba_token=BA-TESTTOKEN123",
+                    "cookies": [
+                        {"name": "datadome", "value": "dd-headless", "domain": ".paypal.com", "path": "/"}
+                    ],
+                    "datadome": "dd-headless",
+                    "clientid": "clientid-headless",
+                    "html": html,
+                },
+                reason=reason,
+                runtime="headless",
+            )
+
+        with (
+            patch.dict(
+                os.environ,
+                {"PAYPAL_FINGERPRINT_SOURCE": "random", "PAYPAL_DATADOME_PHASE0_PREFLIGHT": "1"},
+                clear=True,
+            ),
+            patch.object(flow, "_solve_datadome_with_roxy_browser", side_effect=solve_with_browser_document),
+        ):
+            phase0()
+
+        self.assertEqual(fake.requests, [])
+        self.assertEqual(getattr(flow, "_last_modxo_html"), html)
+        self.assertEqual(flow.state.datadome_cookie, "dd-headless")
+        self.assertNotIn("html", flow.state.datadome_browser_result)
+
+    def test_phase0_headless_skips_slow_datadome_preflight_by_default_when_protocol_get_succeeds(self):
+        with patch.dict(os.environ, {"PAYPAL_FINGERPRINT_SOURCE": "random"}, clear=True):
+            flow, fake = make_flow()
+        setattr(flow, "datadome_mode", "headless")
+        phase0 = cast(Callable[[], None], getattr(flow, "_phase0_initial_load"))
+        html = """
+        <html>
+          <head><title>PayPal checkout</title></head>
+          <body>
+            <script>window.__INITIAL_DATA__ = {"checkout": {"ok": true}};</script>
+            <script>window.paypal = {"ctxId":"ctx-protocol-first"};</script>
+            <a href="https://www.paypal.com/checkoutweb/signup?token=EC-TEST123&ssrt=123">signup</a>
+          </body>
+        </html>
+        """
+
+        def get_approval_page(url: str, **_kwargs: object) -> FakeResponse:
+            fake.requests.append(("GET", url))
+            return FakeResponse(url, html)
+
+        with (
+            patch.dict(os.environ, {"PAYPAL_FINGERPRINT_SOURCE": "random"}, clear=True),
+            patch.object(fake, "get", side_effect=get_approval_page),
+            patch.object(flow, "_solve_datadome_with_roxy_browser", side_effect=AssertionError("slow preflight should not run")),
+        ):
+            phase0()
+
+        self.assertEqual(fake.requests, [("GET", "https://www.paypal.com/agreements/approve?ba_token=BA-TESTTOKEN123")])
+        self.assertEqual(getattr(flow, "_last_modxo_html"), html)
+        self.assertEqual(flow.state.ctx_id, "ctx-protocol-first")
+        self.assertEqual(flow.state.ec_token, "EC-TEST123")
+
     def test_datadome_headless_403_cookie_is_not_treated_as_solved(self):
         flow, fake = make_flow()
         setattr(flow, "datadome_mode", "headless")
@@ -2599,6 +2695,49 @@ class BrowserFlowOrderTest(unittest.TestCase):
         self.assertEqual(flow.state.datadome_browser_result["status"], 403)
         self.assertFalse(flow.state.datadome_browser_result["ok"])
         self.assertEqual(fake.browser_cookies, [])
+
+    def test_datadome_headless_does_not_try_roxy_fallback_unless_enabled(self):
+        with patch.dict(os.environ, {"PAYPAL_FINGERPRINT_SOURCE": "random"}, clear=True):
+            flow, _fake = make_flow()
+        setattr(flow, "datadome_mode", "headless")
+        solve_datadome = cast(Callable[..., bool], getattr(flow, "_solve_datadome_with_roxy_browser"))
+
+        class FakeHeadlessDatadomeSession:
+            def solve_datadome(self, _url: str, *, wait_seconds: float | None = None) -> dict[str, object]:
+                return {
+                    "ok": False,
+                    "runtime": "headless",
+                    "status": 403,
+                    "url": "https://www.paypal.com/agreements/approve?ba_token=BA-TEST",
+                    "blocked_by_datadome": True,
+                }
+
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "PAYPAL_FINGERPRINT_SOURCE": "random",
+                    "PAYPAL_HEADLESS_RUNTIME_FALLBACK": "1",
+                    "PAYPAL_ROXY_API_KEY": "configured-but-local-api-is-closed",
+                },
+                clear=True,
+            ),
+            patch.object(flow, "_get_headless_session", return_value=FakeHeadlessDatadomeSession()),
+            patch.object(
+                flow,
+                "_ensure_roxy_browser_for_datadome",
+                side_effect=AssertionError("Roxy fallback should be opt-in"),
+            ),
+        ):
+            self.assertFalse(
+                solve_datadome(
+                    "https://www.paypal.com/agreements/approve?ba_token=BA-TEST",
+                    reason="unit_test",
+                )
+            )
+
+        self.assertEqual(flow.state.datadome_browser_result["runtime"], "headless")
+        self.assertEqual(getattr(flow, "datadome_mode"), "protocol")
 
     def test_datadome_headless_connection_failure_respects_disabled_fallback(self):
         flow, _fake = make_flow()

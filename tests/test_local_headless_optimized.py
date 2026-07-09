@@ -1,3 +1,5 @@
+import json
+import time
 from collections.abc import Callable
 from typing import Any, Protocol, cast
 
@@ -43,6 +45,12 @@ headless_optimized_request_decision = cast(
     HeadlessOptimizedRequestDecision,
     getattr(local_headless, "_headless_optimized_request_decision"),
 )
+headless_url_is_challenge = cast(Callable[[str], bool], getattr(local_headless, "_headless_url_is_challenge"))
+datadome_challenge_present = cast(Callable[[int, str], bool], getattr(local_headless, "_datadome_challenge_present"))
+signup_context_document_assessment = cast(
+    Callable[[str, int, str], dict[str, object]],
+    getattr(local_headless, "_signup_context_document_assessment"),
+)
 
 
 def signup_context_decision(url: str, *, method: str, resource_type: str) -> HeadlessRequestDecision:
@@ -57,6 +65,8 @@ def signup_context_decision(url: str, *, method: str, resource_type: str) -> Hea
 def test_current_paypal_browser_telemetry_urls_are_observability() -> None:
     assert headless_phase1_family("https://www.paypal.com/signin/client-log") == "observability"
     assert headless_phase1_family("https://t.paypal.com/ts?v=1.15.0&fpti_sdk_name=pa-js") == "observability"
+    assert headless_phase1_family("https://www.paypal.com/xoplatform/logger/api/logger/") == "observability"
+    assert headless_phase1_family("https://b.stats.paypal.com/v2/counter.cgi?p=EC-TEST&s=CHECKOUT") == "observability"
 
 
 def test_paypal_observability_can_fulfill_datadog_required_slot() -> None:
@@ -226,6 +236,384 @@ def test_signup_context_allows_paypal_analytics_script() -> None:
     assert decision.reason == "signup_context_observability_script"
 
 
+def test_signup_context_allows_paypal_tealeaf_sdk_script() -> None:
+    runtime = signup_context_decision(
+        "https://www.paypalobjects.com/pa/3pjs/tl/6.4.177/patleaf.js",
+        method="GET",
+        resource_type="script",
+    )
+    config = signup_context_decision(
+        "https://www.paypalobjects.com/pa/3pjs/tl/6.4.177/patlcfg.js",
+        method="GET",
+        resource_type="script",
+    )
+
+    assert runtime.action == "allow"
+    assert runtime.reason == "signup_context_tealeaf_script"
+    assert config.action == "allow"
+    assert config.reason == "signup_context_tealeaf_script"
+
+
+def test_signup_context_allows_paypal_marketing_analytics_dependencies() -> None:
+    marketing = signup_context_decision(
+        "https://www.paypalobjects.com/martech/tm/paypal/mktgtagmanager.js",
+        method="GET",
+        resource_type="script",
+    )
+    analytics_config = signup_context_decision(
+        "https://www.paypalobjects.com/pa/mi/paypal/latmconf.js",
+        method="GET",
+        resource_type="script",
+    )
+    logger_route = signup_context_decision(
+        "https://www.paypal.com/xoplatform/logger/api/logger/",
+        method="POST",
+        resource_type="xhr",
+    )
+    stats = signup_context_decision(
+        "https://b.stats.paypal.com/v2/counter.cgi?p=EC-TEST&s=CHECKOUTUINODEWEB_ONBOARDING_LITE",
+        method="GET",
+        resource_type="image",
+    )
+
+    assert marketing.action == "allow"
+    assert marketing.reason == "signup_context_marketing_script"
+    assert analytics_config.action == "allow"
+    assert analytics_config.reason == "signup_context_analytics_config"
+    assert logger_route.action == "allow"
+    assert logger_route.reason == "signup_context_logger"
+    assert logger_route.family == "observability"
+    assert stats.action == "allow"
+    assert stats.reason == "signup_context_stats"
+    assert stats.family == "observability"
+
+
+def test_signup_context_allows_datadome_and_fraudnet_error_dependencies() -> None:
+    datadome_script = signup_context_decision(
+        "https://ct.ddc.paypal.com/i.js",
+        method="GET",
+        resource_type="script",
+    )
+    datadome_challenge_script = signup_context_decision(
+        "https://ct.ddc.paypal.com/c.js",
+        method="GET",
+        resource_type="script",
+    )
+    fraudnet_error = signup_context_decision(
+        "https://c.paypal.com/v1/r/d/b/e?appId=CHECKOUT&correlationID=EC-TEST",
+        method="GET",
+        resource_type="script",
+    )
+
+    assert datadome_script.action == "allow"
+    assert datadome_script.reason == "datadome_script"
+    assert datadome_challenge_script.action == "allow"
+    assert datadome_challenge_script.reason == "datadome_script"
+    assert fraudnet_error.action == "allow"
+    assert fraudnet_error.reason == "fraudnet_error"
+
+
+def test_signup_context_detects_geo_ddc_captcha_as_challenge_document() -> None:
+    challenge_url = "https://geo.ddc.paypal.com/captcha/?referer=https%3A%2F%2Fwww.paypal.com%2Fcheckoutweb%2Fsignup"
+    html = "<html><body>DataDome captcha <script>device_check_redirect_to_slider()</script></body></html>"
+
+    assessment = signup_context_document_assessment(challenge_url, 200, html)
+
+    assert headless_url_is_challenge(challenge_url) is True
+    assert datadome_challenge_present(200, html) is True
+    assert assessment["ok"] is False
+    assert assessment["reason"] == "signup_context_datadome_challenge"
+    assert assessment["blocked_by_datadome"] is True
+
+
+def test_signup_context_accepts_real_paypal_signup_document() -> None:
+    url = "https://www.paypal.com/checkoutweb/signup?token=EC-TEST123"
+    html = "<html><script src='/checkoutweb/release/weasley/app.js'></script><body>Create account</body></html>"
+
+    assessment = signup_context_document_assessment(url, 200, html)
+
+    assert assessment["ok"] is True
+    assert assessment["reason"] == "ok"
+    assert "weasley" in cast(list[object], assessment["normal_markers"])
+
+
+def test_signup_context_accepts_normal_signup_document_with_datadome_bootstrap_urls() -> None:
+    url = "https://www.paypal.com/checkoutweb/signup?token=EC-TEST123"
+    html = """
+    <html>
+      <head>
+        <script>
+          window.__DD_BOOTSTRAP__ = {
+            endpoint: "https://geo.ddc.paypal.com/captcha/?referer=/checkoutweb/signup",
+            tpl: "https://static.ddc.paypal.com/captcha/assets/tpl/index.css",
+            vendor: "captcha-delivery",
+            datadomeBlockedReason: "blocked request templates are declared here"
+          };
+        </script>
+        <script src="/checkoutweb/release/weasley/app.js"></script>
+      </head>
+      <body data-app="CHECKOUTUINODEWEB_ONBOARDING_LITE">Create account</body>
+    </html>
+    """
+
+    assessment = signup_context_document_assessment(url, 200, html)
+
+    assert datadome_challenge_present(200, html) is False
+    assert assessment["ok"] is True
+    assert assessment["reason"] == "ok"
+    assert assessment["challenge_markers"] == []
+
+
+def test_signup_context_accepts_normal_document_when_playwright_status_is_stale_403() -> None:
+    url = "https://www.paypal.com/checkoutweb/signup?token=EC-TEST123"
+    html = "<html><script src='/checkoutweb/release/weasley/app.js'></script><body>Create account</body></html>"
+
+    assessment = signup_context_document_assessment(url, 403, html)
+
+    assert assessment["ok"] is True
+    assert assessment["stale_challenge_status_with_normal_doc"] is True
+
+
+def test_signup_context_runs_risk_on_bootstrapped_document_without_replaying_navigation(monkeypatch: Any) -> None:
+    signup_url = "https://www.paypal.com/checkoutweb/signup?token=EC-TEST123"
+
+    class FakeResponse:
+        status = 200
+
+    class FakePage:
+        def __init__(self) -> None:
+            self.url = ""
+            self.goto_calls: list[str] = []
+
+        def goto(self, url: str, **_kwargs: object) -> FakeResponse:
+            self.goto_calls.append(url)
+            self.url = url
+            return FakeResponse()
+
+        def content(self) -> str:
+            return "<html><script src='/checkoutweb/release/weasley/app.js'></script><body>Create account</body></html>"
+
+        def wait_for_load_state(self, _state: str, **_kwargs: object) -> None:
+            return None
+
+        def wait_for_timeout(self, _timeout: float) -> None:
+            return None
+
+        def evaluate(self, _expression: str, _arg: object = None) -> object:
+            return {}
+
+        def on(self, _event: str, _callback: Callable[[object], None]) -> object:
+            return None
+
+    class FakeContext:
+        def __init__(self) -> None:
+            self.page = FakePage()
+
+        def new_page(self) -> FakePage:
+            return self.page
+
+        def cookies(self, _urls: list[str]) -> list[dict[str, object]]:
+            return [{"name": "datadome", "value": "dd-cookie-value", "domain": ".paypal.com", "path": "/"}]
+
+    session = local_headless.LocalHeadlessSession(runtime="headless")
+    fake_context = FakeContext()
+    session._context = fake_context
+    session._browser = object()
+    monkeypatch.setattr(session, "start", lambda: None)
+    monkeypatch.setattr(local_headless, "_wait_for_page_state_or_ready", lambda *args, **kwargs: True)
+
+    def fake_inject(_page: object, **_kwargs: object) -> None:
+        counts = cast(dict[str, object], session.events["counts"])
+        for family in ("fraudnet_p1", "fraudnet_p2", "fraudnet_w", "identity_di_log", "datadog_rum"):
+            counts[family] = 1
+
+    monkeypatch.setattr(session, "_inject_mtr_and_phase1_scripts", fake_inject)
+
+    result = session.run_mtr_phase1(
+        signup_url,
+        dfp_config={},
+        dfp_script_url="https://www.paypalobjects.com/rdaAssets/fraudnet/ext/dfp.js",
+        wait_seconds=0.01,
+        mtr_wait_seconds=0.01,
+        stage="signup_context",
+        new_page=True,
+        run_mtr=False,
+    )
+
+    assert result["ok"] is True
+    assert result["reason"] == "ok"
+    assert fake_context.page.goto_calls == [signup_url]
+    assert cast(dict[str, object], result["signup_context_page"])["ok"] is True
+
+
+def test_signup_context_can_seed_protocol_signup_html_without_datadome_bootstrap(monkeypatch: Any) -> None:
+    signup_url = "https://www.paypal.com/checkoutweb/signup?token=EC-TEST123"
+    html = "<html><script src='/checkoutweb/release/weasley/app.js'></script><body>Create account</body></html>"
+
+    class FakeResponse:
+        status = 200
+
+    class FakeRoute:
+        def __init__(self, page: "FakePage") -> None:
+            self.page = page
+
+        @property
+        def request(self) -> object:
+            class Request:
+                url = signup_url
+                method = "GET"
+                resource_type = "document"
+
+            return Request()
+
+        def fulfill(self, **kwargs: object) -> None:
+            self.page.fulfilled = dict(kwargs)
+            self.page.url = signup_url
+            self.page.html = str(kwargs.get("body") or "")
+
+        def continue_(self) -> None:
+            return None
+
+    class FakePage:
+        def __init__(self) -> None:
+            self.url = ""
+            self.html = ""
+            self.goto_calls: list[str] = []
+            self.route_handler: Callable[[object], None] | None = None
+            self.fulfilled: dict[str, object] = {}
+
+        def route(self, _url: str, callback: Callable[[object], None]) -> None:
+            self.route_handler = callback
+
+        def goto(self, url: str, **_kwargs: object) -> FakeResponse:
+            self.goto_calls.append(url)
+            if self.route_handler:
+                self.route_handler(FakeRoute(self))
+            else:
+                self.url = url
+                self.html = html
+            return FakeResponse()
+
+        def content(self) -> str:
+            return self.html
+
+        def wait_for_load_state(self, _state: str, **_kwargs: object) -> None:
+            return None
+
+        def wait_for_timeout(self, _timeout: float) -> None:
+            return None
+
+        def evaluate(self, _expression: str, _arg: object = None) -> object:
+            return {}
+
+        def on(self, _event: str, _callback: Callable[[object], None]) -> object:
+            return None
+
+    class FakeContext:
+        def __init__(self) -> None:
+            self.page = FakePage()
+
+        def new_page(self) -> FakePage:
+            return self.page
+
+        def cookies(self, _urls: list[str]) -> list[dict[str, object]]:
+            return []
+
+    session = local_headless.LocalHeadlessSession(runtime="headless")
+    fake_context = FakeContext()
+    session._context = fake_context
+    session._browser = object()
+    monkeypatch.setattr(session, "start", lambda: None)
+
+    def fake_inject(_page: object, **_kwargs: object) -> None:
+        counts = cast(dict[str, object], session.events["counts"])
+        for family in ("fraudnet_p1", "fraudnet_p2", "fraudnet_w", "identity_di_log", "datadog_rum"):
+            counts[family] = 1
+
+    monkeypatch.setattr(session, "_inject_mtr_and_phase1_scripts", fake_inject)
+
+    result = session.run_mtr_phase1(
+        signup_url,
+        dfp_config={},
+        dfp_script_url="https://www.paypalobjects.com/rdaAssets/fraudnet/ext/dfp.js",
+        wait_seconds=0.01,
+        mtr_wait_seconds=0.01,
+        stage="signup_context",
+        new_page=True,
+        run_mtr=False,
+        document_html=html,
+        document_status=200,
+    )
+
+    assert result["ok"] is True
+    assert fake_context.page.goto_calls == [signup_url]
+    assert fake_context.page.fulfilled["body"] == html
+    assert cast(dict[str, object], result["signup_context_seeded_document"])["enabled"] is True
+
+
+def test_signup_context_datadome_bootstrap_challenge_does_not_inject_risk(monkeypatch: Any) -> None:
+    signup_url = "https://www.paypal.com/checkoutweb/signup?token=EC-TEST123"
+
+    class FakeResponse:
+        status = 200
+
+    class FakePage:
+        def __init__(self) -> None:
+            self.url = ""
+
+        def goto(self, _url: str, **_kwargs: object) -> FakeResponse:
+            self.url = "https://geo.ddc.paypal.com/captcha/?referer=signup"
+            return FakeResponse()
+
+        def content(self) -> str:
+            return "<html><body>DataDome captcha device_check_redirect_to_slider</body></html>"
+
+        def wait_for_load_state(self, _state: str, **_kwargs: object) -> None:
+            return None
+
+        def wait_for_timeout(self, _timeout: float) -> None:
+            return None
+
+        def evaluate(self, _expression: str, _arg: object = None) -> object:
+            return {}
+
+        def on(self, _event: str, _callback: Callable[[object], None]) -> object:
+            return None
+
+    class FakeContext:
+        def __init__(self) -> None:
+            self.page = FakePage()
+
+        def new_page(self) -> FakePage:
+            return self.page
+
+        def cookies(self, _urls: list[str]) -> list[dict[str, object]]:
+            return [{"name": "datadome", "value": "dd-cookie-value", "domain": ".paypal.com", "path": "/"}]
+
+    session = local_headless.LocalHeadlessSession(runtime="headless")
+    fake_context = FakeContext()
+    session._context = fake_context
+    session._browser = object()
+    monkeypatch.setattr(session, "start", lambda: None)
+    monkeypatch.setattr(local_headless, "_wait_for_page_state_or_ready", lambda *args, **kwargs: False)
+    monkeypatch.setattr(session, "_inject_mtr_and_phase1_scripts", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("risk injection should not run on DataDome challenge")))
+
+    result = session.run_mtr_phase1(
+        signup_url,
+        dfp_config={},
+        dfp_script_url="https://www.paypalobjects.com/rdaAssets/fraudnet/ext/dfp.js",
+        wait_seconds=0.01,
+        mtr_wait_seconds=0.01,
+        stage="signup_context",
+        new_page=True,
+        run_mtr=False,
+    )
+
+    assert result["ok"] is False
+    assert result["reason"] == "signup_context_datadome_challenge"
+    assert result["blocked_by_datadome"] is True
+
+
 def test_headless_default_policy_uses_frozen_learned_cache_rules() -> None:
     rules = seed_headless_optimized_rules("checkout")
 
@@ -256,37 +644,105 @@ def test_headless_default_policy_uses_frozen_learned_cache_rules() -> None:
     assert datadog_ping_decision.reason == "learned_datadog_rum"
 
 
-def test_headless_dynamic_allowlist_cache_and_learning_are_opt_in(monkeypatch: Any, tmp_path: Any) -> None:
-    rule_class = getattr(local_headless, "HeadlessAllowlistRule")
-    save_rules = cast(Callable[[list[object]], list[dict[str, object]]], getattr(local_headless, "_save_headless_cached_rules"))
+def test_signup_context_allows_real_risk_signal_ping_resource_type() -> None:
+    fraudnet_decision = signup_context_decision(
+        "https://c.paypal.com/v1/r/d/b/p1",
+        method="POST",
+        resource_type="ping",
+    )
+    tealeaf_decision = signup_context_decision(
+        "https://www.paypal.com/platform/tealeaftarget",
+        method="POST",
+        resource_type="ping",
+    )
+    datadog_decision = signup_context_decision(
+        "https://browser-intake-us5-datadoghq.com/api/v2/rum",
+        method="POST",
+        resource_type="ping",
+    )
+
+    assert fraudnet_decision.action == "allow"
+    assert fraudnet_decision.reason == "fraudnet_p1"
+    assert tealeaf_decision.action == "allow"
+    assert tealeaf_decision.reason == "tealeaf_observe"
+    assert datadog_decision.action == "allow"
+    assert datadog_decision.reason == "learned_datadog_rum"
+
+
+def test_headless_allowlist_cache_is_ignored_after_rules_are_frozen(monkeypatch: Any, tmp_path: Any) -> None:
     build_rules = cast(Callable[[str], list[object]], getattr(local_headless, "_headless_rules"))
     learning_enabled = cast(Callable[[], bool], getattr(local_headless, "headless_allowlist_learning_enabled"))
     cache_path = tmp_path / "headless_allowlist_cache.json"
+    now = time.time()
 
     monkeypatch.setenv("PAYPAL_HEADLESS_ALLOWLIST_CACHE", str(cache_path))
-    monkeypatch.delenv("PAYPAL_HEADLESS_ALLOWLIST_CACHE_ENABLED", raising=False)
-    monkeypatch.delenv("PAYPAL_HEADLESS_DYNAMIC_ALLOWLIST_CACHE", raising=False)
-    monkeypatch.delenv("PAYPAL_HEADLESS_ALLOWLIST_LEARNING", raising=False)
-
-    save_rules([
-        rule_class(
-            "dynamic-cache.example",
-            "/learned",
-            methods=("GET",),
-            resource_types=("fetch",),
-            reason="learned_dynamic_cache",
-        )
-    ])
-
-    default_rules = build_rules("checkout")
-    assert all(getattr(rule, "host") != "dynamic-cache.example" for rule in default_rules)
-    assert learning_enabled() is False
-
-    monkeypatch.setenv("PAYPAL_HEADLESS_ALLOWLIST_CACHE_ENABLED", "1")
+    monkeypatch.delenv("PAYPAL_HEADLESS_IGNORE_CACHE", raising=False)
+    monkeypatch.delenv("PAYPAL_HEADLESS_OPTIMIZED_IGNORE_CACHE", raising=False)
     monkeypatch.setenv("PAYPAL_HEADLESS_ALLOWLIST_LEARNING", "1")
-    enabled_rules = build_rules("checkout")
-    assert any(getattr(rule, "host") == "dynamic-cache.example" for rule in enabled_rules)
-    assert learning_enabled() is True
+    cache_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "updated_at": now,
+                "rules": [
+                    {
+                        "host": "dynamic-cache.example",
+                        "path_prefix": "/learned",
+                        "methods": ["GET"],
+                        "resource_types": ["fetch"],
+                        "reason": "learned_dynamic_cache",
+                        "created_at": now,
+                        "last_seen": now,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    rules = build_rules("checkout")
+    before = cache_path.read_text(encoding="utf-8")
+
+    assert all(getattr(rule, "host") != "dynamic-cache.example" for rule in rules)
+    assert any(getattr(rule, "host") == "ddbm2.paypal.com" and getattr(rule, "reason") == "learned_ddbm" for rule in rules)
+    assert any(getattr(rule, "host") == "www.paypal.com" and getattr(rule, "reason") == "learned_identity_di_log" for rule in rules)
+    assert any(getattr(rule, "host") == "browser-intake-us5-datadoghq.com" and getattr(rule, "reason") == "learned_datadog_rum" for rule in rules)
+    assert learning_enabled() is False
+    assert cache_path.read_text(encoding="utf-8") == before
+
+
+def test_signup_context_missing_required_signals_writes_redacted_diagnostic(monkeypatch: Any, tmp_path: Any) -> None:
+    diagnostic_path = tmp_path / "headless_last_missing_signup_context.json"
+    monkeypatch.setenv("PAYPAL_HEADLESS_MISSING_DIAGNOSTIC_PATH", str(diagnostic_path))
+
+    session = local_headless.LocalHeadlessSession(runtime="headless")
+    session.events["injected_scripts"] = ["https://c.paypal.com/da/r/fb_fp.js"]
+    session.events["blocked_requests"] = [
+        {
+            "event": "route",
+            "url": "https://www.paypalobjects.com/martech/tm/paypal/mktgtagmanager.js",
+            "method": "GET",
+            "resource_type": "script",
+            "decision": {"action": "abort", "reason": "not_allowlisted"},
+        }
+    ]
+    writer = cast(Callable[..., str], getattr(session, "_write_signup_context_missing_diagnostic"))
+
+    written = writer(
+        page_url="https://www.paypal.com/checkoutweb/signup?ssrt=SECRETSSRT&ba_token=BA-SECRET&token=EC-SECRET",
+        status=200,
+        observed=["identity_di_log", "ddbm"],
+        missing=["fraudnet_p1", "datadog_rum"],
+        required_missing=["fraudnet_p1", "datadog_rum"],
+        run_mtr=True,
+    )
+
+    payload = json.loads(diagnostic_path.read_text(encoding="utf-8"))
+    assert written == str(diagnostic_path)
+    assert payload["required_missing"] == ["fraudnet_p1", "datadog_rum"]
+    assert payload["page_url"] == "https://www.paypal.com/checkoutweb/signup?ssrt=%3Credacted%3E&ba_token=%3Credacted%3E&token=%3Credacted%3E"
+    assert "SECRET" not in diagnostic_path.read_text(encoding="utf-8")
+    assert payload["important_decisions"]["fraudnet_p1_rt_p"]["action"] == "allow"
 
 
 def test_signup_context_allowlist_does_not_open_checkout_or_static_styles() -> None:

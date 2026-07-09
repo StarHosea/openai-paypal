@@ -4,6 +4,7 @@ import base64
 import hashlib
 import json
 import os
+import random
 import re
 import tempfile
 import threading
@@ -53,9 +54,13 @@ class _Page(Protocol):
 
     def on(self, event: str, callback: Callable[[object], None]) -> object: ...
 
+    def route(self, url: str, callback: Callable[[object], None]) -> object: ...
+
 
 class _BrowserContext(Protocol):
     def add_cookies(self, cookies: list[JsonObject]) -> None: ...
+
+    def set_extra_http_headers(self, headers: dict[str, str]) -> None: ...
 
     def new_page(self) -> _Page: ...
 
@@ -184,6 +189,8 @@ def _redact_debug_value(value: object, key: str = "") -> object:
     if compact == "url" and isinstance(value, str):
         return _redact_debug_url(value)
     if any(part in compact for part in _DEBUG_SENSITIVE_KEY_PARTS):
+        if isinstance(value, (bool, int, float)):
+            return value
         return "<redacted>" if value else value
     if isinstance(value, dict):
         return {str(item_key): _redact_debug_value(item_value, str(item_key)) for item_key, item_value in value.items()}
@@ -479,6 +486,511 @@ def _context_options(
     }
 
 
+def _chrome_version_parts(profile: JsonObject) -> tuple[int, str]:
+    user_agent = str(profile.get("user_agent") or USER_AGENT)
+    major = _int_value(profile.get("chrome_major"), _parse_chrome_major(user_agent, 150))
+    full_version = _str_value(profile.get("chrome_full_version"))
+    if not full_version:
+        match = re.search(r"(?:Chrome|Chromium|HeadlessChrome)/([0-9.]+)", user_agent)
+        full_version = match.group(1) if match else f"{major}.0.0.0"
+    if not full_version.startswith(f"{major}."):
+        full_version = f"{major}.0.0.0"
+    return major, full_version
+
+
+def _chrome_user_agent_metadata(profile: JsonObject) -> JsonObject:
+    major, full_version = _chrome_version_parts(profile)
+    platform_text = str(profile.get("sec_ch_platform") or '"Linux"').strip('"') or "Linux"
+    architecture = str(profile.get("sec_ch_arch") or '"x86"').strip('"') or "x86"
+    return {
+        "brands": [
+            {"brand": "Not;A=Brand", "version": "8"},
+            {"brand": "Chromium", "version": str(major)},
+            {"brand": "Google Chrome", "version": str(major)},
+        ],
+        "fullVersionList": [
+            {"brand": "Not;A=Brand", "version": "8.0.0.0"},
+            {"brand": "Chromium", "version": full_version},
+            {"brand": "Google Chrome", "version": full_version},
+        ],
+        "fullVersion": full_version,
+        "platform": platform_text,
+        "platformVersion": str(profile.get("sec_ch_platform_version") or "").strip('"'),
+        "architecture": architecture,
+        "model": "",
+        "mobile": False,
+        "bitness": "64" if architecture in {"x86", "arm"} else "",
+        "wow64": False,
+    }
+
+
+def _ua_data_script_config(profile: JsonObject) -> JsonObject:
+    metadata = _chrome_user_agent_metadata(profile)
+    return {
+        "brands": metadata.get("brands") or [],
+        "fullVersionList": metadata.get("fullVersionList") or [],
+        "fullVersion": metadata.get("fullVersion") or "",
+        "platform": metadata.get("platform") or str(profile.get("sec_ch_platform") or '"Linux"').strip('"') or "Linux",
+        "platformVersion": metadata.get("platformVersion") or "",
+        "architecture": metadata.get("architecture") or "x86",
+        "model": metadata.get("model") or "",
+        "mobile": bool(metadata.get("mobile", False)),
+        "bitness": metadata.get("bitness") or "64",
+        "wow64": bool(metadata.get("wow64", False)),
+    }
+
+
+def _js_native_function_source(name: str) -> str:
+    return f"function {name}() {{ [native code] }}"
+
+
+def _headless_cookie_cache_enabled() -> bool:
+    raw = _env_text("PAYPAL_HEADLESS_COOKIE_CACHE", "PAYPAL_LOCAL_HEADLESS_COOKIE_CACHE").strip().lower()
+    return raw not in {"0", "false", "no", "off", "disabled", "disable"}
+
+
+def _headless_cookie_cache_path() -> Path:
+    raw = _env_text("PAYPAL_HEADLESS_COOKIE_CACHE_PATH", "PAYPAL_LOCAL_HEADLESS_COOKIE_CACHE_PATH")
+    return Path(raw).expanduser().resolve() if raw else (_headless_optimized_project_root() / "var" / "headless_cookie_cache.json")
+
+
+def _headless_cookie_cache_key(proxy_url: str, profile: JsonObject) -> str:
+    proxy_host = ""
+    proxy_scheme = ""
+    try:
+        parsed = urlsplit(proxy_url or "")
+        proxy_scheme = parsed.scheme or ""
+        proxy_host = parsed.hostname or ""
+        if parsed.port is not None:
+            proxy_host = f"{proxy_host}:{parsed.port}"
+    except Exception:
+        proxy_host = proxy_url or ""
+    material = {
+        "proxy": f"{proxy_scheme}://{proxy_host}" if proxy_host else "",
+        "ua": str(profile.get("user_agent") or USER_AGENT),
+        "platform": str(profile.get("sec_ch_platform") or profile.get("platform") or ""),
+        "timezone": str(profile.get("timezone") or ""),
+        "locale": str(profile.get("locale") or profile.get("language") or ""),
+    }
+    return hashlib.sha256(_json_bytes(material)).hexdigest()[:32]
+
+
+def _cookie_identity(cookie: JsonObject) -> tuple[str, str, str]:
+    return (
+        str(cookie.get("name") or ""),
+        str(cookie.get("domain") or cookie.get("url") or ""),
+        str(cookie.get("path") or "/"),
+    )
+
+
+def _merge_cookie_lists(*groups: list[JsonObject]) -> list[JsonObject]:
+    merged: dict[tuple[str, str, str], JsonObject] = {}
+    order: list[tuple[str, str, str]] = []
+    for cookies in groups:
+        for cookie in cookies or []:
+            item = _normalize_cookie(cookie)
+            if not item:
+                continue
+            key = _cookie_identity(item)
+            if key not in merged:
+                order.append(key)
+            merged[key] = item
+    return [merged[key] for key in order if key in merged]
+
+
+def _paypal_cookie_cache_filter(cookies: list[JsonObject]) -> list[JsonObject]:
+    now = time.time()
+    filtered: list[JsonObject] = []
+    for cookie in cookies or []:
+        item = _normalize_cookie(cookie)
+        if not item:
+            continue
+        domain = str(item.get("domain") or item.get("url") or "").lower()
+        name = str(item.get("name") or "").lower()
+        if not any(host in domain for host in ("paypal.com", "paypalobjects.com", "ddbm2.paypal.com")):
+            continue
+        expires = item.get("expires")
+        if isinstance(expires, (int, float)) and expires > 0 and float(expires) < now + 30:
+            continue
+        if name in {"datadome", "ddall", "ddgl", "ts", "ts_c", "x-pp-s", "nsid", "tsrce", "d_id", "lang", "_dd_s"} or "paypal" in domain:
+            filtered.append(item)
+    return filtered
+
+
+def _load_headless_cached_cookies(proxy_url: str, profile: JsonObject) -> list[JsonObject]:
+    if not _headless_cookie_cache_enabled():
+        return []
+    path = _headless_cookie_cache_path()
+    if not path.exists():
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8") or "{}")
+    except Exception as exc:
+        logger.debug("Local headless cookie cache is unreadable; ignoring: {}", exc)
+        return []
+    key = _headless_cookie_cache_key(proxy_url, profile)
+    entries = _dict_value(_dict_value(data).get("entries"))
+    entry = _dict_value(entries.get(key))
+    cookies = _paypal_cookie_cache_filter(cast(list[JsonObject], _list_value(entry.get("cookies"))))
+    return cookies
+
+
+def _save_headless_cached_cookies(proxy_url: str, profile: JsonObject, cookies: list[JsonObject]) -> None:
+    if not _headless_cookie_cache_enabled():
+        return
+    filtered = _paypal_cookie_cache_filter(cookies)
+    if not filtered:
+        return
+    path = _headless_cookie_cache_path()
+    lock_handle = _lock_cache_file(path.with_suffix(path.suffix + ".lock"))
+    now = time.time()
+    key = _headless_cookie_cache_key(proxy_url, profile)
+    try:
+        payload: JsonObject = {"version": 1, "updated_at": now, "entries": {}}
+        if path.exists():
+            try:
+                loaded = json.loads(path.read_text(encoding="utf-8") or "{}")
+                if isinstance(loaded, dict):
+                    payload.update(cast(JsonObject, loaded))
+            except Exception:
+                pass
+        entries = _dict_value(payload.get("entries"))
+        entries[key] = {
+            "updated_at": now,
+            "profile": {
+                "user_agent": str(profile.get("user_agent") or USER_AGENT),
+                "platform": str(profile.get("sec_ch_platform") or profile.get("platform") or ""),
+                "timezone": str(profile.get("timezone") or ""),
+                "locale": str(profile.get("locale") or profile.get("language") or ""),
+            },
+            "cookies": filtered,
+        }
+        payload["version"] = 1
+        payload["updated_at"] = now
+        payload["entries"] = entries
+        _prepare_private_dir(path.parent)
+        fd, temp_name = tempfile.mkstemp(prefix=path.name, suffix=".tmp", dir=str(path.parent))
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
+                handle.write("\n")
+            os.chmod(temp_name, 0o600)
+            os.replace(temp_name, path)
+        finally:
+            if os.path.exists(temp_name):
+                os.unlink(temp_name)
+    finally:
+        try:
+            import fcntl
+
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+            lock_handle.close()
+        except Exception:
+            pass
+
+
+def _headless_language_list(language: str) -> list[str]:
+    values: list[str] = []
+    for item in (language, language.split("-", 1)[0] if "-" in language else "", "en-US", "en"):
+        if item and item not in values:
+            values.append(item)
+    return values
+
+
+def _sec_ch_ua_header_from_metadata(metadata: JsonObject, *, full: bool = False) -> str:
+    key = "fullVersionList" if full else "brands"
+    items = _list_value(metadata.get(key))
+    parts: list[str] = []
+    for item in items:
+        entry = _dict_value(item)
+        brand = _str_value(entry.get("brand"))
+        version = _str_value(entry.get("version"))
+        if brand and version:
+            parts.append(f'"{brand}";v="{version}"')
+    return ", ".join(parts)
+
+
+def _headless_extra_http_headers(profile: JsonObject) -> dict[str, str]:
+    metadata = _chrome_user_agent_metadata(profile)
+    language = str(profile.get("language") or "pt-BR")
+    bitness = str(metadata.get("bitness") or profile.get("sec_ch_bitness") or "64")
+    platform_version = str(metadata.get("platformVersion") or profile.get("sec_ch_platform_version") or "").strip('"')
+    return {
+        "Accept-Language": f"{language},pt;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Sec-CH-UA": _sec_ch_ua_header_from_metadata(metadata),
+        "Sec-CH-UA-Mobile": "?0",
+        "Sec-CH-UA-Platform": str(profile.get("sec_ch_platform") or '"Linux"'),
+        "Sec-CH-UA-Arch": str(profile.get("sec_ch_arch") or '"x86"'),
+        "Sec-CH-UA-Bitness": json.dumps(bitness),
+        "Sec-CH-UA-Full-Version-List": _sec_ch_ua_header_from_metadata(metadata, full=True),
+        "Sec-CH-UA-Model": '""',
+        "Sec-CH-UA-Platform-Version": json.dumps(platform_version),
+        "Sec-CH-UA-WoW64": "?0",
+        "Sec-CH-Device-Memory": str(profile.get("device_memory") or "8"),
+    }
+
+
+def _stealth_init_script(
+    *,
+    browser_profile: JsonObject | None = None,
+    screen: JsonObject | None = None,
+    viewport: JsonObject | None = None,
+) -> str:
+    profile = _merged_context_dict(BROWSER_PROFILE, browser_profile)
+    viewport_options = _merged_context_dict(VIEWPORT, viewport)
+    screen_options = _merged_context_dict(SCREEN, screen)
+    language = str(profile.get("language") or "pt-BR")
+    user_agent = str(profile.get("user_agent") or USER_AGENT)
+    ua_data = _ua_data_script_config(profile)
+    configured_webgl_vendor = _env_text("PAYPAL_HEADLESS_WEBGL_VENDOR")
+    configured_webgl_renderer = _env_text("PAYPAL_HEADLESS_WEBGL_RENDERER")
+    profile_gpu_vendor = str(profile.get("gpu_vendor") or profile.get("webgl_vendor") or "")
+    profile_gpu_renderer = str(profile.get("gpu_renderer") or profile.get("webgl_renderer") or "")
+    spoof_webgl = _env_bool("PAYPAL_HEADLESS_SPOOF_WEBGL", False) or _env_bool("PAYPAL_LOCAL_HEADLESS_SPOOF_WEBGL", False)
+    if not configured_webgl_vendor and not configured_webgl_renderer and not spoof_webgl:
+        profile_gpu_vendor = ""
+        profile_gpu_renderer = ""
+    config = {
+        "userAgent": user_agent,
+        "appVersion": user_agent.split("Mozilla/", 1)[-1] if user_agent.startswith("Mozilla/") else user_agent,
+        "languages": _headless_language_list(language),
+        "language": language,
+        "platform": str(profile.get("platform") or "Linux x86_64"),
+        "hardwareConcurrency": _int_value(profile.get("hardware_concurrency"), 8),
+        "deviceMemory": _int_value(profile.get("device_memory"), 8),
+        "screenWidth": _int_value(screen_options.get("width"), 1536),
+        "screenHeight": _int_value(screen_options.get("height"), 864),
+        "screenAvailWidth": _int_value(screen_options.get("availWidth"), _int_value(screen_options.get("width"), 1536)),
+        "screenAvailHeight": _int_value(screen_options.get("availHeight"), _int_value(screen_options.get("height"), 864)),
+        "viewportWidth": _int_value(viewport_options.get("width"), 1365),
+        "viewportHeight": _int_value(viewport_options.get("height"), 768),
+        "timezone": str(profile.get("timezone") or "America/Sao_Paulo"),
+        "webglVendor": configured_webgl_vendor or profile_gpu_vendor,
+        "webglRenderer": configured_webgl_renderer or profile_gpu_renderer,
+        "uaData": ua_data,
+    }
+    return f"""
+(() => {{
+  const cfg = {json.dumps(config, ensure_ascii=False)};
+  const nativeSource = (name) => `function ${{name}}() {{ [native code] }}`;
+  const defineGetter = (obj, prop, getter) => {{
+    try {{ Object.defineProperty(obj, prop, {{ get: getter, configurable: true }}); }} catch (_e) {{}}
+  }};
+  const defineValue = (obj, prop, value) => {{
+    try {{ Object.defineProperty(obj, prop, {{ value, configurable: true, writable: true }}); }} catch (_e) {{}}
+  }};
+  const patchToString = (fn, name) => {{
+    try {{ Object.defineProperty(fn, "toString", {{ value: () => nativeSource(name), configurable: true }}); }} catch (_e) {{}}
+    return fn;
+  }};
+  const makeUAData = () => {{
+    const data = cfg.uaData || {{}};
+    const values = {{
+      brands: (data.brands || []).map((item) => Object.assign({{}}, item)),
+      mobile: !!data.mobile,
+      platform: data.platform || "",
+      architecture: data.architecture || "",
+      bitness: data.bitness || "",
+      model: data.model || "",
+      platformVersion: data.platformVersion || "",
+      uaFullVersion: data.fullVersion || "",
+      fullVersionList: (data.fullVersionList || []).map((item) => Object.assign({{}}, item)),
+      wow64: !!data.wow64
+    }};
+    const result = {{
+      brands: values.brands,
+      mobile: values.mobile,
+      platform: values.platform,
+      getHighEntropyValues: patchToString(async (hints) => {{
+        const out = {{}};
+        for (const hint of (Array.isArray(hints) ? hints : [])) {{
+          if (hint in values) out[hint] = Array.isArray(values[hint]) ? values[hint].map((item) => Object.assign({{}}, item)) : values[hint];
+        }}
+        return out;
+      }}, "getHighEntropyValues"),
+      toJSON: patchToString(() => ({{ brands: values.brands, mobile: values.mobile, platform: values.platform }}), "toJSON")
+    }};
+    try {{ Object.defineProperty(result, Symbol.toStringTag, {{ value: "NavigatorUAData", configurable: true }}); }} catch (_e) {{}}
+    return result;
+  }};
+  const patchNavigatorLike = (proto) => {{
+    if (!proto) return;
+    defineGetter(proto, "webdriver", () => undefined);
+    defineGetter(proto, "userAgent", () => cfg.userAgent);
+    defineGetter(proto, "appVersion", () => cfg.appVersion);
+    defineGetter(proto, "language", () => cfg.language);
+    defineGetter(proto, "languages", () => cfg.languages.slice());
+    defineGetter(proto, "platform", () => cfg.platform);
+    defineGetter(proto, "hardwareConcurrency", () => cfg.hardwareConcurrency);
+    defineGetter(proto, "deviceMemory", () => cfg.deviceMemory);
+    defineGetter(proto, "userAgentData", () => makeUAData());
+  }};
+  const patchWebGL = (root) => {{
+    try {{
+      const patch = (proto) => {{
+        if (!proto || !proto.getParameter || proto.__paypalHeadlessPatched) return;
+        const original = proto.getParameter;
+        defineValue(proto, "getParameter", patchToString(function(parameter) {{
+          if (parameter === 37445 && cfg.webglVendor) return cfg.webglVendor;
+          if (parameter === 37446 && cfg.webglRenderer) return cfg.webglRenderer;
+          return original.apply(this, arguments);
+        }}, "getParameter"));
+        try {{ Object.defineProperty(proto, "__paypalHeadlessPatched", {{ value: true }}); }} catch (_e) {{}}
+      }};
+      patch(root.WebGLRenderingContext && root.WebGLRenderingContext.prototype);
+      patch(root.WebGL2RenderingContext && root.WebGL2RenderingContext.prototype);
+    }} catch (_e) {{}}
+  }};
+  const patchIntl = (root) => {{
+    try {{
+      const proto = root.Intl && root.Intl.DateTimeFormat && root.Intl.DateTimeFormat.prototype;
+      if (!proto || proto.__paypalTimezonePatched) return;
+      const original = proto.resolvedOptions;
+      defineValue(proto, "resolvedOptions", patchToString(function() {{
+        const value = original.apply(this, arguments) || {{}};
+        try {{ value.timeZone = cfg.timezone; }} catch (_e) {{}}
+        return value;
+      }}, "resolvedOptions"));
+      try {{ Object.defineProperty(proto, "__paypalTimezonePatched", {{ value: true }}); }} catch (_e) {{}}
+    }} catch (_e) {{}}
+  }};
+  try {{
+    delete window.__playwright__binding__;
+    delete window.__pwInitScripts;
+    patchNavigatorLike(Navigator.prototype);
+  }} catch (_e) {{}}
+  try {{
+    defineGetter(Screen.prototype, "width", () => cfg.screenWidth);
+    defineGetter(Screen.prototype, "height", () => cfg.screenHeight);
+    defineGetter(Screen.prototype, "availWidth", () => cfg.screenAvailWidth);
+    defineGetter(Screen.prototype, "availHeight", () => cfg.screenAvailHeight);
+  }} catch (_e) {{}}
+  try {{
+    const outerWidth = Math.min(cfg.screenWidth, Math.max(cfg.viewportWidth, window.innerWidth || cfg.viewportWidth) + 16);
+    const outerHeight = Math.min(cfg.screenHeight, Math.max(cfg.viewportHeight, window.innerHeight || cfg.viewportHeight) + 88);
+    defineGetter(window, "outerWidth", () => outerWidth);
+    defineGetter(window, "outerHeight", () => outerHeight);
+  }} catch (_e) {{}}
+  try {{
+    const originalQuery = window.navigator.permissions && window.navigator.permissions.query;
+    if (originalQuery) {{
+      window.navigator.permissions.query = patchToString(function(parameters) {{
+        if (parameters && parameters.name === "notifications") {{
+          const state = (window.Notification && window.Notification.permission) || "default";
+          return Promise.resolve({{ state, onchange: null }});
+        }}
+        return originalQuery.apply(this, arguments);
+      }}, "query");
+    }}
+  }} catch (_e) {{}}
+  patchWebGL(window);
+  patchIntl(window);
+  try {{
+    const workerPrelude = `(() => {{
+      const cfg = ${{JSON.stringify(cfg)}};
+      const nativeSource = (name) => \\`function ${{name}}() {{ [native code] }}\\`;
+      const defineGetter = (obj, prop, getter) => {{ try {{ Object.defineProperty(obj, prop, {{ get: getter, configurable: true }}); }} catch (_e) {{}} }};
+      const defineValue = (obj, prop, value) => {{ try {{ Object.defineProperty(obj, prop, {{ value, configurable: true, writable: true }}); }} catch (_e) {{}} }};
+      const patchToString = (fn, name) => {{ try {{ Object.defineProperty(fn, "toString", {{ value: () => nativeSource(name), configurable: true }}); }} catch (_e) {{}} return fn; }};
+      const makeUAData = () => {{
+        const data = cfg.uaData || {{}};
+        const values = {{
+          brands: (data.brands || []).map((item) => Object.assign({{}}, item)), mobile: !!data.mobile, platform: data.platform || "",
+          architecture: data.architecture || "", bitness: data.bitness || "", model: data.model || "",
+          platformVersion: data.platformVersion || "", uaFullVersion: data.fullVersion || "",
+          fullVersionList: (data.fullVersionList || []).map((item) => Object.assign({{}}, item)), wow64: !!data.wow64
+        }};
+        return {{ brands: values.brands, mobile: values.mobile, platform: values.platform, getHighEntropyValues: patchToString(async (hints) => {{ const out = {{}}; for (const hint of (Array.isArray(hints) ? hints : [])) {{ if (hint in values) out[hint] = Array.isArray(values[hint]) ? values[hint].map((item) => Object.assign({{}}, item)) : values[hint]; }} return out; }}, "getHighEntropyValues"), toJSON: patchToString(() => ({{ brands: values.brands, mobile: values.mobile, platform: values.platform }}), "toJSON") }};
+      }};
+      try {{
+        const proto = self.WorkerNavigator && self.WorkerNavigator.prototype;
+        if (proto) {{
+          defineGetter(proto, "userAgent", () => cfg.userAgent);
+          defineGetter(proto, "appVersion", () => cfg.appVersion);
+          defineGetter(proto, "language", () => cfg.language);
+          defineGetter(proto, "languages", () => cfg.languages.slice());
+          defineGetter(proto, "platform", () => cfg.platform);
+          defineGetter(proto, "hardwareConcurrency", () => cfg.hardwareConcurrency);
+          defineGetter(proto, "deviceMemory", () => cfg.deviceMemory);
+          defineGetter(proto, "userAgentData", () => makeUAData());
+          defineGetter(proto, "webdriver", () => undefined);
+        }}
+      }} catch (_e) {{}}
+      try {{
+        const patch = (proto) => {{
+          if (!proto || !proto.getParameter || proto.__paypalHeadlessPatched) return;
+          const original = proto.getParameter;
+          defineValue(proto, "getParameter", patchToString(function(parameter) {{ if (parameter === 37445 && cfg.webglVendor) return cfg.webglVendor; if (parameter === 37446 && cfg.webglRenderer) return cfg.webglRenderer; return original.apply(this, arguments); }}, "getParameter"));
+          try {{ Object.defineProperty(proto, "__paypalHeadlessPatched", {{ value: true }}); }} catch (_e) {{}}
+        }};
+        patch(self.WebGLRenderingContext && self.WebGLRenderingContext.prototype);
+        patch(self.WebGL2RenderingContext && self.WebGL2RenderingContext.prototype);
+      }} catch (_e) {{}}
+      try {{
+        const proto = self.Intl && self.Intl.DateTimeFormat && self.Intl.DateTimeFormat.prototype;
+        if (proto && !proto.__paypalTimezonePatched) {{
+          const original = proto.resolvedOptions;
+          defineValue(proto, "resolvedOptions", patchToString(function() {{ const value = original.apply(this, arguments) || {{}}; try {{ value.timeZone = cfg.timezone; }} catch (_e) {{}} return value; }}, "resolvedOptions"));
+          try {{ Object.defineProperty(proto, "__paypalTimezonePatched", {{ value: true }}); }} catch (_e) {{}}
+        }}
+      }} catch (_e) {{}}
+    }})();\n`;
+    const NativeBlob = window.Blob;
+    if (NativeBlob && !NativeBlob.__paypalHeadlessPatched) {{
+      const PatchedBlob = function(parts, options) {{
+        const opts = options || {{}};
+        const type = String(opts.type || "").toLowerCase();
+        if (type.includes("javascript") || type.includes("ecmascript")) {{
+          try {{ return new NativeBlob([workerPrelude].concat(Array.from(parts || [])), opts); }} catch (_e) {{}}
+        }}
+        return new NativeBlob(parts, opts);
+      }};
+      try {{ Object.setPrototypeOf(PatchedBlob, NativeBlob); }} catch (_e) {{}}
+      PatchedBlob.prototype = NativeBlob.prototype;
+      try {{ Object.defineProperty(PatchedBlob, "name", {{ value: "Blob" }}); }} catch (_e) {{}}
+      patchToString(PatchedBlob, "Blob");
+      try {{ Object.defineProperty(PatchedBlob, "__paypalHeadlessPatched", {{ value: true }}); }} catch (_e) {{}}
+      defineValue(window, "Blob", PatchedBlob);
+    }}
+  }} catch (_e) {{}}
+}})();
+"""
+
+def _apply_cdp_stealth_overrides(
+    context: Any,
+    page: Any,
+    *,
+    browser_profile: JsonObject | None = None,
+) -> None:
+    profile = _merged_context_dict(BROWSER_PROFILE, browser_profile)
+    language = str(profile.get("language") or "pt-BR")
+    try:
+        cdp = context.new_cdp_session(page)
+    except Exception as exc:
+        logger.debug("Local headless CDP stealth session unavailable: {}", exc)
+        return
+    try:
+        cdp.send(
+            "Network.setUserAgentOverride",
+            {
+                "userAgent": str(profile.get("user_agent") or USER_AGENT),
+                "acceptLanguage": f"{language},pt;q=0.9,en-US;q=0.8,en;q=0.7",
+                "platform": str(profile.get("platform") or "Linux x86_64"),
+                "userAgentMetadata": _chrome_user_agent_metadata(profile),
+            },
+        )
+    except Exception as exc:
+        logger.debug("Local headless UA metadata override failed: {}", exc)
+    try:
+        cdp.send("Emulation.setTimezoneOverride", {"timezoneId": str(profile.get("timezone") or "America/Sao_Paulo")})
+    except Exception:
+        pass
+    try:
+        cdp.send("Emulation.setLocaleOverride", {"locale": language})
+    except Exception:
+        pass
+
+
 def _load_dotenv_value(name: str) -> str:
     if os.getenv(name):
         return os.getenv(name, "").strip()
@@ -533,13 +1045,29 @@ def _local_headless_browser_channel() -> str:
 
 
 def _base_launch_kwargs(proxy_url: str | None, *, channel: str) -> JsonObject:
+    angle_backend = _env_text("PAYPAL_HEADLESS_ANGLE_BACKEND", "PAYPAL_LOCAL_HEADLESS_ANGLE_BACKEND").strip().lower()
+    if not angle_backend:
+        angle_backend = "gl"
+    args = [
+        "--ignore-gpu-blocklist",
+        "--enable-webgl",
+        "--enable-accelerated-2d-canvas",
+        "--disable-search-engine-choice-screen",
+        "--disable-blink-features=AutomationControlled",
+        "--disable-infobars",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--password-store=basic",
+        "--use-mock-keychain",
+    ]
+    if angle_backend not in {"0", "false", "no", "none", "off", "default", "disabled", "disable"}:
+        args.insert(0, f"--use-angle={angle_backend}")
+    if _env_bool("PAYPAL_HEADLESS_ENABLE_SWIFTSHADER", False) or _env_bool("PAYPAL_LOCAL_HEADLESS_ENABLE_SWIFTSHADER", False):
+        args.append("--enable-unsafe-swiftshader")
     kwargs: JsonObject = {
         "headless": True,
-        "args": [
-            "--enable-unsafe-swiftshader",
-            "--disable-search-engine-choice-screen",
-            "--disable-blink-features=AutomationControlled",
-        ],
+        "ignore_default_args": ["--enable-automation"],
+        "args": args,
     }
     if channel:
         kwargs["channel"] = channel
@@ -592,6 +1120,13 @@ def _normalize_cookie(cookie: JsonObject) -> JsonObject | None:
     same_site = str(cookie.get("sameSite") or cookie.get("same_site") or "")
     if same_site in {"Strict", "Lax", "None"}:
         item["sameSite"] = same_site
+    expires = cookie.get("expires")
+    if isinstance(expires, (int, float)) and float(expires) > 0:
+        item["expires"] = float(expires)
+    if "httpOnly" in cookie:
+        item["httpOnly"] = bool(cookie.get("httpOnly"))
+    elif "http_only" in cookie:
+        item["httpOnly"] = bool(cookie.get("http_only"))
     return item
 
 
@@ -718,7 +1253,6 @@ _HEADLESS_OPTIMIZED_REQUIRED_SIGNALS = (
     "identity_di_log",
     "datadog_rum",
 )
-_HEADLESS_OPTIMIZED_CACHE_VERSION = 1
 _HEADLESS_OPTIMIZED_CACHE_TTL_SECONDS = 7 * 24 * 60 * 60
 _headless_optimized_semaphore_instance: threading.BoundedSemaphore | None = None
 _HEADLESS_OPTIMIZED_SEMAPHORE_LOCK = threading.Lock()
@@ -902,6 +1436,39 @@ def headless_datadome_wait_seconds() -> float:
     return headless_optimized_datadome_wait_seconds()
 
 
+def headless_datadome_prewarm_enabled() -> bool:
+    raw = _env_text("PAYPAL_HEADLESS_DATADOME_PREWARM", "PAYPAL_LOCAL_HEADLESS_DATADOME_PREWARM").strip().lower()
+    return raw not in {"0", "false", "no", "off", "disabled", "disable"}
+
+
+def headless_interactions_enabled() -> bool:
+    raw = _env_text("PAYPAL_HEADLESS_INTERACTIONS", "PAYPAL_LOCAL_HEADLESS_INTERACTIONS").strip().lower()
+    return raw not in {"0", "false", "no", "off", "disabled", "disable"}
+
+
+def _headless_datadome_prewarm_urls(target_url: str) -> list[str]:
+    raw = _env_text("PAYPAL_HEADLESS_DATADOME_PREWARM_URLS", "PAYPAL_LOCAL_HEADLESS_DATADOME_PREWARM_URLS")
+    if raw:
+        values = [item.strip() for item in raw.split(",") if item.strip()]
+    else:
+        values = [
+            "https://www.paypal.com/",
+            "https://www.paypal.com/signin",
+        ]
+    try:
+        target = urlsplit(target_url or "")
+        target_origin = urlunsplit((target.scheme or "https", target.netloc or "www.paypal.com", "/", "", ""))
+        if target_origin not in values:
+            values.insert(0, target_origin)
+    except Exception:
+        pass
+    deduped: list[str] = []
+    for value in values:
+        if value and value not in deduped and not _headless_url_is_challenge(value):
+            deduped.append(value)
+    return deduped[:4]
+
+
 def headless_optimized_mtr_wait_seconds() -> float:
     return _headless_optimized_float_env(
         "PAYPAL_HEADLESS_MTR_WAIT_SECONDS",
@@ -958,9 +1525,14 @@ def _headless_optimized_debug_root() -> Path:
     return Path(raw).expanduser().resolve() if raw else (_headless_optimized_project_root() / "debug" / "headless")
 
 
-def _headless_optimized_cache_path() -> Path:
-    raw = _env_text("PAYPAL_HEADLESS_ALLOWLIST_CACHE", "PAYPAL_HEADLESS_OPTIMIZED_ALLOWLIST_CACHE")
-    return Path(raw).expanduser().resolve() if raw else (_headless_optimized_project_root() / "var" / "headless_allowlist_cache.json")
+def _headless_signup_context_missing_diagnostic_path() -> Path:
+    raw = _env_text(
+        "PAYPAL_HEADLESS_MISSING_DIAGNOSTIC_PATH",
+        "PAYPAL_HEADLESS_SIGNUP_CONTEXT_DIAGNOSTIC_PATH",
+    )
+    if raw:
+        return Path(raw).expanduser().resolve()
+    return _headless_optimized_project_root() / "var" / "headless_last_missing_signup_context.json"
 
 
 def _prepare_private_dir(path: Path) -> None:
@@ -1007,23 +1579,6 @@ def _host_matches(host: str, expected: str) -> bool:
     return bool(host == expected or host.endswith(f".{expected}"))
 
 
-def _rule_from_json(value: object) -> HeadlessAllowlistRule | None:
-    data = _dict_value(value)
-    host = _str_value(data.get("host"))
-    if not host:
-        return None
-    raw_methods = _list_value(data.get("methods"))
-    raw_types = _list_value(data.get("resource_types"))
-    return HeadlessAllowlistRule(
-        host=host,
-        path_prefix=_str_value(data.get("path_prefix"), "/"),
-        methods=tuple(str(item).upper() for item in raw_methods if str(item)),
-        resource_types=tuple(str(item) for item in raw_types if str(item)),
-        reason=_str_value(data.get("reason"), "cache"),
-        path_contains=_str_value(data.get("path_contains")),
-    )
-
-
 def _seed_headless_optimized_rules(stage: str = "checkout") -> list[HeadlessAllowlistRule]:
     rules = [
         HeadlessAllowlistRule("www.paypal.com", "/agreements/approve", resource_types=("document",), reason="paypal_document"),
@@ -1031,17 +1586,20 @@ def _seed_headless_optimized_rules(stage: str = "checkout") -> list[HeadlessAllo
         HeadlessAllowlistRule("www.paypal.com", "/checkoutweb", resource_types=("document", "xhr", "fetch", "script"), reason="paypal_checkoutweb"),
         HeadlessAllowlistRule("www.paypal.com", "/mtr/", methods=("GET", "POST"), resource_types=("xhr", "fetch", "script"), reason="mtr"),
         HeadlessAllowlistRule("www.paypal.com", "/identity/di/log", methods=("POST",), resource_types=("xhr", "fetch", "beacon"), reason="identity_di_log"),
-        HeadlessAllowlistRule("www.paypal.com", "/platform/tealeaftarget", methods=("POST",), resource_types=("xhr", "fetch", "beacon"), reason="tealeaf_observe"),
+        HeadlessAllowlistRule("www.paypal.com", "/platform/tealeaftarget", methods=("POST",), resource_types=("xhr", "fetch", "beacon", "ping"), reason="tealeaf_observe"),
         HeadlessAllowlistRule("www.paypal.com", "/pay/api/trpc/observability.handleClientEmit", methods=("POST",), resource_types=("xhr", "fetch", "ping"), reason="observability"),
         HeadlessAllowlistRule("www.paypal.com", "/signin/client-log", methods=("POST",), resource_types=("xhr", "fetch", "beacon"), reason="observability"),
         HeadlessAllowlistRule("www.paypal.com", "/csplog/api/log/csp", methods=("POST",), resource_types=("xhr", "fetch", "beacon", "other"), reason="observability"),
         HeadlessAllowlistRule("t.paypal.com", "/ts", methods=("GET", "POST"), resource_types=("xhr", "fetch", "beacon", "image"), reason="observability"),
+        HeadlessAllowlistRule("ct.ddc.paypal.com", "/i.js", methods=("GET",), resource_types=("script",), reason="datadome_script"),
+        HeadlessAllowlistRule("ct.ddc.paypal.com", "/c.js", methods=("GET",), resource_types=("script",), reason="datadome_script"),
         HeadlessAllowlistRule("c.paypal.com", "/da/r/fb_fp.js", methods=("GET",), resource_types=("script",), reason="fraudnet_script"),
-        HeadlessAllowlistRule("c.paypal.com", "/v1/r/d/b/p1", methods=("POST", "GET"), resource_types=("xhr", "fetch", "beacon", "image"), reason="fraudnet_p1"),
-        HeadlessAllowlistRule("c.paypal.com", "/v1/r/d/b/p2", methods=("POST", "GET"), resource_types=("xhr", "fetch", "beacon", "image"), reason="fraudnet_p2"),
-        HeadlessAllowlistRule("c.paypal.com", "/v1/r/d/b/w", methods=("POST", "GET"), resource_types=("xhr", "fetch", "beacon", "image"), reason="fraudnet_w"),
-        HeadlessAllowlistRule("c.paypal.com", "/v1/r/d/b/pa", methods=("POST", "GET"), resource_types=("xhr", "fetch", "beacon", "image"), reason="fraudnet_pa"),
-        HeadlessAllowlistRule("c6.paypal.com", "/v1/r/d/b/p3", methods=("GET", "POST"), resource_types=("xhr", "fetch", "beacon", "image"), reason="fraudnet_p3"),
+        HeadlessAllowlistRule("c.paypal.com", "/v1/r/d/b/p1", methods=("POST", "GET"), resource_types=("xhr", "fetch", "beacon", "image", "ping"), reason="fraudnet_p1"),
+        HeadlessAllowlistRule("c.paypal.com", "/v1/r/d/b/p2", methods=("POST", "GET"), resource_types=("xhr", "fetch", "beacon", "image", "ping"), reason="fraudnet_p2"),
+        HeadlessAllowlistRule("c.paypal.com", "/v1/r/d/b/w", methods=("POST", "GET"), resource_types=("xhr", "fetch", "beacon", "image", "ping"), reason="fraudnet_w"),
+        HeadlessAllowlistRule("c.paypal.com", "/v1/r/d/b/pa", methods=("POST", "GET"), resource_types=("xhr", "fetch", "beacon", "image", "ping"), reason="fraudnet_pa"),
+        HeadlessAllowlistRule("c.paypal.com", "/v1/r/d/b/e", methods=("GET", "POST"), resource_types=("xhr", "fetch", "beacon", "image", "script", "ping"), reason="fraudnet_error"),
+        HeadlessAllowlistRule("c6.paypal.com", "/v1/r/d/b/p3", methods=("GET", "POST"), resource_types=("xhr", "fetch", "beacon", "image", "ping"), reason="fraudnet_p3"),
         HeadlessAllowlistRule("ddbm2.paypal.com", "/tags.js", methods=("GET",), resource_types=("script",), reason="datadome_exception"),
         HeadlessAllowlistRule("ddbm2.paypal.com", "/js/", methods=("GET",), resource_types=("script",), reason="datadome_exception"),
         HeadlessAllowlistRule("browser-intake-us5-datadoghq.com", "/api/v2/rum", methods=("POST",), resource_types=("xhr", "fetch", "beacon"), reason="datadog_rum"),
@@ -1065,68 +1623,19 @@ def _seed_headless_optimized_rules(stage: str = "checkout") -> list[HeadlessAllo
                 HeadlessAllowlistRule("www.paypalobjects.com", "/checkoutweb/", methods=("GET",), resource_types=("script",), reason="signup_context_script"),
                 HeadlessAllowlistRule("www.paypalobjects.com", "/clientinteractions/", methods=("GET",), resource_types=("script",), reason="signup_context_script"),
                 HeadlessAllowlistRule("www.paypalobjects.com", "/pa/js/min/pa.js", methods=("GET",), resource_types=("script",), reason="signup_context_observability_script"),
+                HeadlessAllowlistRule("www.paypalobjects.com", "/pa/3pjs/tl/", methods=("GET",), resource_types=("script",), reason="signup_context_tealeaf_script"),
+                HeadlessAllowlistRule("www.paypalobjects.com", "/martech/tm/paypal/mktgtagmanager.js", methods=("GET",), resource_types=("script",), reason="signup_context_marketing_script"),
+                HeadlessAllowlistRule("www.paypalobjects.com", "/pa/mi/paypal/latmconf.js", methods=("GET",), resource_types=("script",), reason="signup_context_analytics_config"),
                 HeadlessAllowlistRule("www.datadoghq-browser-agent.com", "/us5/v5/datadog-rum.js", methods=("GET",), resource_types=("script",), reason="signup_context_datadog_script"),
+                HeadlessAllowlistRule("www.paypal.com", "/xoplatform/logger/api/logger", methods=("POST",), resource_types=("xhr", "fetch", "beacon", "ping"), reason="signup_context_logger"),
+                HeadlessAllowlistRule("b.stats.paypal.com", "/v2/counter.cgi", methods=("GET",), resource_types=("image", "fetch", "ping"), reason="signup_context_stats"),
             ]
         )
     return rules
 
 
-def _load_headless_optimized_cached_rules() -> list[HeadlessAllowlistRule]:
-    if _env_text("PAYPAL_HEADLESS_IGNORE_CACHE", "PAYPAL_HEADLESS_OPTIMIZED_IGNORE_CACHE").strip().lower() in {"1", "true", "yes", "on"}:
-        return []
-    path = _headless_optimized_cache_path()
-    if not path.exists():
-        return []
-    now = time.time()
-    try:
-        data = json.loads(path.read_text(encoding="utf-8") or "{}")
-    except Exception as exc:
-        logger.warning("Local headless allowlist cache is unreadable; ignoring: {}", exc)
-        return []
-    rules: list[HeadlessAllowlistRule] = []
-    for item in _list_value(_dict_value(data).get("rules")):
-        entry = _dict_value(item)
-        last_seen = _float_value(entry.get("last_seen") or entry.get("created_at"), 0.0)
-        if last_seen and now - last_seen > _HEADLESS_OPTIMIZED_CACHE_TTL_SECONDS:
-            continue
-        rule = _rule_from_json(entry)
-        if rule:
-            rules.append(rule)
-    return rules
-
-
-def _headless_dynamic_allowlist_cache_enabled() -> bool:
-    raw = _env_text(
-        "PAYPAL_HEADLESS_ALLOWLIST_CACHE_ENABLED",
-        "PAYPAL_HEADLESS_OPTIMIZED_ALLOWLIST_CACHE_ENABLED",
-        "PAYPAL_HEADLESS_DYNAMIC_ALLOWLIST_CACHE",
-        "PAYPAL_HEADLESS_OPTIMIZED_DYNAMIC_ALLOWLIST_CACHE",
-    ).strip().lower()
-    if not raw:
-        return False
-    return raw in {"1", "true", "yes", "on", "enable", "enabled"}
-
-
 def headless_allowlist_learning_enabled() -> bool:
-    raw = _env_text(
-        "PAYPAL_HEADLESS_ALLOWLIST_LEARNING",
-        "PAYPAL_HEADLESS_OPTIMIZED_ALLOWLIST_LEARNING",
-    ).strip().lower()
-    if not raw:
-        return False
-    return raw in {"1", "true", "yes", "on", "enable", "enabled"}
-
-
-def clear_headless_optimized_allowlist_cache() -> None:
-    path = _headless_optimized_cache_path()
-    try:
-        path.unlink(missing_ok=True)
-    except Exception as exc:
-        logger.debug("Local headless allowlist cache clear failed: {}", exc)
-
-
-def clear_headless_allowlist_cache() -> None:
-    clear_headless_optimized_allowlist_cache()
+    return False
 
 
 def _lock_cache_file(lock_path: Path):
@@ -1136,62 +1645,6 @@ def _lock_cache_file(lock_path: Path):
     handle = lock_path.open("a+", encoding="utf-8")
     fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
     return handle
-
-
-def _save_headless_optimized_cached_rules(new_rules: list[HeadlessAllowlistRule]) -> list[JsonObject]:
-    if not new_rules:
-        return []
-    path = _headless_optimized_cache_path()
-    lock_handle = _lock_cache_file(path.with_suffix(path.suffix + ".lock"))
-    now = time.time()
-    try:
-        existing: dict[tuple[str, str, str, tuple[str, ...], tuple[str, ...]], JsonObject] = {}
-        if path.exists():
-            try:
-                data = json.loads(path.read_text(encoding="utf-8") or "{}")
-                for item in _list_value(_dict_value(data).get("rules")):
-                    entry = _dict_value(item)
-                    rule = _rule_from_json(entry)
-                    if not rule:
-                        continue
-                    last_seen = _float_value(entry.get("last_seen") or entry.get("created_at"), 0.0)
-                    if last_seen and now - last_seen > _HEADLESS_OPTIMIZED_CACHE_TTL_SECONDS:
-                        continue
-                    key = (rule.host, rule.path_prefix, rule.path_contains, rule.methods, rule.resource_types)
-                    existing[key] = dict(entry)
-            except Exception:
-                existing = {}
-        written: list[JsonObject] = []
-        for rule in new_rules:
-            key = (rule.host, rule.path_prefix, rule.path_contains, rule.methods, rule.resource_types)
-            entry = existing.get(key, rule.to_json())
-            entry["created_at"] = _float_value(entry.get("created_at"), now) or now
-            entry["last_seen"] = now
-            entry["hits"] = _int_value(entry.get("hits"), 0) + 1
-            entry["reason"] = rule.reason or entry.get("reason") or "learned"
-            existing[key] = entry
-            written.append(dict(entry))
-        payload = {"version": _HEADLESS_OPTIMIZED_CACHE_VERSION, "updated_at": now, "rules": list(existing.values())}
-        _prepare_private_dir(path.parent)
-        fd, temp_name = tempfile.mkstemp(prefix=path.name, suffix=".tmp", dir=str(path.parent))
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
-                handle.write("\n")
-            os.chmod(temp_name, 0o600)
-            os.replace(temp_name, path)
-        finally:
-            if os.path.exists(temp_name):
-                os.unlink(temp_name)
-        return written
-    finally:
-        try:
-            import fcntl
-
-            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
-            lock_handle.close()
-        except Exception:
-            pass
 
 
 def _headless_url_parts(url: str) -> tuple[str, str]:
@@ -1224,8 +1677,10 @@ def _headless_phase1_family(url: str) -> str:
         "observability.handleclientemit" in url_lower
         or "observability" in url_lower
         or "paypal.com/signin/client-log" in url_lower
+        or "paypal.com/xoplatform/logger/api/logger" in url_lower
         or "paypal.com/csplog/api/log/csp" in url_lower
         or "t.paypal.com/ts" in url_lower
+        or "b.stats.paypal.com/v2/counter.cgi" in url_lower
     ):
         return "observability"
     if "ddbm2.paypal.com/js/" in url_lower or "ddbm2.paypal.com/tags.js" in url_lower:
@@ -1299,7 +1754,157 @@ def _headless_observability_url_count(events: JsonObject) -> int:
 
 def _headless_url_is_challenge(url: str) -> bool:
     lower = (url or "").lower()
-    return any(marker in lower for marker in ("authchallenge", "createchallenge", "validatecaptcha", "hcaptcha", "recaptcha"))
+    if not lower:
+        return False
+    try:
+        parts = urlsplit(lower)
+        host = parts.netloc
+        path = parts.path or "/"
+    except Exception:
+        host = ""
+        path = lower
+    if host == "geo.ddc.paypal.com":
+        return True
+    if host.endswith(".ddc.paypal.com") and any(marker in path for marker in ("/captcha", "/interstitial")):
+        return True
+    return any(
+        marker in lower
+        for marker in (
+            "authchallenge",
+            "createchallenge",
+            "validatecaptcha",
+            "hcaptcha",
+            "recaptcha",
+            "/captcha/",
+            "/interstitial/",
+        )
+    )
+
+
+_SIGNUP_CONTEXT_PATH_PREFIXES = (
+    "/checkoutweb/signup",
+    "/webapps/xoonboarding",
+)
+
+_SIGNUP_CONTEXT_HTML_MARKERS = (
+    "checkoutweb/signup",
+    "checkoutuinodeweb_onboarding_lite",
+    "signupnewmember",
+    "create account",
+    "weasley",
+    "xoonboarding",
+)
+
+
+def _signup_context_document_assessment(url: str, status: int, html: str) -> JsonObject:
+    try:
+        parts = urlsplit(url or "")
+        host = parts.netloc.lower()
+        path = parts.path or "/"
+    except Exception:
+        host = ""
+        path = ""
+    lower_html = (html or "").lower()
+    marker_hits = [marker for marker in _SIGNUP_CONTEXT_HTML_MARKERS if marker in lower_html]
+    url_ok = host == "www.paypal.com" and any(path.startswith(prefix) for prefix in _SIGNUP_CONTEXT_PATH_PREFIXES)
+    challenge_by_url = _headless_url_is_challenge(url)
+    challenge_by_html = _datadome_challenge_present(status, html)
+    challenge_markers = _datadome_challenge_marker_hits(status, html)
+    html_present = bool((html or "").strip())
+    stale_challenge_status_with_normal_doc = bool(
+        status in {403, 429}
+        and url_ok
+        and marker_hits
+        and html_present
+        and not challenge_by_url
+        and not challenge_by_html
+    )
+    status_ok = status == 0 or 200 <= status < 400 or stale_challenge_status_with_normal_doc
+    ok = bool(url_ok and status_ok and html_present and not challenge_by_url and not challenge_by_html)
+    if ok:
+        reason = "ok"
+    elif challenge_by_url or challenge_by_html or (status in {403, 429} and not stale_challenge_status_with_normal_doc):
+        reason = "signup_context_datadome_challenge"
+    elif not url_ok:
+        reason = "signup_context_unexpected_url"
+    elif not status_ok:
+        reason = "signup_context_bad_status"
+    elif not html_present:
+        reason = "signup_context_empty_document"
+    else:
+        reason = "signup_context_document_not_ready"
+    return {
+        "ok": ok,
+        "reason": reason,
+        "url": url,
+        "status": status,
+        "host": host,
+        "path": path,
+        "url_ok": url_ok,
+        "status_ok": status_ok,
+        "stale_challenge_status_with_normal_doc": stale_challenge_status_with_normal_doc,
+        "html_present": html_present,
+        "html_length": len(html or ""),
+        "normal_markers": marker_hits,
+        "challenge_markers": challenge_markers,
+        "challenge_by_url": challenge_by_url,
+        "challenge_by_html": challenge_by_html,
+        "blocked_by_datadome": bool(challenge_by_url or challenge_by_html or status in {403, 429}),
+    }
+
+
+def _urls_match_without_fragment(left: str, right: str) -> bool:
+    try:
+        left_parts = urlsplit(left or "")
+        right_parts = urlsplit(right or "")
+    except Exception:
+        return bool(left == right)
+    return (
+        left_parts.scheme.lower(),
+        left_parts.netloc.lower(),
+        left_parts.path,
+        left_parts.query,
+    ) == (
+        right_parts.scheme.lower(),
+        right_parts.netloc.lower(),
+        right_parts.path,
+        right_parts.query,
+    )
+
+
+def _install_fulfilled_document_route(page: Any, target_url: str, html: str, *, status: int = 200) -> bool:
+    if not html:
+        return False
+    try:
+        served = {"value": False}
+
+        def handler(route: Any) -> None:
+            request = getattr(route, "request", None)
+            request_url = str(getattr(request, "url", "") or "")
+            resource_type = str(getattr(request, "resource_type", "") or getattr(request, "resourceType", "") or "").lower()
+            if served["value"] or (resource_type and resource_type != "document") or not _urls_match_without_fragment(request_url, target_url):
+                fallback = getattr(route, "fallback", None)
+                if callable(fallback):
+                    fallback()
+                    return
+                route.continue_()
+                return
+            served["value"] = True
+            route.fulfill(
+                status=max(200, min(int(status or 200), 399)),
+                headers={
+                    "content-type": "text/html; charset=utf-8",
+                    "cache-control": "no-store",
+                    "x-codex-fulfilled-document": "signup_context",
+                },
+                body=html,
+            )
+
+        page.route(target_url, handler)
+        return True
+    except Exception as exc:
+        logger.debug("Local headless fulfilled document route install failed: {}", exc)
+        return False
 
 
 def _headless_optimized_rule_for_url(url: str, *, method: str, resource_type: str, reason: str = "learned") -> HeadlessAllowlistRule | None:
@@ -1348,15 +1953,10 @@ def _headless_optimized_request_decision(
 
 
 def _headless_optimized_rules(stage: str = "checkout") -> list[HeadlessAllowlistRule]:
-    rules = _seed_headless_optimized_rules(stage)
-    if _headless_dynamic_allowlist_cache_enabled():
-        rules.extend(_load_headless_optimized_cached_rules())
-    return rules
+    return _seed_headless_optimized_rules(stage)
 
 
 _seed_headless_rules = _seed_headless_optimized_rules
-_load_headless_cached_rules = _load_headless_optimized_cached_rules
-_save_headless_cached_rules = _save_headless_optimized_cached_rules
 _headless_rule_for_url = _headless_optimized_rule_for_url
 _headless_request_decision = _headless_optimized_request_decision
 _headless_rules = _headless_optimized_rules
@@ -1392,6 +1992,7 @@ class LocalHeadlessSession:
         self._playwright: Any = None
         self._semaphore_acquired = False
         self._network_installed = False
+        self._network_mode = "restricted"
         self._status = 0
         self._reset_events()
 
@@ -1463,19 +2064,45 @@ class LocalHeadlessSession:
                 screen=self.screen,
                 viewport=self.viewport,
             )
-            options["service_workers"] = "block"
             if self.roxy_browser:
                 contexts = list(getattr(self._browser, "contexts", []) or [])
                 self._context = contexts[0] if contexts else self._browser.new_context(**options)
             else:
                 self._context = self._browser.new_context(**options)
-            sanitized = _sanitize_cookies(self.cookies)
+            profile = _merged_context_dict(BROWSER_PROFILE, self.browser_profile)
+            try:
+                self._context.set_extra_http_headers(_headless_extra_http_headers(profile))
+            except Exception as exc:
+                logger.debug("Local headless extra headers install failed: {}", exc)
+            self._install_stealth_context()
+            cached_cookies = [] if self.roxy_browser else _load_headless_cached_cookies(self.proxy_url, profile)
+            sanitized = _merge_cookie_lists(_sanitize_cookies(self.cookies), cached_cookies)
             if sanitized:
                 self._context.add_cookies(sanitized)
+                self.cookies = sanitized
             self._install_network_policy()
         except Exception:
             self.close()
             raise
+
+    def _install_stealth_context(self) -> None:
+        if self._context is None:
+            return
+        try:
+            self._context.add_init_script(
+                _stealth_init_script(
+                    browser_profile=self.browser_profile,
+                    screen=self.screen,
+                    viewport=self.viewport,
+                )
+            )
+        except Exception as exc:
+            logger.debug("Local headless stealth init script install failed: {}", exc)
+
+    def _prepare_page_for_runtime(self, page: Any) -> None:
+        self._attach_page_listeners(page)
+        if self._context is not None:
+            _apply_cdp_stealth_overrides(self._context, page, browser_profile=self.browser_profile)
 
     def close(self) -> None:
         try:
@@ -1517,6 +2144,15 @@ class LocalHeadlessSession:
         except Exception:
             return []
 
+    def _persist_cookie_cache(self, cookies: list[JsonObject] | None = None) -> None:
+        if self.roxy_browser:
+            return
+        try:
+            profile = _merged_context_dict(BROWSER_PROFILE, self.browser_profile)
+            _save_headless_cached_cookies(self.proxy_url, profile, cookies or self.browser_cookies())
+        except Exception as exc:
+            logger.debug("Local headless cookie cache save failed: {}", exc)
+
     def import_cookies(self, cookies: list[JsonObject] | None) -> None:
         sanitized = _sanitize_cookies(cookies)
         if not sanitized:
@@ -1551,7 +2187,14 @@ class LocalHeadlessSession:
             url = str(getattr(request, "url", "") or "")
             method = str(getattr(request, "method", "GET") or "GET")
             resource_type = str(getattr(request, "resource_type", "") or getattr(request, "resourceType", "") or "other").lower()
-            decision = self.policy.decide(url=url, method=method, resource_type=resource_type)
+            if self._network_mode == "datadome":
+                decision = HeadlessRequestDecision(
+                    "allow",
+                    "datadome_browser_open_network",
+                    family=_headless_phase1_family(url),
+                )
+            else:
+                decision = self.policy.decide(url=url, method=method, resource_type=resource_type)
             record: JsonObject = {
                 "event": "route",
                 "url": url,
@@ -1729,6 +2372,113 @@ class LocalHeadlessSession:
                 missing.append(family)
         return missing
 
+    def _write_signup_context_missing_diagnostic(
+        self,
+        *,
+        page_url: str,
+        status: int,
+        observed: list[str],
+        missing: list[str],
+        required_missing: list[str],
+        run_mtr: bool,
+        final_url: str = "",
+        page_assessment: JsonObject | None = None,
+        bootstrap: JsonObject | None = None,
+    ) -> str:
+        def limited_list(name: str, limit: int = 160) -> list[object]:
+            raw = self.events.get(name)
+            if not isinstance(raw, list):
+                return []
+            return cast(list[object], raw)[-limit:]
+
+        def probe(url: str, *, method: str = "GET", resource_type: str = "fetch") -> JsonObject:
+            return _headless_optimized_request_decision(
+                url,
+                method=method,
+                resource_type=resource_type,
+                rules=self.policy.rules,
+            ).to_json()
+
+        path = _headless_signup_context_missing_diagnostic_path()
+        important_decisions: JsonObject = {
+            "signup_document": probe(page_url, method="GET", resource_type="document"),
+            "fraudnet_script": probe("https://c.paypal.com/da/r/fb_fp.js", method="GET", resource_type="script"),
+            "fraudnet_p1_xhr": probe("https://c.paypal.com/v1/r/d/b/p1", method="POST", resource_type="xhr"),
+            "fraudnet_p1_rt_p": probe("https://c.paypal.com/v1/r/d/b/p1", method="POST", resource_type="ping"),
+            "fraudnet_p2_xhr": probe("https://c.paypal.com/v1/r/d/b/p2", method="POST", resource_type="xhr"),
+            "fraudnet_w_xhr": probe("https://c.paypal.com/v1/r/d/b/w", method="POST", resource_type="xhr"),
+            "datadog_fetch": probe("https://browser-intake-us5-datadoghq.com/api/v2/rum", method="POST", resource_type="fetch"),
+            "datadog_rt_p": probe("https://browser-intake-us5-datadoghq.com/api/v2/rum", method="POST", resource_type="ping"),
+            "identity_rt_p": probe("https://www.paypal.com/identity/di/log", method="POST", resource_type="ping"),
+            "marketing_script": probe("https://www.paypalobjects.com/martech/tm/paypal/mktgtagmanager.js", method="GET", resource_type="script"),
+            "analytics_config": probe("https://www.paypalobjects.com/pa/mi/paypal/latmconf.js", method="GET", resource_type="script"),
+            "paypal_logger": probe("https://www.paypal.com/xoplatform/logger/api/logger/", method="POST", resource_type="xhr"),
+            "paypal_stats": probe("https://b.stats.paypal.com/v2/counter.cgi?p=EC-TEST&s=CHECKOUT", method="GET", resource_type="image"),
+        }
+        payload: JsonObject = {
+            "event": "signup_context_missing_diagnostic",
+            "created_at": time.time(),
+            "source_file": __file__,
+            "cwd": os.getcwd(),
+            "project_root": str(_headless_optimized_project_root()),
+            "runtime": self.runtime,
+            "status": status,
+            "page_url": _redact_debug_url(page_url),
+            "final_url": _redact_debug_url(final_url or page_url),
+            "signup_context_page": page_assessment or self.events.get("signup_context_page") or {},
+            "signup_context_page_after_runtime": self.events.get("signup_context_page_after_runtime") or {},
+            "signup_context_bootstrap": bootstrap or self.events.get("signup_context_bootstrap") or {},
+            "signup_context_seeded_document": self.events.get("signup_context_seeded_document") or {},
+            "datadome_cookie_present": bool(self._datadome_cookie()),
+            "datadome_cookie_len": len(self._datadome_cookie()),
+            "run_mtr": run_mtr,
+            "proxy_configured": bool(self.proxy_url),
+            "proxy_fingerprint": _sha256_hex(self.proxy_url)[:16] if self.proxy_url else "",
+            "headless_debug_enabled": headless_debug_enabled(),
+            "debug_log_path": self.debug_log_path,
+            "required_signals": list(_HEADLESS_OPTIMIZED_REQUIRED_SIGNALS),
+            "observed": observed,
+            "missing": missing,
+            "required_missing": required_missing,
+            "counts": self.events.get("counts") or {},
+            "response_counts": self.events.get("response_counts") or {},
+            "observed_order": self.events.get("observed_order") or [],
+            "injected_scripts": self.events.get("injected_scripts") or [],
+            "inject_errors": self.events.get("inject_errors") or [],
+            "datadog_runtime": self.events.get("datadog_runtime") or {},
+            "datadog_probes": self.events.get("datadog_probes") or [],
+            "datadog_flushes": self.events.get("datadog_flushes") or [],
+            "runtime_signals": self.events.get("runtime_signals") or [],
+            "mtr": self.events.get("mtr") or {},
+            "intercept": self.intercept_summary(),
+            "important_decisions": important_decisions,
+            "requests_tail": limited_list("requests"),
+            "responses_tail": limited_list("responses"),
+            "request_failures_tail": limited_list("request_failures"),
+            "allowed_requests_tail": limited_list("allowed_requests"),
+            "blocked_requests_tail": limited_list("blocked_requests"),
+        }
+        payload = _redact_debug_event(payload)
+        try:
+            _prepare_private_dir(path.parent)
+            fd, temp_name = tempfile.mkstemp(prefix=path.name, suffix=".tmp", dir=str(path.parent))
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
+                    handle.write("\n")
+                os.chmod(temp_name, 0o600)
+                os.replace(temp_name, path)
+            finally:
+                if os.path.exists(temp_name):
+                    os.unlink(temp_name)
+            self.events["missing_diagnostic_path"] = str(path)
+            self.debug_log.record({"event": "missing_diagnostic_written", "path": str(path)})
+            return str(path)
+        except Exception as exc:
+            self.events["missing_diagnostic_error"] = str(exc)
+            logger.debug("Local headless missing diagnostic write failed: {}", exc)
+            return ""
+
     def _mtr_ready(self) -> bool:
         mtr = _dict_value(self.events.get("mtr"))
         return bool(mtr.get("requestId") and mtr.get("sealedResult"))
@@ -1740,8 +2490,49 @@ class LocalHeadlessSession:
         self.start()
         if self._page is None:
             self._page = self._context.new_page()
-            self._attach_page_listeners(self._page)
+            self._prepare_page_for_runtime(self._page)
         return self._page
+
+    def _simulate_browser_activity(self, page: Any, *, reason: str, duration_ms: int = 900) -> JsonObject:
+        if not headless_interactions_enabled():
+            return {"ok": False, "reason": "disabled"}
+        profile = _merged_context_dict(BROWSER_PROFILE, self.browser_profile)
+        viewport_options = _merged_context_dict(VIEWPORT, self.viewport)
+        width = max(320, _int_value(viewport_options.get("width"), _int_value(profile.get("inner_width"), 1200)))
+        height = max(320, _int_value(viewport_options.get("height"), _int_value(profile.get("inner_height"), 720)))
+        events: list[str] = []
+        try:
+            mouse = getattr(page, "mouse", None)
+            if mouse is not None:
+                start_x = max(20, min(width - 20, int(width * 0.22)))
+                start_y = max(20, min(height - 20, int(height * 0.28)))
+                mouse.move(start_x, start_y, steps=6)
+                events.append("mousemove")
+                for index in range(3):
+                    target_x = max(20, min(width - 20, int(width * (0.35 + index * 0.17)) + random.randint(-12, 12)))
+                    target_y = max(20, min(height - 20, int(height * (0.35 + index * 0.09)) + random.randint(-10, 10)))
+                    mouse.move(target_x, target_y, steps=random.randint(8, 16))
+                    events.append("pointermove")
+                    page.wait_for_timeout(random.randint(70, 160))
+                try:
+                    mouse.wheel(0, random.randint(90, 180))
+                    events.append("scroll")
+                except Exception:
+                    pass
+            keyboard = getattr(page, "keyboard", None)
+            if keyboard is not None:
+                try:
+                    keyboard.press("Tab")
+                    events.append("keydown")
+                except Exception:
+                    pass
+            if duration_ms > 0:
+                page.wait_for_timeout(max(100, min(duration_ms, 2500)))
+            result: JsonObject = {"ok": True, "reason": reason, "events": events}
+        except Exception as exc:
+            result = {"ok": False, "reason": reason, "error": str(exc), "events": events}
+        self.debug_log.record({"event": "browser_activity", **result})
+        return result
 
     def solve_datadome(self, url: str, *, wait_seconds: float | None = None) -> JsonObject:
         page = self._new_or_existing_page()
@@ -1749,20 +2540,102 @@ class LocalHeadlessSession:
         wait_ms = max(1000, int(wait_seconds * 1000))
         status = 0
         html = ""
+        previous_network_mode = self._network_mode
+        self._network_mode = "datadome"
+
+        def read_page_html() -> str:
+            try:
+                return str(page.content() or "")
+            except Exception:
+                return ""
+
+        def page_url() -> str:
+            try:
+                return str(getattr(page, "url", "") or "")
+            except Exception:
+                return ""
+
+        def challenge_present(current_status: int, current_html: str) -> bool:
+            return bool(
+                current_status in {403, 429}
+                or _headless_url_is_challenge(page_url())
+                or _datadome_challenge_present(current_status, current_html)
+            )
+
+        def navigate_once(*, reason: str, target_url: str | None = None) -> None:
+            nonlocal status, html
+            active_url = target_url or url
+            try:
+                response = page.goto(active_url, wait_until="domcontentloaded", timeout=wait_ms)
+                status = int(getattr(response, "status", 0) or 0) if response is not None else status
+            except Exception as exc:
+                logger.debug("Local headless DataDome navigation did not finish cleanly: {}", exc)
+                self.debug_log.record(
+                    {
+                        "event": "datadome_navigation_error",
+                        "reason": reason,
+                        "url": active_url,
+                        "error": str(exc),
+                    }
+                )
+            _wait_for_page_state_or_ready(
+                page,
+                "networkidle",
+                timeout_ms=min(wait_ms, 3000),
+                max_wait_ms=min(wait_ms, 3000),
+                ready=lambda: bool(self._datadome_cookie()) and not challenge_present(status, read_page_html()),
+                poll_ms=250,
+            )
+            html = read_page_html()
+            self.debug_log.record(
+                {
+                    "event": "datadome_navigation",
+                    "reason": reason,
+                    "status": status,
+                    "url": page_url(),
+                    "target_url": active_url,
+                    "datadome_present": bool(self._datadome_cookie()),
+                    "blocked_by_datadome": challenge_present(status, html),
+                }
+            )
+
         try:
-            response = page.goto(url, wait_until="domcontentloaded", timeout=wait_ms)
-            status = int(getattr(response, "status", 0) or 0) if response is not None else 0
-        except Exception as exc:
-            logger.debug("Local headless DataDome navigation did not finish cleanly: {}", exc)
-        deadline = time.time() + wait_seconds
-        while time.time() < deadline and not self._datadome_cookie():
-            page.wait_for_timeout(250)
+            if headless_datadome_prewarm_enabled() and not self._datadome_cookie():
+                for prewarm_url in _headless_datadome_prewarm_urls(url):
+                    navigate_once(reason="prewarm", target_url=prewarm_url)
+                    if self._datadome_cookie() and not challenge_present(status, html):
+                        self._simulate_browser_activity(page, reason="datadome_prewarm")
+                        break
+            navigate_once(reason="initial")
+            deadline = time.time() + wait_seconds
+            while time.time() < deadline:
+                html = read_page_html()
+                if self._datadome_cookie() and not challenge_present(status, html):
+                    break
+                page.wait_for_timeout(250)
+
+            # DataDome often materializes the cookie on a 403 challenge document.
+            # The cookie only becomes useful after the protected URL is loaded
+            # again in the same browser context; treating the intermediate 403
+            # page as final leaves the caller with a challenge-only cookie.
+            reload_attempts = 0
+            while self._datadome_cookie() and challenge_present(status, html) and reload_attempts < 2:
+                reload_attempts += 1
+                self._simulate_browser_activity(page, reason=f"datadome_challenge_before_reload_{reload_attempts}")
+                page.wait_for_timeout(500)
+                navigate_once(reason=f"reload_after_datadome_cookie_{reload_attempts}")
+                if not challenge_present(status, html):
+                    break
+        finally:
+            self._network_mode = previous_network_mode
+
         try:
             html = str(page.content() or "")
         except Exception:
             html = ""
-        blocked_by_datadome = _datadome_challenge_present(status, html)
+        blocked_by_datadome = challenge_present(status, html)
         cookies = self.browser_cookies()
+        self._persist_cookie_cache(cookies)
         datadome = self._datadome_cookie()
         ok = bool(datadome and not blocked_by_datadome)
         result: JsonObject = {
@@ -1777,7 +2650,9 @@ class LocalHeadlessSession:
             "debug_log_path": self.debug_log_path,
             "intercept": self.intercept_summary(),
         }
-        self.debug_log.record({"event": "datadome_result", **result})
+        if ok:
+            result["html"] = html
+        self.debug_log.record({"event": "datadome_result", **{key: value for key, value in result.items() if key != "html"}})
         return result
 
     def run_mtr_phase1(
@@ -1794,6 +2669,8 @@ class LocalHeadlessSession:
         stage: str = "checkout",
         new_page: bool = False,
         run_mtr: bool = True,
+        document_html: str = "",
+        document_status: int = 200,
     ) -> JsonObject:
         from paypal.roxy_fingerprint import (
             _phase1_mark_datadog_runtime_observed,
@@ -1808,7 +2685,7 @@ class LocalHeadlessSession:
             self.policy.rules.extend(_seed_headless_optimized_rules("signup_context"))
         if new_page or self._page is None:
             page = self._context.new_page()
-            self._attach_page_listeners(page)
+            self._prepare_page_for_runtime(page)
             if not new_page:
                 self._page = page
         else:
@@ -1823,20 +2700,165 @@ class LocalHeadlessSession:
         self.policy.learned_candidates.clear()
         status = 0
         attempts = 1
+        seeded_document = False
+        seeded_document_assessment: JsonObject = {}
+        if stage == "signup_context" and document_html:
+            seeded_document_assessment = _signup_context_document_assessment(page_url, document_status, document_html)
+            if seeded_document_assessment.get("ok"):
+                seeded_document = _install_fulfilled_document_route(
+                    page,
+                    page_url,
+                    document_html,
+                    status=_int_value(document_status, 200),
+                )
+            self.events["signup_context_seeded_document"] = {
+                "enabled": seeded_document,
+                "assessment": seeded_document_assessment,
+                "html_length": len(document_html or ""),
+                "status": _int_value(document_status, 200),
+            }
+            self.debug_log.record(
+                {
+                    "event": "signup_context_seeded_document",
+                    "enabled": seeded_document,
+                    "assessment": seeded_document_assessment,
+                    "html_length": len(document_html or ""),
+                    "status": _int_value(document_status, 200),
+                }
+            )
 
         def ready() -> bool:
             return (not run_mtr or self._mtr_ready()) and not self._required_missing()
 
-        def run_once(*, reload_page: bool = False) -> None:
-            nonlocal status
+        def read_page_html() -> str:
             try:
-                if reload_page:
-                    response = page.reload(wait_until="domcontentloaded", timeout=wait_ms)
-                else:
-                    response = page.goto(page_url, wait_until="domcontentloaded", timeout=wait_ms)
-                status = int(getattr(response, "status", 0) or 0) if response is not None else status
-            except Exception as exc:
-                logger.debug("Local headless navigation did not finish cleanly: {}", exc)
+                return str(page.content() or "")
+            except Exception:
+                return ""
+
+        def current_page_url() -> str:
+            try:
+                return str(getattr(page, "url", "") or "")
+            except Exception:
+                return ""
+
+        def datadome_challenge_present(current_status: int, current_html: str | None = None) -> bool:
+            html = read_page_html() if current_html is None else current_html
+            return bool(
+                current_status in {403, 429}
+                or _headless_url_is_challenge(current_page_url())
+                or _datadome_challenge_present(current_status, html)
+            )
+
+        def assess_signup_context_page(*, label: str, current_status: int | None = None, html: str | None = None) -> JsonObject:
+            assessment = _signup_context_document_assessment(
+                current_page_url(),
+                status if current_status is None else current_status,
+                read_page_html() if html is None else html,
+            )
+            assessment["label"] = label
+            assessment["datadome_cookie_present"] = bool(self._datadome_cookie())
+            assessment["datadome_cookie_len"] = len(self._datadome_cookie())
+            self.events["signup_context_page"] = assessment
+            self.debug_log.record({"event": "signup_context_page_assessment", **assessment})
+            return assessment
+
+        def signup_context_ready(current_status: int | None = None, html: str | None = None) -> bool:
+            assessment = _signup_context_document_assessment(
+                current_page_url(),
+                status if current_status is None else current_status,
+                read_page_html() if html is None else html,
+            )
+            return bool(assessment.get("ok"))
+
+        def datadome_bootstrap_document() -> bool:
+            """Load the protected signup document with open network until a real signup document is active."""
+            nonlocal status
+            previous_network_mode = self._network_mode
+            self._network_mode = "datadome"
+            ok = False
+            attempts_summary: list[object] = []
+            try:
+                for attempt in range(1, 4):
+                    try:
+                        response = page.goto(page_url, wait_until="domcontentloaded", timeout=wait_ms)
+                        status = int(getattr(response, "status", 0) or 0) if response is not None else status
+                    except Exception as exc:
+                        logger.debug("Local headless signup-context DataDome bootstrap navigation did not finish cleanly: {}", exc)
+                        self.debug_log.record(
+                            {
+                                "event": "signup_context_datadome_bootstrap_error",
+                                "attempt": attempt,
+                                "url": page_url,
+                                "error": str(exc),
+                            }
+                        )
+                    _wait_for_page_state_or_ready(
+                        page,
+                        "networkidle",
+                        timeout_ms=min(wait_ms, 4000),
+                        max_wait_ms=min(wait_ms, 4000),
+                        ready=lambda: signup_context_ready(status),
+                        poll_ms=250,
+                    )
+                    html = read_page_html()
+                    challenged = datadome_challenge_present(status, html)
+                    assessment = assess_signup_context_page(
+                        label=f"datadome_bootstrap_attempt_{attempt}",
+                        current_status=status,
+                        html=html,
+                    )
+                    attempt_summary: JsonObject = {
+                        "attempt": attempt,
+                        "status": status,
+                        "url": current_page_url(),
+                        "datadome_present": bool(self._datadome_cookie()),
+                        "blocked_by_datadome": challenged,
+                        "signup_context_ready": bool(assessment.get("ok")),
+                        "reason": str(assessment.get("reason") or ""),
+                    }
+                    attempts_summary.append(attempt_summary)
+                    self.debug_log.record(
+                        {
+                            "event": "signup_context_datadome_bootstrap",
+                            **attempt_summary,
+                        }
+                    )
+                    if assessment.get("ok"):
+                        ok = True
+                        break
+                    if self._datadome_cookie() and challenged:
+                        self._simulate_browser_activity(page, reason=f"signup_context_datadome_bootstrap_{attempt}")
+                    page.wait_for_timeout(500)
+            finally:
+                self._network_mode = previous_network_mode
+                final_html = read_page_html()
+                final_assessment = _signup_context_document_assessment(current_page_url(), status, final_html)
+                final_assessment["datadome_cookie_present"] = bool(self._datadome_cookie())
+                final_assessment["datadome_cookie_len"] = len(self._datadome_cookie())
+                self.events["signup_context_bootstrap"] = {
+                    "ok": ok,
+                    "attempts": attempts_summary,
+                    "final": final_assessment,
+                }
+                self.events["signup_context_page"] = final_assessment
+            return ok
+
+        def run_once(*, reload_page: bool = False, navigate: bool = True) -> bool:
+            nonlocal status
+            if navigate:
+                try:
+                    if reload_page:
+                        response = page.reload(wait_until="domcontentloaded", timeout=wait_ms)
+                    else:
+                        response = page.goto(page_url, wait_until="domcontentloaded", timeout=wait_ms)
+                    status = int(getattr(response, "status", 0) or 0) if response is not None else status
+                except Exception as exc:
+                    logger.debug("Local headless navigation did not finish cleanly: {}", exc)
+            if stage == "signup_context":
+                assessment = assess_signup_context_page(label="before_runtime_injection", current_status=status)
+                if not assessment.get("ok"):
+                    return False
             self._apply_phase_metadata(page, app_id=app_id, correlation_id=correlation_id)
             if run_mtr:
                 self._inject_mtr_listener(page)
@@ -1883,64 +2905,136 @@ class LocalHeadlessSession:
                             self.events,
                             reason=f"{stage}_headless_paypal_observability_without_datadog_sdk",
                         )
+            if stage == "signup_context":
+                final_assessment = assess_signup_context_page(label="after_runtime_wait", current_status=status)
+                self.events["signup_context_page_after_runtime"] = final_assessment
+                if not final_assessment.get("ok"):
+                    return False
+            return True
+
+        def finalize_result(*, ok: bool, reason: str) -> JsonObject:
+            required_missing = self._required_missing()
+            counts = self._counts()
+            missing = _phase1_missing_signals(counts)
+            observed = [str(name) for name in counts if _int_value(counts.get(str(name)), 0) > 0]
+            self.events["observed"] = observed
+            self.events["missing"] = missing
+            self.events["required_missing"] = required_missing
+            page_assessment = _dict_value(
+                self.events.get("signup_context_page_after_runtime")
+                or self.events.get("signup_context_page")
+            )
+            bootstrap = _dict_value(self.events.get("signup_context_bootstrap"))
+            if stage == "signup_context" and (required_missing or not ok):
+                self._write_signup_context_missing_diagnostic(
+                    page_url=page_url,
+                    final_url=current_page_url(),
+                    status=status,
+                    observed=observed,
+                    missing=missing,
+                    required_missing=required_missing,
+                    run_mtr=run_mtr,
+                    page_assessment=page_assessment,
+                    bootstrap=bootstrap,
+                )
+            mtr = _dict_value(self.events.get("mtr"))
+            result = self._result(status=status, page=page, ok=ok, reason=reason, attempts=attempts)
+            result.update(
+                {
+                    "observed": observed,
+                    "missing": missing,
+                    "required_missing": required_missing,
+                    "missing_diagnostic_path": self.events.get("missing_diagnostic_path") or "",
+                    "missing_diagnostic_error": self.events.get("missing_diagnostic_error") or "",
+                    "requestId": mtr.get("requestId") or "",
+                    "sealedResult": mtr.get("sealedResult") or "",
+                    "visitorToken": mtr.get("visitorToken") or "",
+                    "x0_status": mtr.get("x0_status") or 0,
+                    "post_status": mtr.get("post_status") or 0,
+                    "mtr": mtr,
+                    "signup_context_page": page_assessment,
+                    "signup_context_bootstrap": bootstrap,
+                    "signup_context_seeded_document": self.events.get("signup_context_seeded_document") or {},
+                    "blocked_by_datadome": bool(page_assessment.get("blocked_by_datadome")),
+                }
+            )
+            self.debug_log.record({"event": "headless_result", **result})
+            return result
 
         if _headless_url_is_challenge(page_url):
-            return self._result(status=status, page=page, ok=False, reason="challenge_required")
-        if not self._datadome_cookie() and not self._datadome_cookie_looks_valid(self.cookies):
+            return finalize_result(ok=False, reason="challenge_required")
+        signup_context_bootstrap: JsonObject = {}
+        if stage == "signup_context" and seeded_document:
+            pass
+        elif stage == "signup_context":
+            if not datadome_bootstrap_document():
+                assessment = _dict_value(self.events.get("signup_context_page"))
+                reason = str(assessment.get("reason") or "signup_context_document_not_ready")
+                return finalize_result(ok=False, reason=reason)
+            signup_context_bootstrap = _dict_value(self.events.get("signup_context_bootstrap"))
+            signup_context_page = _dict_value(self.events.get("signup_context_page"))
+            self._reset_events()
+            self.events["signup_context_bootstrap"] = signup_context_bootstrap
+            self.events["signup_context_page"] = signup_context_page
+            self.policy.allowed.clear()
+            self.policy.blocked.clear()
+            self.policy.learned_candidates.clear()
+        elif not self._datadome_cookie() and not self._datadome_cookie_looks_valid(self.cookies):
+            previous_network_mode = self._network_mode
+            self._network_mode = "datadome"
             try:
-                response = page.goto(page_url, wait_until="domcontentloaded", timeout=wait_ms)
-                status = int(getattr(response, "status", 0) or 0) if response is not None else status
-            except Exception as exc:
-                logger.debug("Local headless DataDome bootstrap navigation did not finish cleanly: {}", exc)
-            datadome_deadline = time.time() + datadome_wait_seconds
-            while time.time() < datadome_deadline and not self._datadome_cookie():
-                page.wait_for_timeout(250)
+                try:
+                    response = page.goto(page_url, wait_until="domcontentloaded", timeout=wait_ms)
+                    status = int(getattr(response, "status", 0) or 0) if response is not None else status
+                except Exception as exc:
+                    logger.debug("Local headless DataDome bootstrap navigation did not finish cleanly: {}", exc)
+                datadome_deadline = time.time() + datadome_wait_seconds
+                while time.time() < datadome_deadline and not self._datadome_cookie():
+                    page.wait_for_timeout(250)
+            finally:
+                self._network_mode = previous_network_mode
             if not self._datadome_cookie():
-                return self._result(status=status, page=page, ok=False, reason="datadome_missing")
-        run_once(reload_page=False)
+                return finalize_result(ok=False, reason="datadome_missing")
+        ran_once = run_once(reload_page=False, navigate=stage != "signup_context" or seeded_document)
+        if stage == "signup_context" and (not ran_once or datadome_challenge_present(status)):
+            if datadome_bootstrap_document():
+                signup_context_bootstrap = _dict_value(self.events.get("signup_context_bootstrap"))
+                signup_context_page = _dict_value(self.events.get("signup_context_page"))
+                self._reset_events()
+                self.events["signup_context_bootstrap"] = signup_context_bootstrap
+                self.events["signup_context_page"] = signup_context_page
+                self.policy.allowed.clear()
+                self.policy.blocked.clear()
+                self.policy.learned_candidates.clear()
+                ran_once = run_once(reload_page=False, navigate=False)
+        if stage == "signup_context" and not ran_once:
+            assessment = _dict_value(
+                self.events.get("signup_context_page_after_runtime")
+                or self.events.get("signup_context_page")
+            )
+            reason = str(assessment.get("reason") or "signup_context_document_not_ready")
+            return finalize_result(ok=False, reason=reason)
         if "datadog_rum" in self._required_missing():
             _headless_mark_paypal_observability_as_datadog(
                 self.events,
                 reason=f"{stage}_headless_paypal_observability_without_datadog_sdk",
             )
         required_missing = self._required_missing()
-        if (
-            (required_missing or (run_mtr and not self._mtr_ready()))
-            and self.policy.blocked
-            and headless_allowlist_learning_enabled()
-        ):
-            attempts = 2
-            self.policy.fail_open = True
-            run_once(reload_page=True)
-            self.policy.fail_open = False
-            learned = self._learn_core_rules()
-            written = _save_headless_optimized_cached_rules(learned)
-            self.events["learned_rules"] = written
-        required_missing = self._required_missing()
-        counts = self._counts()
-        missing = _phase1_missing_signals(counts)
-        observed = [str(name) for name in counts if _int_value(counts.get(str(name)), 0) > 0]
-        self.events["observed"] = observed
-        self.events["missing"] = missing
-        self.events["required_missing"] = required_missing
-        mtr = _dict_value(self.events.get("mtr"))
-        ok = bool((not run_mtr or self._mtr_ready()) and not required_missing)
-        result = self._result(status=status, page=page, ok=ok, reason="ok" if ok else "missing_core_signals", attempts=attempts)
-        result.update(
-            {
-                "observed": observed,
-                "missing": missing,
-                "required_missing": required_missing,
-                "requestId": mtr.get("requestId") or "",
-                "sealedResult": mtr.get("sealedResult") or "",
-                "visitorToken": mtr.get("visitorToken") or "",
-                "x0_status": mtr.get("x0_status") or 0,
-                "post_status": mtr.get("post_status") or 0,
-                "mtr": mtr,
-            }
+        page_ready_ok = True
+        page_assessment = _dict_value(
+            self.events.get("signup_context_page_after_runtime")
+            or self.events.get("signup_context_page")
         )
-        self.debug_log.record({"event": "headless_result", **result})
-        return result
+        if stage == "signup_context":
+            page_ready_ok = bool(page_assessment.get("ok"))
+        ok = bool((not run_mtr or self._mtr_ready()) and not required_missing and page_ready_ok)
+        if ok:
+            reason = "ok"
+        elif stage == "signup_context" and not page_ready_ok:
+            reason = str(page_assessment.get("reason") or "signup_context_document_not_ready")
+        else:
+            reason = "missing_core_signals"
+        return finalize_result(ok=ok, reason=reason)
 
     def _mark_runtime_signal_observed(self, family: str, *, source: str, reason: str, details: JsonObject | None = None) -> None:
         counts = self._counts()
@@ -2152,32 +3246,6 @@ class LocalHeadlessSession:
                 if isinstance(errors, list):
                     errors.append({"url": script_url, "error": str(exc)})
 
-    def _learn_core_rules(self) -> list[HeadlessAllowlistRule]:
-        learned: list[HeadlessAllowlistRule] = []
-        seen: set[tuple[str, str, str, tuple[str, ...], tuple[str, ...]]] = set()
-        for record in self.policy.allowed:
-            decision = _dict_value(record.get("decision"))
-            if decision.get("reason") != "fail_open_unknown":
-                continue
-            url = _str_value(record.get("url"))
-            family = _headless_phase1_family(url)
-            if family not in {*_HEADLESS_OPTIMIZED_REQUIRED_SIGNALS, "fraudnet_p3", "fraudnet_pa", "ddbm", "observability", "tealeaf"}:
-                continue
-            rule = _headless_optimized_rule_for_url(
-                url,
-                method=_str_value(record.get("method"), "GET"),
-                resource_type=_str_value(record.get("resource_type"), "other"),
-                reason=f"learned_{family}",
-            )
-            if not rule:
-                continue
-            key = (rule.host, rule.path_prefix, rule.path_contains, rule.methods, rule.resource_types)
-            if key in seen:
-                continue
-            seen.add(key)
-            learned.append(rule)
-        return learned
-
     def intercept_summary(self) -> JsonObject:
         return {
             "allowed_count": len(self.policy.allowed),
@@ -2191,6 +3259,8 @@ class LocalHeadlessSession:
             final_url = str(getattr(page, "url", "") or "")
         except Exception:
             final_url = ""
+        cookies = self.browser_cookies()
+        self._persist_cookie_cache(cookies)
         return {
             "ok": ok,
             "runtime": self.runtime,
@@ -2198,7 +3268,7 @@ class LocalHeadlessSession:
             "url": final_url,
             "reason": reason,
             "attempts": attempts,
-            "cookies": self.browser_cookies(),
+            "cookies": cookies,
             "counts": self.events.get("counts") or {},
             "response_counts": self.events.get("response_counts") or {},
             "requests": self.events.get("requests") or [],
@@ -2249,6 +3319,8 @@ def run_local_headless_mtr_phase1(
     run_mtr: bool = True,
     roxy_browser: JsonObject | None = None,
     runtime: str | None = None,
+    document_html: str = "",
+    document_status: int = 200,
 ) -> JsonObject:
     owns_session = session is None
     active_session = session or LocalHeadlessSession(
@@ -2273,6 +3345,8 @@ def run_local_headless_mtr_phase1(
             stage=stage,
             new_page=new_page,
             run_mtr=run_mtr,
+            document_html=document_html,
+            document_status=document_status,
         )
     finally:
         if owns_session:
@@ -2724,7 +3798,18 @@ def capture_runtime_fingerprint_with_local_headless(
                     viewport=viewport,
                 )
             )
+            try:
+                context.add_init_script(
+                    _stealth_init_script(
+                        browser_profile=browser_profile,
+                        screen=screen,
+                        viewport=viewport,
+                    )
+                )
+            except Exception as exc:
+                logger.debug("Local headless fingerprint stealth init install failed: {}", exc)
             page = context.new_page()
+            _apply_cdp_stealth_overrides(context, page, browser_profile=browser_profile)
             try:
                 _ = page.goto("about:blank", wait_until="domcontentloaded", timeout=wait_ms)
             except Exception:
@@ -2779,11 +3864,52 @@ def _extract_datadome_clientid_from_html(html: str) -> str:
     return ""
 
 
-def _datadome_challenge_present(status: int, html: str) -> bool:
-    if status not in {403, 429}:
-        return False
+def _datadome_challenge_marker_hits(status: int, html: str) -> list[str]:
     lower = (html or "").lower()
-    return "datadome" in lower or "captcha" in lower
+    if not lower:
+        return ["empty_403_429"] if status in {403, 429} else []
+    # DataDome bootstrap code can appear in a perfectly normal PayPal document
+    # (including geo.ddc/captcha endpoint strings used by c.js).  Treat only
+    # active block/challenge page markers as HTML-level challenges for HTTP 200
+    # documents; generic captcha endpoint URLs are considered challenge proof
+    # only when the protected navigation itself returned 403/429.
+    active_markers = (
+        "device_check_redirect_to_slider",
+        "slider_closed",
+        "ddc-captcha",
+        "datadome captcha",
+        "block_page_loaded",
+        "edge_bot_protection",
+        "captcha-delivery.com/captcha",
+        "data-ddcid",
+    )
+    hits = [marker for marker in active_markers if marker in lower]
+    if status in {403, 429}:
+        if "datadome" in lower and any(marker in lower for marker in ("blocked", "forbidden", "access denied")):
+            hits.append("datadome_block_text")
+        status_markers = (
+            "geo.ddc.paypal.com",
+            "static.ddc.paypal.com/captcha",
+            "/interstitial/",
+            "/captcha/",
+            "captcha-delivery",
+            "datadome",
+            "captcha",
+            "access denied",
+            "forbidden",
+        )
+        hits.extend(marker for marker in status_markers if marker in lower)
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for marker in hits:
+        if marker not in seen:
+            seen.add(marker)
+            ordered.append(marker)
+    return ordered
+
+
+def _datadome_challenge_present(status: int, html: str) -> bool:
+    return bool(_datadome_challenge_marker_hits(status, html))
 
 
 def solve_datadome_with_local_headless(

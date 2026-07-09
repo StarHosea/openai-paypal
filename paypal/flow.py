@@ -17,6 +17,7 @@ import subprocess
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Protocol, cast
 from uuid import uuid4
 from loguru import logger
@@ -194,6 +195,7 @@ class PayPalFlow:
         self._signup_billing_address_prepared = False
         self._headless_session: Any | None = None
         self._headless_optimized_session: Any | None = None
+        self._datadome_browser_document: dict[str, Any] = {}
 
         if keep_roxy_browser and self._fingerprint_runtime_requested_roxy():
             profile_source = str(
@@ -489,6 +491,50 @@ class PayPalFlow:
         return raw not in {"0", "false", "no", "off", "strict", "disabled", "disable"}
 
     @staticmethod
+    def _datadome_phase0_preflight_enabled() -> bool:
+        raw = (
+            _load_proxy_dotenv_value("PAYPAL_DATADOME_PHASE0_PREFLIGHT")
+            or _load_proxy_dotenv_value("PAYPAL_DATADOME_PREFLIGHT")
+            or _load_proxy_dotenv_value("PAYPAL_HEADLESS_DATADOME_PREFLIGHT")
+            or ""
+        ).strip().lower()
+        return raw in {"1", "true", "yes", "on", "enable", "enabled"}
+
+    @staticmethod
+    def _headless_datadome_roxy_fallback_enabled() -> bool:
+        raw = (
+            _load_proxy_dotenv_value("PAYPAL_HEADLESS_DATADOME_ROXY_FALLBACK")
+            or _load_proxy_dotenv_value("PAYPAL_LOCAL_HEADLESS_DATADOME_ROXY_FALLBACK")
+            or "0"
+        ).strip().lower()
+        if raw in {"0", "false", "no", "off", "strict", "disabled", "disable"}:
+            return False
+        try:
+            from paypal.roxy_fingerprint import configured_roxy_api_key
+
+            return bool(configured_roxy_api_key())
+        except Exception:
+            return False
+
+    @staticmethod
+    def _headless_signup_context_roxy_fallback_enabled() -> bool:
+        raw = (
+            _load_proxy_dotenv_value("PAYPAL_HEADLESS_SIGNUP_CONTEXT_ROXY_FALLBACK")
+            or _load_proxy_dotenv_value("PAYPAL_LOCAL_HEADLESS_SIGNUP_CONTEXT_ROXY_FALLBACK")
+            or _load_proxy_dotenv_value("PAYPAL_HEADLESS_DATADOME_ROXY_FALLBACK")
+            or _load_proxy_dotenv_value("PAYPAL_LOCAL_HEADLESS_DATADOME_ROXY_FALLBACK")
+            or "auto"
+        ).strip().lower()
+        if raw in {"0", "false", "no", "off", "strict", "disabled", "disable"}:
+            return False
+        try:
+            from paypal.roxy_fingerprint import configured_roxy_api_key
+
+            return bool(configured_roxy_api_key())
+        except Exception:
+            return False
+
+    @staticmethod
     def _datadome_roxy_wait_seconds() -> float:
         raw = _load_proxy_dotenv_value("PAYPAL_DATADOME_ROXY_WAIT_SECONDS")
         if raw:
@@ -539,8 +585,61 @@ class PayPalFlow:
         self.state.roxy_browser = runtime.get("roxy_browser", {})
         return self.state.roxy_browser
 
+    @staticmethod
+    def _browser_document_from_datadome_result(result: dict[str, Any]) -> dict[str, Any]:
+        if not result.get("ok"):
+            return {}
+        html = str(result.get("html") or "")
+        if not html:
+            return {}
+        try:
+            status = int(result.get("status") or 0)
+        except Exception:
+            status = 0
+        if status >= 400:
+            return {}
+        if looks_like_paypal_authchallenge(html):
+            return {}
+        return {
+            "status_code": status or 200,
+            "url": str(result.get("url") or ""),
+            "text": html,
+        }
+
+    @staticmethod
+    def _response_from_browser_document(document: dict[str, Any]) -> Any | None:
+        html = str(document.get("text") or "")
+        if not html:
+            return None
+        return SimpleNamespace(
+            status_code=int(document.get("status_code") or 200),
+            text=html,
+            url=str(document.get("url") or ""),
+            headers={},
+            content=html.encode("utf-8", "ignore"),
+        )
+
+    @staticmethod
+    def _signup_context_seed_html_looks_usable(html: str) -> bool:
+        lower = (html or "").lower()
+        if not lower.lstrip().startswith("<"):
+            return False
+        if not any(marker in lower for marker in ("checkoutweb/signup", "weasley", "signupnewmember", "compliance.signupterms")):
+            return False
+        active_datadome_block_markers = (
+            "device_check_redirect_to_slider",
+            "block_page_loaded",
+            "datadome captcha",
+            "ddc-captcha",
+            "edge_bot_protection",
+        )
+        return not any(marker in lower for marker in active_datadome_block_markers)
+
     def _apply_datadome_browser_result(self, result: dict[str, Any], *, reason: str, runtime: str) -> bool:
         solved = bool(result.get("ok"))
+        document = self._browser_document_from_datadome_result(result)
+        if document:
+            self._datadome_browser_document = document
         self.state.datadome_browser_result = {
             "ok": solved,
             "runtime": runtime,
@@ -596,6 +695,32 @@ class PayPalFlow:
                     wait_seconds=self._datadome_headless_wait_seconds(),
                 )
                 solved = self._apply_datadome_browser_result(result, reason=reason, runtime="headless")
+                if not solved and self._headless_datadome_roxy_fallback_enabled():
+                    logger.warning(
+                        "Local headless DataDome remained challenged; retrying the same check through Roxy browser runtime."
+                    )
+                    try:
+                        from paypal.roxy_fingerprint import solve_datadome_with_roxy
+
+                        roxy_browser = self._ensure_roxy_browser_for_datadome()
+                        roxy_result = solve_datadome_with_roxy(
+                            roxy_browser,
+                            url,
+                            cookies=self.session.export_cookies_for_browser(),
+                            wait_seconds=self._datadome_roxy_wait_seconds(),
+                        )
+                        roxy_solved = self._apply_datadome_browser_result(
+                            roxy_result,
+                            reason=f"{reason}_roxy_fallback",
+                            runtime="roxy",
+                        )
+                        if roxy_solved:
+                            return True
+                    except Exception as roxy_exc:
+                        logger.warning(
+                            "Roxy fallback after local headless DataDome challenge failed: {}",
+                            self._safe_error_text(roxy_exc),
+                        )
                 if not solved and self._headless_runtime_fallback_enabled():
                     self.datadome_mode = "protocol"
                     self._cleanup_headless_session()
@@ -964,9 +1089,39 @@ class PayPalFlow:
             "debug_log_path": result.get("debug_log_path") or "",
         }
 
-    def _send_signup_context_risk_signals_with_roxy(self, signup_url: str, token: str) -> bool:
+    @staticmethod
+    def _signup_context_headless_result_is_datadome_challenge(result: dict[str, Any]) -> bool:
+        reason = str(result.get("reason") or "")
+        if reason in {
+            "signup_context_datadome_challenge",
+            "challenge_required",
+            "datadome_missing",
+        }:
+            return True
+        try:
+            status = int(result.get("status") or 0)
+        except Exception:
+            status = 0
+        if status in {403, 429}:
+            return True
+        if bool(result.get("blocked_by_datadome")):
+            return True
+        url = str(result.get("url") or "").lower()
+        if any(marker in url for marker in ("geo.ddc.paypal.com", "/captcha/", "/interstitial/", "authchallenge")):
+            return True
+        for key in ("signup_context_page_after_runtime", "signup_context_page"):
+            raw_page = result.get(key)
+            if not isinstance(raw_page, dict):
+                continue
+            page = cast(dict[str, object], raw_page)
+            page_reason = str(page.get("reason") or "")
+            if page_reason == "signup_context_datadome_challenge" or bool(page.get("blocked_by_datadome")):
+                return True
+        return False
+
+    def _send_signup_context_risk_signals_with_roxy(self, signup_url: str, token: str, *, force: bool = False) -> bool:
         mode = self._signup_context_risk_mode()
-        if mode not in {"roxy", "auto"} and not self._roxy_risk_runtime_active():
+        if not force and mode not in {"roxy", "auto"} and not self._roxy_risk_runtime_active():
             return False
         try:
             from paypal.roxy_fingerprint import run_phase1_risk_with_roxy_browser
@@ -1023,6 +1178,8 @@ class PayPalFlow:
                 "allowed_requests": result.get("allowed_requests") or [],
                 "learned_rules": result.get("learned_rules") or [],
                 "intercept": result.get("intercept") or {},
+                "missing_diagnostic_path": result.get("missing_diagnostic_path") or "",
+                "missing_diagnostic_error": result.get("missing_diagnostic_error") or "",
                 "debug_log_path": result.get("debug_log_path") or "",
             }
             previous = getattr(self.state, "risk_signals_browser_result", {})
@@ -1087,6 +1244,18 @@ class PayPalFlow:
             headless_session = self._get_headless_session()
             dfp_config = self._headless_mtr_config_for_page(signup_url)
             run_mtr = self._mtr_runtime_mode() == "headless"
+            seeded_signup_html = ""
+            seeded_signup_status = 200
+            last_signup_url = str(getattr(self, "_last_signup_url", "") or "")
+            if (
+                str(getattr(self, "_last_signup_html", "") or "")
+                and "/checkoutweb/signup" in last_signup_url
+            ):
+                seeded_signup_html = str(getattr(self, "_last_signup_html", "") or "")
+                try:
+                    seeded_signup_status = int(getattr(self, "_last_signup_status", 200) or 200)
+                except Exception:
+                    seeded_signup_status = 200
             result = run_local_headless_mtr_phase1(
                 signup_url,
                 dfp_config=dfp_config,
@@ -1104,11 +1273,30 @@ class PayPalFlow:
                 new_page=True,
                 run_mtr=run_mtr,
                 runtime="headless",
+                document_html=seeded_signup_html,
+                document_status=seeded_signup_status,
             )
             raw_cookies = result.get("cookies")
             result_cookies = cast(list[dict[str, Any]], raw_cookies) if isinstance(raw_cookies, list) else []
             if result_cookies:
                 self.session.import_browser_cookies(result_cookies)
+            if (
+                self._signup_context_headless_result_is_datadome_challenge(result)
+                and self._headless_signup_context_roxy_fallback_enabled()
+            ):
+                logger.warning(
+                    "Local headless signup-context stopped on DataDome challenge; retrying signup-context risk through Roxy fallback."
+                )
+                try:
+                    if self._send_signup_context_risk_signals_with_roxy(signup_url, token, force=True):
+                        return True
+                except Exception as roxy_exc:
+                    if strict_browser_risk_enabled():
+                        raise
+                    logger.warning(
+                        "Roxy fallback after signup-context DataDome challenge failed: {}",
+                        self._safe_error_text(roxy_exc),
+                    )
             browser_ok = self._normalize_phase1_roxy_datadog_runtime_result(result)
             counts = result.get("counts") if isinstance(result.get("counts"), dict) else {}
             observed = list(cast(list[object], result.get("observed"))) if isinstance(result.get("observed"), list) else []
@@ -1142,10 +1330,16 @@ class PayPalFlow:
                 "runtime_signals": result.get("runtime_signals") or [],
                 "required_signals": result.get("required_signals") or [],
                 "required_missing": required_missing,
+                "signup_context_page": result.get("signup_context_page") or {},
+                "signup_context_bootstrap": result.get("signup_context_bootstrap") or {},
+                "signup_context_seeded_document": result.get("signup_context_seeded_document") or {},
+                "blocked_by_datadome": bool(result.get("blocked_by_datadome")),
                 "blocked_requests": result.get("blocked_requests") or [],
                 "allowed_requests": result.get("allowed_requests") or [],
                 "learned_rules": result.get("learned_rules") or [],
                 "intercept": result.get("intercept") or {},
+                "missing_diagnostic_path": result.get("missing_diagnostic_path") or "",
+                "missing_diagnostic_error": result.get("missing_diagnostic_error") or "",
                 "debug_log_path": result.get("debug_log_path") or "",
             }
             previous = getattr(self.state, "risk_signals_browser_result", {})
@@ -1165,6 +1359,9 @@ class PayPalFlow:
             required_missing_text = [str(item) for item in required_missing if str(item)]
             if required_missing_text:
                 message = "Headless signup-context risk runtime is missing required browser signals: " + ",".join(required_missing_text)
+                diagnostic_path = str(result.get("missing_diagnostic_path") or "")
+                if diagnostic_path:
+                    message += f" diagnostic={diagnostic_path}"
                 if strict_browser_risk_enabled():
                     raise RuntimeError(message)
                 logger.warning(message)
@@ -1350,12 +1547,12 @@ class PayPalFlow:
         return send_tealeaf_data(*args, **kwargs)
 
     def _send_datadog_rum_view(self, *args, **kwargs):
-        if self._skip_synthetic_behavior_telemetry("Datadog RUM view"):
+        if strict_browser_risk_enabled() and self._skip_synthetic_behavior_telemetry("Datadog RUM view"):
             return None
         return send_datadog_rum_view(*args, **kwargs)
 
     def _send_datadog_rum_action(self, *args, **kwargs):
-        if self._skip_synthetic_behavior_telemetry("Datadog RUM action"):
+        if strict_browser_risk_enabled() and self._skip_synthetic_behavior_telemetry("Datadog RUM action"):
             return None
         return send_datadog_rum_action(*args, **kwargs)
 
@@ -2026,6 +2223,7 @@ class PayPalFlow:
         self._signup_billing_address_prepared = False
         self._headless_session = None
         self._headless_optimized_session = None
+        self._datadome_browser_document = {}
         self._on_full_retry_generated(flow_attempt)
 
         logger.info(
@@ -2045,56 +2243,92 @@ class PayPalFlow:
 
         url = f"https://www.paypal.com/agreements/approve?ba_token={self.ba_token}"
         datadome_mode = self._datadome_mode()
-        if datadome_mode in {"roxy", "headless"} and not self.state.datadome_cookie:
-            self._solve_datadome_with_roxy_browser(url, reason="phase0_preflight")
+        resp = None
+        if (
+            datadome_mode in {"roxy", "headless"}
+            and not self.state.datadome_cookie
+            and self._datadome_phase0_preflight_enabled()
+        ):
+            solved_preflight = self._solve_datadome_with_roxy_browser(url, reason="phase0_preflight")
             datadome_mode = self._datadome_mode()
+            if solved_preflight and datadome_mode == "headless":
+                resp = self._response_from_browser_document(self._datadome_browser_document)
+                if resp is not None:
+                    logger.info(
+                        "Using local headless browser document for Phase 0 after DataDome preflight status={} url={}",
+                        resp.status_code,
+                        sanitize_for_log({"url": str(resp.url)})["url"],
+                    )
+        elif datadome_mode in {"roxy", "headless"} and not self.state.datadome_cookie:
+            logger.debug(
+                "Skipping Phase 0 DataDome browser preflight; protocol GET will run first and browser runtime is reserved for HTTP 403."
+            )
 
         # First GET - may return 403 with DataDome challenge or 302 redirect
-        resp = self.session.get(url, headers={
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
-            "Upgrade-Insecure-Requests": "1",
-            "Sec-Fetch-Site": "none",
-            "Sec-Fetch-Mode": "navigate",
-            "Sec-Fetch-User": "?1",
-            "Sec-Fetch-Dest": "document",
-        })
+        if resp is None:
+            resp = self.session.get(url, headers={
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+                "Upgrade-Insecure-Requests": "1",
+                "Sec-Fetch-Site": "none",
+                "Sec-Fetch-Mode": "navigate",
+                "Sec-Fetch-User": "?1",
+                "Sec-Fetch-Dest": "document",
+            })
         self._capture_datadome_clientid(resp.text)
 
         if resp.status_code == 403:
             logger.info("Got 403 - DataDome challenge detected")
-            solved = self._solve_datadome_with_roxy_browser(url, reason="phase0_403") if datadome_mode in {"roxy", "headless", "auto"} else False
-            datadome_mode = self._datadome_mode()
-            if solved:
-                resp = self.session.get(url, headers={
-                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
-                    "Upgrade-Insecure-Requests": "1",
-                    "Sec-Fetch-Site": "none",
-                    "Sec-Fetch-Mode": "navigate",
-                    "Sec-Fetch-User": "?1",
-                    "Sec-Fetch-Dest": "document",
-                })
-                self._capture_datadome_clientid(resp.text)
-            elif datadome_mode in {"roxy", "headless"}:
-                raise RuntimeError(f"{datadome_mode} DataDome did not produce a datadome cookie after HTTP 403")
+            browser_resp = self._response_from_browser_document(self._datadome_browser_document)
+            if browser_resp is not None and datadome_mode == "headless":
+                logger.info(
+                    "Protocol Phase 0 replay was challenged; continuing with the local headless browser document status={} url={}",
+                    browser_resp.status_code,
+                    sanitize_for_log({"url": str(browser_resp.url)})["url"],
+                )
+                resp = browser_resp
             else:
-                # DataDome returns a page with embedded dd object and ct.ddc.paypal.com/c.js.
-                # Keep the old protocol/header method as the second configurable path.
-                logger.warning("DataDome challenge using protocol fallback. "
-                               "Cookie/client-id from response stored, attempting to proceed...")
+                solved = self._solve_datadome_with_roxy_browser(url, reason="phase0_403") if datadome_mode in {"roxy", "headless", "auto"} else False
+                datadome_mode = self._datadome_mode()
+                if solved:
+                    browser_resp = self._response_from_browser_document(self._datadome_browser_document)
+                    if browser_resp is not None and datadome_mode == "headless":
+                        logger.info(
+                            "Using local headless browser document for Phase 0 after 403 challenge status={} url={}",
+                            browser_resp.status_code,
+                            sanitize_for_log({"url": str(browser_resp.url)})["url"],
+                        )
+                        resp = browser_resp
+                    else:
+                        resp = self.session.get(url, headers={
+                            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+                            "Upgrade-Insecure-Requests": "1",
+                            "Sec-Fetch-Site": "none",
+                            "Sec-Fetch-Mode": "navigate",
+                            "Sec-Fetch-User": "?1",
+                            "Sec-Fetch-Dest": "document",
+                        })
+                    self._capture_datadome_clientid(resp.text)
+                elif datadome_mode in {"roxy", "headless"}:
+                    raise RuntimeError(f"{datadome_mode} DataDome did not produce a datadome cookie after HTTP 403")
+                else:
+                    # DataDome returns a page with embedded dd object and ct.ddc.paypal.com/c.js.
+                    # Keep the old protocol/header method as the second configurable path.
+                    logger.warning("DataDome challenge using protocol fallback. "
+                                   "Cookie/client-id from response stored, attempting to proceed...")
 
-                # Try the POST approach that the browser uses after DataDome resolves
-                post_url = f"{url}&YWRzZGRjYXB0Y2hh=1"
-                resp = self.session.post(post_url, headers={
-                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
-                    "Content-Type": "application/x-www-form-urlencoded",
-                    "Origin": "https://www.paypal.com",
-                    "Upgrade-Insecure-Requests": "1",
-                    "Sec-Fetch-Site": "same-origin",
-                    "Sec-Fetch-Mode": "navigate",
-                    "Sec-Fetch-User": "?1",
-                    "Sec-Fetch-Dest": "document",
-                }, data={"adsddtoken": ""})
-                self._capture_datadome_clientid(resp.text)
+                    # Try the POST approach that the browser uses after DataDome resolves
+                    post_url = f"{url}&YWRzZGRjYXB0Y2hh=1"
+                    resp = self.session.post(post_url, headers={
+                        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+                        "Content-Type": "application/x-www-form-urlencoded",
+                        "Origin": "https://www.paypal.com",
+                        "Upgrade-Insecure-Requests": "1",
+                        "Sec-Fetch-Site": "same-origin",
+                        "Sec-Fetch-Mode": "navigate",
+                        "Sec-Fetch-User": "?1",
+                        "Sec-Fetch-Dest": "document",
+                    }, data={"adsddtoken": ""})
+                    self._capture_datadome_clientid(resp.text)
 
         if resp.status_code == 302:
             redirect_url = resp.headers.get("Location", "")
@@ -6206,6 +6440,10 @@ class PayPalFlow:
                     },
                 )
                 self._capture_datadome_clientid(signup_resp.text)
+                if getattr(signup_resp, "status_code", 0) == 200 and self._signup_context_seed_html_looks_usable(signup_resp.text):
+                    self._last_signup_html = signup_resp.text
+                    self._last_signup_url = str(getattr(signup_resp, "url", "") or self.state.signup_url)
+                    self._last_signup_status = int(getattr(signup_resp, "status_code", 200) or 200)
                 self._apply_signup_content_metadata(signup_resp.text)
                 if self._content_metadata_is_unresolved():
                     self._ensure_live_signup_content_manifest(referer=self.state.signup_url)
@@ -6618,6 +6856,10 @@ class PayPalFlow:
                         },
                     )
                     self._capture_datadome_clientid(signup_resp.text)
+            if getattr(signup_resp, "status_code", 0) == 200 and self._signup_context_seed_html_looks_usable(signup_resp.text):
+                self._last_signup_html = signup_resp.text
+                self._last_signup_url = str(getattr(signup_resp, "url", "") or signup_url)
+                self._last_signup_status = int(getattr(signup_resp, "status_code", 200) or 200)
             self._apply_signup_content_metadata(signup_resp.text)
             manifest_url = (
                 self._extract_content_manifest_url(
