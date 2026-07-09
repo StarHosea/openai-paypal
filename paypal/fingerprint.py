@@ -767,6 +767,13 @@ def generate_runtime_profile(
             )
             return runtime
         except Exception as exc:
+            fallback_configured = bool(
+                _load_dotenv_value("PAYPAL_HEADLESS_FINGERPRINT_FALLBACK")
+                or _load_dotenv_value("PAYPAL_LOCAL_HEADLESS_FINGERPRINT_FALLBACK")
+                or _load_dotenv_value("PAYPAL_FINGERPRINT_FALLBACK")
+            )
+            if requested == "headless" and not fallback_configured:
+                raise
             if not _headless_fallback_to_random_enabled():
                 raise
             try:

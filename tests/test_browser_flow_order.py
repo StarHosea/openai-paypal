@@ -2192,6 +2192,39 @@ class BrowserFlowOrderTest(unittest.TestCase):
         self.assertEqual(dfp["audio_val"], "0.000123")
         self.assertEqual(dfp["webgl_ext_hash"], "webgl-headless")
 
+    def test_generate_runtime_profile_headless_missing_playwright_raises_by_default(self):
+        generate_runtime_profile = cast(Callable[..., dict[str, object]], getattr(fingerprint_module, "generate_runtime_profile"))
+
+        with (
+            patch("paypal.fingerprint._load_dotenv_value", return_value=""),
+            patch(
+                "paypal.local_headless.capture_runtime_fingerprint_with_local_headless",
+                side_effect=RuntimeError("playwright is not installed"),
+            ),
+            self.assertRaises(RuntimeError) as raised,
+        ):
+            generate_runtime_profile("headless")
+
+        self.assertIn("playwright is not installed", str(raised.exception))
+
+    def test_generate_runtime_profile_headless_fallback_requires_explicit_opt_in(self):
+        generate_runtime_profile = cast(Callable[..., dict[str, object]], getattr(fingerprint_module, "generate_runtime_profile"))
+
+        def fake_dotenv(name: str) -> str:
+            return "random" if name == "PAYPAL_HEADLESS_FINGERPRINT_FALLBACK" else ""
+
+        with (
+            patch("paypal.fingerprint._load_dotenv_value", side_effect=fake_dotenv),
+            patch(
+                "paypal.local_headless.capture_runtime_fingerprint_with_local_headless",
+                side_effect=RuntimeError("playwright is not installed"),
+            ),
+        ):
+            result = generate_runtime_profile("headless")
+
+        profile = cast(dict[str, object], result["browser_profile"])
+        self.assertEqual(profile["fingerprint_source"], "random")
+
     def test_mtr_python_generated_treats_headless_profile_as_browser_runtime(self):
         build_mtr_request_object = cast(Callable[..., dict[str, object]], getattr(mtr_module, "build_mtr_request_object"))
         build_mtr_bd_module = cast(Callable[..., dict[str, object]], getattr(mtr_module, "build_mtr_bd_module"))
