@@ -19,3 +19,14 @@ captures/
 
 # Local backup files
 backups/
+
+# Analysis / reverse-engineering write-ups (not needed in production repo)
+/*_analysis.md
+/*_diff*.md
+/*_review.md
+/PAYPAL_*.md
+/*_report.md
+/manual_path_analysis.md
+/full_flow_analysis.md
+/protocol_payment_reconstruction.md
+/roxy_packet_manual_analysis/
