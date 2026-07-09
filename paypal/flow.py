@@ -1127,6 +1127,18 @@ class PayPalFlow:
             from paypal.roxy_fingerprint import run_phase1_risk_with_roxy_browser
 
             roxy_browser = self._ensure_roxy_browser_for_datadome()
+            seeded_signup_html = ""
+            seeded_signup_status = 200
+            last_signup_url = str(getattr(self, "_last_signup_url", "") or "")
+            if (
+                str(getattr(self, "_last_signup_html", "") or "")
+                and "/checkoutweb/signup" in last_signup_url
+            ):
+                seeded_signup_html = str(getattr(self, "_last_signup_html", "") or "")
+                try:
+                    seeded_signup_status = int(getattr(self, "_last_signup_status", 200) or 200)
+                except Exception:
+                    seeded_signup_status = 200
             result = run_phase1_risk_with_roxy_browser(
                 roxy_browser,
                 signup_url,
@@ -1134,6 +1146,8 @@ class PayPalFlow:
                 wait_seconds=self._risk_roxy_wait_seconds(),
                 app_id="CHECKOUTUINODEWEB_ONBOARDING_LITE",
                 correlation_id=token,
+                document_html=seeded_signup_html,
+                document_status=seeded_signup_status,
             )
             if result.get("cookies"):
                 self.session.import_browser_cookies(result["cookies"])

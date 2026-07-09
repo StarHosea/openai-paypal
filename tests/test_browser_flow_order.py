@@ -716,6 +716,9 @@ class BrowserFlowOrderTest(unittest.TestCase):
     def test_signup_context_roxy_runs_even_when_legacy_enable_flag_is_off(self):
         flow, fake = make_flow(risk_signals_mode="roxy")
         setattr(flow, "_roxy_runtime_disabled_reason", "")
+        setattr(flow, "_last_signup_url", "https://www.paypal.com/checkoutweb/signup?token=EC-TEST123")
+        setattr(flow, "_last_signup_html", "<html><body>Create account</body></html>")
+        setattr(flow, "_last_signup_status", 200)
         send_signup_context = cast(Callable[[str, str], bool], getattr(flow, "_send_signup_context_risk_signals_with_roxy"))
 
         result = {
@@ -748,6 +751,9 @@ class BrowserFlowOrderTest(unittest.TestCase):
             )
 
         roxy_runner.assert_called_once()
+        _, roxy_kwargs = roxy_runner.call_args
+        self.assertEqual(roxy_kwargs["document_html"], "<html><body>Create account</body></html>")
+        self.assertEqual(roxy_kwargs["document_status"], 200)
         signup_context = cast(dict[str, object], flow.state.risk_signals_browser_result["signup_context"])
         self.assertEqual(signup_context["correlation_id"], "EC-TEST123")
         self.assertEqual(fake.browser_cookies[-1]["value"], "dd-roxy")

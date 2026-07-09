@@ -551,6 +551,45 @@ def test_signup_context_can_seed_protocol_signup_html_without_datadome_bootstrap
     assert cast(dict[str, object], result["signup_context_seeded_document"])["enabled"] is True
 
 
+def test_roxy_session_close_unroutes_network_handler_and_closes_owned_page() -> None:
+    class FakePage:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    class FakeContext:
+        def __init__(self) -> None:
+            self.unrouted: list[tuple[str, object]] = []
+
+        def unroute(self, pattern: str, handler: object) -> None:
+            self.unrouted.append((pattern, handler))
+
+    def handler(_route: object) -> None:
+        return None
+
+    session = local_headless.LocalHeadlessSession(
+        roxy_browser={"cdp_info": {"http": "127.0.0.1:9222"}},
+        runtime="roxy",
+    )
+    page = FakePage()
+    context = FakeContext()
+    session._browser = object()
+    session._context = context
+    session._network_route_handler = handler
+    session._network_installed = True
+    session._owned_pages.append(page)
+
+    session.close()
+
+    assert context.unrouted == [("**/*", handler)]
+    assert page.closed is True
+    assert session._network_route_handler is None
+    assert session._network_installed is False
+    assert session._owned_pages == []
+
+
 def test_signup_context_datadome_bootstrap_challenge_does_not_inject_risk(monkeypatch: Any) -> None:
     signup_url = "https://www.paypal.com/checkoutweb/signup?token=EC-TEST123"
 

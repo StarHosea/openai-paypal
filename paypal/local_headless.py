@@ -1992,8 +1992,10 @@ class LocalHeadlessSession:
         self._playwright: Any = None
         self._semaphore_acquired = False
         self._network_installed = False
+        self._network_route_handler: Callable[[Any], None] | None = None
         self._network_mode = "restricted"
         self._status = 0
+        self._owned_pages: list[Any] = []
         self._reset_events()
 
     @property
@@ -2106,6 +2108,24 @@ class LocalHeadlessSession:
 
     def close(self) -> None:
         try:
+            if self._context is not None and self._network_route_handler is not None:
+                try:
+                    unroute = getattr(self._context, "unroute", None)
+                    if callable(unroute):
+                        unroute("**/*", self._network_route_handler)
+                except Exception as exc:
+                    logger.debug("Local headless route cleanup failed: {}", exc)
+                finally:
+                    self._network_route_handler = None
+                    self._network_installed = False
+            for page in list(self._owned_pages):
+                try:
+                    close_page = getattr(page, "close", None)
+                    if callable(close_page):
+                        close_page()
+                except Exception as exc:
+                    logger.debug("Local headless page cleanup failed: {}", exc)
+            self._owned_pages.clear()
             if self._browser is not None:
                 if not self.roxy_browser:
                     self._browser.close()
@@ -2225,6 +2245,7 @@ class LocalHeadlessSession:
 
         try:
             self._context.route("**/*", route_handler)
+            self._network_route_handler = route_handler
             self._network_installed = True
         except Exception as exc:
             logger.debug("Local headless route install failed: {}", exc)
@@ -2490,6 +2511,7 @@ class LocalHeadlessSession:
         self.start()
         if self._page is None:
             self._page = self._context.new_page()
+            self._owned_pages.append(self._page)
             self._prepare_page_for_runtime(self._page)
         return self._page
 
@@ -2685,6 +2707,7 @@ class LocalHeadlessSession:
             self.policy.rules.extend(_seed_headless_optimized_rules("signup_context"))
         if new_page or self._page is None:
             page = self._context.new_page()
+            self._owned_pages.append(page)
             self._prepare_page_for_runtime(page)
             if not new_page:
                 self._page = page

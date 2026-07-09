@@ -2035,6 +2035,8 @@ def run_phase1_risk_with_roxy_browser(
     wait_seconds: float = 18.0,
     app_id: str = "IWC_NEXT_CHECKOUT",
     correlation_id: str = "",
+    document_html: str = "",
+    document_status: int = 200,
 ) -> dict[str, Any]:
     """Run signup-context browser-risk through the shared local-headless logic on Roxy."""
     from paypal.local_headless import run_local_headless_mtr_phase1
@@ -2055,5 +2057,7 @@ def run_phase1_risk_with_roxy_browser(
             run_mtr=False,
             roxy_browser=cast(dict[str, object], roxy_browser),
             runtime="roxy",
+            document_html=document_html,
+            document_status=document_status,
         ),
     )
