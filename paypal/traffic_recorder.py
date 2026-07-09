@@ -11,10 +11,10 @@ import time
 import urllib.parse
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 
-_GLOBAL_RECORDER = None
+_global_recorder: "TrafficRecorder | None" = None
 _GLOBAL_LOCK = threading.Lock()
 _THREAD_LOCAL = threading.local()
 
@@ -52,6 +52,32 @@ def re_sub(pattern: str, repl: str, value: str) -> str:
 
 def _sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def _prepare_private_dir(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(path, 0o700)
+    except Exception:
+        pass
+
+
+def _touch_private_file(path: Path) -> None:
+    _prepare_private_dir(path.parent)
+    path.touch(exist_ok=True)
+    try:
+        os.chmod(path, 0o600)
+    except Exception:
+        pass
+
+
+def _write_private_text(path: Path, text: str) -> None:
+    _prepare_private_dir(path.parent)
+    path.write_text(text, encoding="utf-8")
+    try:
+        os.chmod(path, 0o600)
+    except Exception:
+        pass
 
 
 def _is_text_content_type(content_type: str = "", url: str = "") -> bool:
@@ -179,6 +205,8 @@ def request_body_from_kwargs(kwargs: dict[str, Any]) -> tuple[bytes | None, str,
 
     if "data" in kwargs and kwargs.get("data") is not None:
         data = kwargs.get("data")
+        if data is None:
+            return None, "", meta
         if isinstance(data, bytes):
             return data, "", {"source": "data.bytes"}
         if isinstance(data, bytearray):
@@ -186,7 +214,7 @@ def request_body_from_kwargs(kwargs: dict[str, Any]) -> tuple[bytes | None, str,
         if isinstance(data, str):
             return data.encode("utf-8"), "", {"source": "data.str"}
         try:
-            return urllib.parse.urlencode(data, doseq=True).encode("utf-8"), (
+            return urllib.parse.urlencode(cast(Any, data), doseq=True).encode("utf-8"), (
                 "application/x-www-form-urlencoded"
             ), {"source": "data.form"}
         except Exception:
@@ -194,9 +222,11 @@ def request_body_from_kwargs(kwargs: dict[str, Any]) -> tuple[bytes | None, str,
 
     if "files" in kwargs and kwargs.get("files") is not None:
         files = kwargs.get("files")
+        if files is None:
+            return None, "", meta
         fields = []
         try:
-            iterable = files.items() if isinstance(files, dict) else files
+            iterable: Any = files.items() if isinstance(files, dict) else files
             for name, value in iterable:
                 item: dict[str, Any] = {"name": str(name)}
                 if isinstance(value, tuple):
@@ -237,8 +267,8 @@ class TrafficRecorder:
         self.requests_tsv = self.network_dir / "requests.tsv"
         self.summary_file = self.root / "summary.json"
         self.meta_file = self.root / "metadata.json"
-        self.raw_bodies = _env_bool("PAYPAL_TRAFFIC_RECORD_RAW", True)
-        self.response_bodies = _env_bool("PAYPAL_TRAFFIC_RECORD_RESPONSES", True)
+        self.raw_bodies = _env_bool("PAYPAL_TRAFFIC_RECORD_RAW", False)
+        self.response_bodies = _env_bool("PAYPAL_TRAFFIC_RECORD_RESPONSES", False)
         self.max_preview = int(os.getenv("PAYPAL_TRAFFIC_PREVIEW_BYTES", "4000") or "4000")
         self._lock = threading.Lock()
         self._seq = 0
@@ -248,13 +278,15 @@ class TrafficRecorder:
         self._request_body_paths: dict[int, str] = {}
         self._last_event: dict[str, Any] = {}
         for path in (self.root, self.network_dir, self.requests_dir, self.bodies_dir):
-            path.mkdir(parents=True, exist_ok=True)
+            _prepare_private_dir(path)
+        _touch_private_file(self.events_file)
         if not self.requests_tsv.exists():
-            self.requests_tsv.write_text(
+            _write_private_text(
+                self.requests_tsv,
                 "id\ttime\tmethod\tstatus\turl\trequestBody\tresponseBody\tcontentType\tsynthetic\n",
-                encoding="utf-8",
             )
-        self.meta_file.write_text(
+        _write_private_text(
+            self.meta_file,
             json.dumps(
                 {
                     "startedAt": _now(),
@@ -267,7 +299,6 @@ class TrafficRecorder:
                 ensure_ascii=False,
                 indent=2,
             ),
-            encoding="utf-8",
         )
         self._write_summary("recording")
 
@@ -278,12 +309,14 @@ class TrafficRecorder:
 
     def _append_jsonl(self, obj: dict[str, Any]) -> None:
         with self._lock:
+            _touch_private_file(self.events_file)
             with self.events_file.open("a", encoding="utf-8") as fh:
                 fh.write(json.dumps(obj, ensure_ascii=False) + "\n")
 
     def _append_tsv(self, fields: list[Any]) -> None:
         line = "\t".join(str(v or "").replace("\t", " ").replace("\n", "\\n") for v in fields)
         with self._lock:
+            _touch_private_file(self.requests_tsv)
             with self.requests_tsv.open("a", encoding="utf-8") as fh:
                 fh.write(line + "\n")
 
@@ -307,8 +340,17 @@ class TrafficRecorder:
         }
         tmp = self.summary_file.with_suffix(".json.tmp")
         with self._lock:
+            _prepare_private_dir(tmp.parent)
             tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            try:
+                os.chmod(tmp, 0o600)
+            except Exception:
+                pass
             tmp.replace(self.summary_file)
+            try:
+                os.chmod(self.summary_file, 0o600)
+            except Exception:
+                pass
 
     def _save_bytes(
         self,
@@ -322,7 +364,12 @@ class TrafficRecorder:
             return None
         ext = _extension_for(content_type, url)
         path = directory / f"{prefix}_{_safe_name(url)}_{_sha256(data)[:10]}{ext}"
+        _prepare_private_dir(directory)
         path.write_bytes(data)
+        try:
+            os.chmod(path, 0o600)
+        except Exception:
+            pass
         text = _is_text_content_type(content_type, url)
         preview = ""
         if text:
@@ -391,7 +438,6 @@ class TrafficRecorder:
                 "bytes": len(body),
                 "sha256": _sha256(body),
                 "text": _is_text_content_type(content_type, full_url),
-                "preview": body[: self.max_preview].decode("utf-8", errors="replace"),
                 "meta": body_meta,
             }
         self._append_jsonl(rec)
@@ -491,28 +537,28 @@ def get_global_traffic_recorder() -> TrafficRecorder | None:
     current = getattr(_THREAD_LOCAL, "recorder", None)
     if current is not None:
         return current
-    global _GLOBAL_RECORDER
+    global _global_recorder
     if not traffic_recording_enabled():
         return None
     with _GLOBAL_LOCK:
-        if _GLOBAL_RECORDER is None:
-            _GLOBAL_RECORDER = TrafficRecorder()
-        return _GLOBAL_RECORDER
+        if _global_recorder is None:
+            _global_recorder = TrafficRecorder()
+        return _global_recorder
 
 
 def reset_global_traffic_recorder(root: str | Path | None = None) -> TrafficRecorder:
-    global _GLOBAL_RECORDER
+    global _global_recorder
     os.environ["PAYPAL_TRAFFIC_RECORD"] = "1"
     if root:
         os.environ["PAYPAL_TRAFFIC_RECORD_DIR"] = str(root)
     with _GLOBAL_LOCK:
-        if _GLOBAL_RECORDER is not None:
+        if _global_recorder is not None:
             try:
-                _GLOBAL_RECORDER.close()
+                _global_recorder.close()
             except Exception:
                 pass
-        _GLOBAL_RECORDER = TrafficRecorder(root)
-        return _GLOBAL_RECORDER
+        _global_recorder = TrafficRecorder(root)
+        return _global_recorder
 
 
 def set_current_traffic_recorder(recorder: TrafficRecorder | None) -> None:
@@ -525,7 +571,8 @@ def clear_current_traffic_recorder() -> None:
 
 
 def close_global_traffic_recorder() -> None:
-    global _GLOBAL_RECORDER
+    global _global_recorder
     with _GLOBAL_LOCK:
-        if _GLOBAL_RECORDER is not None:
-            _GLOBAL_RECORDER.close()
+        if _global_recorder is not None:
+            _global_recorder.close()
+            _global_recorder = None

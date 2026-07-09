@@ -17,7 +17,7 @@ except ImportError:
     HAS_CURL_CFFI = False  # pyright: ignore[reportConstantRedefinition]
 
 from loguru import logger
-from typing import Any, Optional
+from typing import Any, Optional, cast
 from paypal.models import SessionState
 from paypal.traffic_recorder import get_global_traffic_recorder
 from config import USER_AGENT, BROWSER_PROFILE
@@ -66,6 +66,63 @@ _CAPTCHA_REMOVED_SOLVER_MODES = {
 }
 
 
+def _dict_value(value: object) -> dict[str, Any]:
+    return cast(dict[str, Any], value) if isinstance(value, dict) else {}
+
+
+def _ua_high_entropy(profile: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    ua_data = _dict_value(
+        profile.get("user_agent_data")
+        or profile.get("uaData")
+        or profile.get("ua_data")
+    )
+    high_entropy = _dict_value(ua_data.get("highEntropy") or ua_data.get("high_entropy"))
+    return ua_data, high_entropy
+
+
+def _ua_brand_entries(value: object) -> list[dict[str, str]]:
+    if not isinstance(value, list):
+        return []
+    entries: list[dict[str, str]] = []
+    for item in value:
+        entry = _dict_value(item)
+        brand = str(entry.get("brand") or entry.get("b") or "")
+        version = str(entry.get("version") or entry.get("v") or "")
+        if brand and version:
+            entries.append({"brand": brand, "version": version})
+    return entries
+
+
+def _low_entropy_ua_brands(profile: dict[str, Any]) -> list[dict[str, str]]:
+    ua_data, high_entropy = _ua_high_entropy(profile)
+    runtime_brands = _ua_brand_entries(high_entropy.get("brands") or ua_data.get("brands"))
+    if runtime_brands:
+        return runtime_brands
+    major = str(profile.get("chrome_major") or "150")
+    return [
+        {"brand": "Not;A=Brand", "version": "8"},
+        {"brand": "Chromium", "version": major},
+        {"brand": "Google Chrome", "version": major},
+    ]
+
+
+def _full_version_ua_brands(profile: dict[str, Any]) -> list[dict[str, str]]:
+    ua_data, high_entropy = _ua_high_entropy(profile)
+    runtime_full_versions = _ua_brand_entries(high_entropy.get("fullVersionList") or ua_data.get("fullVersionList"))
+    if runtime_full_versions:
+        return runtime_full_versions
+    full_version = str(profile.get("chrome_full_version") or f"{profile.get('chrome_major') or '150'}.0.0.0")
+    return [
+        {"brand": "Not;A=Brand", "version": "8.0.0.0"},
+        {"brand": "Chromium", "version": full_version},
+        {"brand": "Google Chrome", "version": full_version},
+    ]
+
+
+def _format_sec_ch_ua(entries: list[dict[str, str]]) -> str:
+    return ", ".join(f'"{item["brand"]}";v="{item["version"]}"' for item in entries)
+
+
 def _load_dotenv_value(name: str) -> str:
     """Read one value from local .env without adding a runtime dependency."""
     if os.getenv(name):
@@ -110,11 +167,12 @@ def _env_truthy(name: str) -> bool:
 
 
 def strict_browser_risk_enabled() -> bool:
-    return _load_dotenv_value("PAYPAL_STRICT_BROWSER_RISK").strip().lower() not in {
-        "0",
-        "false",
-        "no",
-        "off",
+    return _load_dotenv_value("PAYPAL_STRICT_BROWSER_RISK").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+        "strict",
     }
 
 
@@ -147,7 +205,7 @@ def captcha_frontend_disable_enabled() -> bool:
     return paypal_captcha_bypass_mode() == CAPTCHA_FRONTEND_DISABLE_MODE
 
 
-def build_common_headers(state: SessionState | None = None) -> dict:
+def build_common_headers(state: SessionState | None = None) -> dict[str, str]:
     """Low-entropy Client Hints only.
 
     Chrome sends ``sec-ch-ua``, ``sec-ch-ua-mobile`` and
@@ -157,40 +215,36 @@ def build_common_headers(state: SessionState | None = None) -> dict:
     server responds with ``Accept-CH`` and only to **same-origin**
     sub-resource requests, never on the initial navigation.
     """
-    profile = (
+    profile = cast(dict[str, object], (
         getattr(state, "browser_profile", None)
         if state is not None
         else None
-    ) or BROWSER_PROFILE
-    user_agent = profile.get("user_agent") or USER_AGENT
-    major = str(profile.get("chrome_major") or "150")
+    ) or BROWSER_PROFILE)
+    user_agent = str(profile.get("user_agent") or USER_AGENT)
+    language = str(profile.get("language") or "pt-BR")
     return {
         "User-Agent": user_agent,
         "Accept": "*/*",
-        "Accept-Language": f'{profile["language"]},pt;q=0.9,en-US;q=0.8,en;q=0.7',
-        "sec-ch-ua": f'"Not;A=Brand";v="8", "Chromium";v="{major}", "Google Chrome";v="{major}"',
+        "Accept-Language": f"{language},pt;q=0.9,en-US;q=0.8,en;q=0.7",
+        "sec-ch-ua": _format_sec_ch_ua(_low_entropy_ua_brands(profile)),
         "sec-ch-ua-mobile": "?0",
-        "sec-ch-ua-platform": profile["sec_ch_platform"],
+        "sec-ch-ua-platform": str(profile.get("sec_ch_platform") or '"Linux"'),
     }
 
 
-def build_high_entropy_hints(state: SessionState | None = None) -> dict:
+def build_high_entropy_hints(state: SessionState | None = None) -> dict[str, str]:
     """High-entropy Client Hints sent only to same-origin after Accept-CH."""
-    profile = (
+    profile = cast(dict[str, object], (
         getattr(state, "browser_profile", None)
         if state is not None
         else None
-    ) or BROWSER_PROFILE
-    major = str(profile.get("chrome_major") or "150")
-    full_version = str(profile.get("chrome_full_version") or f"{major}.0.0.0")
+    ) or BROWSER_PROFILE)
     return {
-        "sec-ch-ua-arch": profile["sec_ch_arch"],
-        "sec-ch-device-memory": str(profile["device_memory"]),
+        "sec-ch-ua-arch": str(profile.get("sec_ch_arch") or '"x86"'),
+        "sec-ch-device-memory": str(profile.get("device_memory") or "8"),
         "sec-ch-ua-model": '""',
         "sec-ch-ua-full-version-list": (
-            f'"Not;A=Brand";v="8.0.0.0", '
-            f'"Chromium";v="{full_version}", '
-            f'"Google Chrome";v="{full_version}"'
+            _format_sec_ch_ua(_full_version_ua_brands(profile))
         ),
     }
 
@@ -239,6 +293,20 @@ def _mask_url(value: str) -> str:
         "secret",
         "nonce",
         "client_secret",
+        "client_metadata_id",
+        "clientmetadataid",
+        "correlation_id",
+        "correlationid",
+        "ctx_id",
+        "ctxid",
+        "cmid",
+        "ssrt",
+        "request_id",
+        "requestid",
+        "sealed_result",
+        "sealedresult",
+        "visitor_token",
+        "visitortoken",
         "payment_intent",
         "ba_token",
         "stripe_session_id",
@@ -265,6 +333,53 @@ def _mask_url(value: str) -> str:
     )
 
 
+def _mask_embedded_urls(value: str) -> str:
+    return re.sub(r"https?://[^\s\"'<>]+", lambda match: _mask_url(match.group(0)), value)
+
+
+def _mask_inline_sensitive_pairs(value: str) -> str:
+    sensitive_keys = (
+        "ba_token",
+        "ec_token",
+        "billingAgreementId",
+        "billingAgreementToken",
+        "token",
+        "accessToken",
+        "access_token",
+        "password",
+        "securityCode",
+        "cvv",
+        "pin",
+        "otp",
+        "ssrt",
+        "ctxId",
+        "ctx_id",
+        "cmid",
+        "clientMetadataId",
+        "client_metadata_id",
+        "correlationId",
+        "correlation_id",
+        "requestId",
+        "request_id",
+        "sealedResult",
+        "sealed_result",
+        "visitorToken",
+        "visitor_token",
+        "authorization",
+        "cookie",
+        "euat",
+    )
+    key_pattern = "|".join(re.escape(key) for key in sensitive_keys)
+    value = re.sub(
+        rf"(?i)([\"']?\b(?:{key_pattern})\b[\"']?\s*[:=]\s*)([\"']?)([^&,\"'\s}}{{]+)([\"']?)",
+        lambda match: f"{match.group(1)}{match.group(2)}<redacted>{match.group(4)}",
+        value,
+    )
+    value = re.sub(r"\bBA-[A-Za-z0-9]{8,80}\b", lambda match: _mask_middle(match.group(0)), value)
+    value = re.sub(r"\bEC-[A-Za-z0-9]{8,80}\b", lambda match: _mask_middle(match.group(0)), value)
+    return value
+
+
 def sanitize_for_log(value: Any, key: str = "") -> Any:
     """Remove secrets and high-risk PII before writing diagnostics."""
     if isinstance(value, dict):
@@ -283,7 +398,18 @@ def sanitize_for_log(value: Any, key: str = "") -> Any:
         return "<redacted>"
     if "accesstoken" in compact_key or "euat" in compact_key:
         return "<redacted>"
-    if compact_key in {"token", "batoken", "ectoken", "billingagreementid"}:
+    if compact_key in {
+        "sealedresult",
+        "visitortoken",
+        "requestid",
+        "correlationid",
+        "clientmetadataid",
+        "cmid",
+        "ssrt",
+        "ctxid",
+    }:
+        return _mask_middle(value)
+    if compact_key in {"token", "batoken", "ectoken", "billingagreementid", "billingagreementtoken"}:
         return _mask_middle(value)
     if "url" in compact_key and value.startswith(("http://", "https://")):
         return _mask_url(value)
@@ -296,7 +422,7 @@ def sanitize_for_log(value: Any, key: str = "") -> Any:
     if compact_key in {"phonenumber", "phone", "number"} and sum(ch.isdigit() for ch in value) >= 8:
         return _mask_digits(value)
 
-    return value
+    return _mask_inline_sensitive_pairs(_mask_embedded_urls(value))
 
 
 def _paypal_debug_id(headers: httpx.Headers) -> str:
@@ -315,7 +441,10 @@ def _header_values(headers: Any, name: str) -> list[str]:
             try:
                 got = getter(name)
                 if got:
-                    values.extend(str(item) for item in got if item is not None)
+                    if isinstance(got, (list, tuple)):
+                        values.extend(str(item) for item in got if item is not None)
+                    else:
+                        values.append(str(got))
             except Exception:
                 pass
 
@@ -436,7 +565,10 @@ class PayPalSession:
             client_kwargs["proxy"] = proxy_url
         if self._use_curl:
             impersonate = os.getenv("PAYPAL_CURL_IMPERSONATE", "chrome").strip() or "chrome"
-            self.client = CurlSession(impersonate=impersonate)  # pyright: ignore[reportPossiblyUnboundVariable]
+            curl_session_factory = cast(Any, globals().get("CurlSession"))
+            if curl_session_factory is None:
+                raise RuntimeError("curl_cffi is not available")
+            self.client = curl_session_factory(impersonate=impersonate)
             self.client.headers.update(build_common_headers(state))
             self.client.timeout = 30
             self.client.allow_redirects = False
@@ -1062,12 +1194,12 @@ class PayPalSession:
         logger.debug(f"  -> {resp.status_code} ({len(resp.content)} bytes)")
         return resp
 
-    def graphql(self, operation_name: str, query: str, variables: dict,
-                extra_headers: Optional[dict] = None,
-                extra_body: Optional[dict] = None,
+    def graphql(self, operation_name: str, query: str, variables: dict[str, object],
+                extra_headers: Optional[dict[str, object]] = None,
+                extra_body: Optional[dict[str, object]] = None,
                 batched: bool = False,
                 endpoint: Optional[str] = None,
-                graphql_error_level: str = "ERROR") -> dict:
+                graphql_error_level: str = "ERROR") -> dict[str, object] | list[dict[str, object]]:
         """Send a GraphQL request to PayPal's graphql endpoint."""
         url = endpoint or "https://www.paypal.com/graphql"
         if operation_name and endpoint is None:
@@ -1115,9 +1247,9 @@ class PayPalSession:
                 if value is None:
                     headers.pop(key, None)
                 else:
-                    headers[key] = value
+                    headers[key] = str(value)
 
-        payload_item = {
+        payload_item: dict[str, object] = {
             "operationName": operation_name,
             "variables": variables,
             "query": query,

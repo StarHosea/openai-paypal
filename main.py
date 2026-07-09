@@ -5,6 +5,7 @@ Usage:
     python main.py --ba-token BA-xxx --phone +5591980133818
 """
 import argparse
+import importlib
 import json
 import os
 import sys
@@ -18,6 +19,21 @@ from paypal.session import sanitize_for_log
 from paypal.traffic_recorder import close_global_traffic_recorder, reset_global_traffic_recorder
 
 
+def _smsbower_module():
+    return importlib.import_module("paypal.smsbower")
+
+
+def _smsbower_enabled() -> bool:
+    return bool(getattr(_smsbower_module(), "smsbower_enabled")())
+
+
+def _build_smsbower_provider(enabled: bool, api_key: str | None):
+    return getattr(_smsbower_module(), "build_smsbower_provider")(
+        enabled=enabled,
+        api_key=api_key,
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="PayPal Billing Agreement Approval Automation"
@@ -27,8 +43,19 @@ def main():
         help="Billing Agreement token (e.g. BA-3AX328361P111131W)"
     )
     parser.add_argument(
-        "--phone", required=True,
+        "--phone",
+        default="",
         help="Phone number with country code (e.g. +5591980133818)"
+    )
+    parser.add_argument(
+        "--smsbower",
+        action="store_true",
+        help="Use SMSBower to acquire and receive the PayPal Brazil SMS automatically",
+    )
+    parser.add_argument(
+        "--smsbower-api-key",
+        default=None,
+        help="SMSBower API key. Defaults to SMSBOWER_API_KEY or PAYPAL_SMSBOWER_API_KEY from .env/environment",
     )
     parser.add_argument(
         "--debug", action="store_true",
@@ -43,8 +70,8 @@ def main():
     parser.add_argument(
         "--max-flow-attempts",
         type=int,
-        default=3,
-        help="Max full-flow retries when authorization ends with BUYER_NOT_SET",
+        default=1,
+        help="Max full-flow attempts; 1 means no full-flow retry",
     )
     parser.add_argument(
         "--max-authorize-attempts",
@@ -70,7 +97,7 @@ def main():
         dest="proxy_enabled",
         action="store_true",
         default=None,
-        help="Enable configured 1024proxy outbound proxy for this run",
+        help="Enable outbound proxy from PAYPAL_PROXY_URL or PAYPAL_PROXY_POOL for this run",
     )
     proxy_group.add_argument(
         "--no-proxy",
@@ -82,7 +109,7 @@ def main():
         "--proxy-index",
         type=int,
         default=None,
-        help="Use a specific configured proxy index (0-based). Default: random when proxy is enabled",
+        help="Use a specific PAYPAL_PROXY_POOL entry (0-based). Default: random when proxy is enabled",
     )
     parser.add_argument(
         "--proxy-url",
@@ -106,27 +133,27 @@ def main():
     )
     parser.add_argument(
         "--fingerprint-source",
-        choices=["random", "program", "python", "synthetic", "roxy", "browser", "auto"],
+        choices=["random", "program", "python", "synthetic", "roxy", "browser", "headless", "local_headless", "playwright", "local_playwright", "auto"],
         default=None,
-        help="Browser fingerprint source: random/program Python generator, roxy RoxyBrowser runtime, or auto",
+        help="Browser fingerprint source: random/program Python generator, roxy RoxyBrowser runtime, local headless Playwright, or auto",
     )
     parser.add_argument(
         "--datadome-mode",
-        choices=["protocol", "edge", "roxy", "browser", "auto", "off"],
+        choices=["protocol", "edge", "roxy", "browser", "headless", "local_headless", "playwright", "local_playwright", "auto", "off"],
         default=None,
-        help="DataDome mode: protocol edge simulation, roxy real browser runtime, auto, or off",
+        help="DataDome mode: protocol edge simulation, roxy browser runtime, local headless Playwright, auto, or off",
     )
     parser.add_argument(
         "--mtr-runtime",
-        choices=["python_generated", "python", "protocol", "roxy", "browser", "auto", "block", "off"],
+        choices=["python_generated", "python", "protocol", "roxy", "browser", "headless", "local_headless", "playwright", "local_playwright", "auto", "block", "off"],
         default=None,
-        help="MTR sealedResult source: python_generated protocol template, roxy browser runtime, auto, block, or off",
+        help="MTR sealedResult source: python_generated protocol template, roxy browser runtime, local headless Playwright, auto, block, or off",
     )
     parser.add_argument(
         "--risk-signals-mode",
-        choices=["protocol", "python", "synthetic", "template", "roxy", "browser", "auto", "off"],
+        choices=["protocol", "python", "synthetic", "template", "roxy", "browser", "headless", "local_headless", "playwright", "local_playwright", "auto", "off"],
         default=None,
-        help="Phase1 risk signal source: protocol templates, roxy browser runtime, auto, or off",
+        help="Signup-context browser risk source: roxy browser runtime, local headless Playwright, auto, or off",
     )
 
     args = parser.parse_args()
@@ -154,14 +181,24 @@ def main():
         index=args.proxy_index,
         proxy_url=args.proxy_url,
     )
+    sms_provider_requested = bool(args.smsbower or args.smsbower_api_key or _smsbower_enabled())
+    sms_provider = _build_smsbower_provider(
+        enabled=sms_provider_requested,
+        api_key=args.smsbower_api_key,
+    )
+    if not args.phone and sms_provider is None:
+        parser.error("--phone is required unless --smsbower or SMSBOWER_ENABLED=1 is set")
 
-    user = generate_user(args.phone)
+    user = generate_user(args.phone or "+5500000000000")
     card = generate_card(proxy_url=proxy_config.url)
     address = generate_address()
 
     logger.info(f"User: {user.first_name} {user.last_name}")
     logger.info("Email: {}", sanitize_for_log({"email": user.email})["email"])
-    logger.info("Phone: {}", sanitize_for_log({"phone": user.phone})["phone"])
+    if sms_provider is None:
+        logger.info("Phone: {}", sanitize_for_log({"phone": user.phone})["phone"])
+    else:
+        logger.info("Phone: SMSBower auto mode will reserve a Brazil PayPal number before OTP")
     logger.info("CPF: <redacted>")
     logger.info("DOB: <redacted>")
     logger.info(
@@ -187,6 +224,7 @@ def main():
         datadome_mode=args.datadome_mode,
         mtr_runtime=args.mtr_runtime,
         risk_signals_mode=args.risk_signals_mode,
+        sms_provider=sms_provider,
     )
 
     try:

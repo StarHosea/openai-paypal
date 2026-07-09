@@ -5,13 +5,14 @@ import base64
 import hashlib
 import json
 import os
+import random
 import re
 import time
 import urllib.parse
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import httpx
 from loguru import logger
@@ -93,6 +94,36 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return value in {"1", "true", "yes", "on", "y"}
 
 
+def _dict_value(value: object) -> dict[str, Any]:
+    return cast(dict[str, Any], value) if isinstance(value, dict) else {}
+
+
+def _event_dict(events: dict[str, Any], key: str) -> dict[str, Any]:
+    value = events.get(key)
+    if isinstance(value, dict):
+        return cast(dict[str, Any], value)
+    result: dict[str, Any] = {}
+    events[key] = result
+    return result
+
+
+def _event_list(events: dict[str, Any], key: str) -> list[Any]:
+    value = events.get(key)
+    if isinstance(value, list):
+        return value
+    result: list[Any] = []
+    events[key] = result
+    return result
+
+
+def _add_browser_context_cookies(context: Any, cookies: list[dict[str, Any]]) -> None:
+    context.add_cookies(cast(Any, cookies))
+
+
+def _browser_context_cookies(context: Any, target_urls: list[str]) -> list[dict[str, Any]]:
+    return [dict(cookie) for cookie in cast(list[Any], context.cookies(target_urls))]
+
+
 def _roxy_timezone_value(timezone_name: str, offset_minutes: int) -> str:
     # Roxy API uses strings such as "GMT-03:00 America/Sao_Paulo".  JavaScript
     # Date#getTimezoneOffset uses the opposite sign: UTC-3 => +180 minutes.
@@ -145,8 +176,135 @@ def configured_roxy_api_key() -> str:
         _env_str("PAYPAL_ROXY_API_KEY")
         or _env_str("ROXY_API_KEY")
         or _env_str("ROXY_API_TOKEN")
+        or _load_roxy_public_api_key()
         or ROXY_API_KEY
     ).strip()
+
+
+def _roxy_public_config_paths() -> list[Path]:
+    configured = _env_str("PAYPAL_ROXY_PUBLIC_CONFIG_PATH") or _env_str("ROXY_PUBLIC_CONFIG_PATH")
+    paths: list[Path] = []
+    if configured:
+        paths.append(Path(configured).expanduser())
+    paths.append(Path.home() / ".roxybrowser" / "config.json")
+    return paths
+
+
+def _roxy_session_config_paths() -> list[Path]:
+    configured = _env_str("PAYPAL_ROXY_SESSION_CONFIG_PATH") or _env_str("ROXY_SESSION_CONFIG_PATH")
+    paths: list[Path] = []
+    if configured:
+        paths.append(Path(configured).expanduser())
+    paths.extend(
+        [
+            Path.home() / ".config" / "RoxyBrowser" / "config.json",
+            Path.home() / ".config" / "roxybrowser" / "config.json",
+            Path.home() / ".config" / "roxybrowser-dev" / "config.json",
+        ]
+    )
+    return paths
+
+
+def _load_roxy_public_config() -> dict[str, Any]:
+    """Read Roxy's small public config that stores the current OpenAPI key.
+
+    Roxy rewrites this file when the API service starts.  Using it as a retry
+    source prevents stale PAYPAL_ROXY_API_KEY values from making
+    /browser/workspace look empty even though the desktop app is logged in.
+    """
+    for path in _roxy_public_config_paths():
+        if not path.is_file():
+            continue
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if isinstance(data, dict):
+            return cast(dict[str, Any], data)
+    return {}
+
+
+def _load_roxy_public_api_key() -> str:
+    value = _load_roxy_public_config().get("apiKey")
+    return str(value or "").strip()
+
+
+def _decrypt_roxy_session_config(raw: str) -> dict[str, Any]:
+    """Decrypt RoxyBrowser's local Electron config.
+
+    The desktop app stores the logged-in app token in an AES-CBC encrypted JSON
+    file.  We only use it as a last-resort control-plane fallback for workspace
+    discovery/create/delete; normal profile operations still go through Roxy's
+    documented Local API.
+    """
+    raw = (raw or "").strip()
+    if not raw or ":" not in raw:
+        return {}
+    iv_hex, cipher_hex = raw.split(":", 1)
+    if not re.fullmatch(r"[0-9a-fA-F]{32}", iv_hex) or not re.fullmatch(r"[0-9a-fA-F]+", cipher_hex):
+        return {}
+    try:
+        from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+        from cryptography.hazmat.backends import default_backend
+
+        key = hashlib.pbkdf2_hmac(
+            "sha256",
+            b"roxy-browser-default-password",
+            b"roxy-browser-salt",
+            10_000,
+            dklen=32,
+        )
+        decryptor = Cipher(
+            algorithms.AES(key),
+            modes.CBC(bytes.fromhex(iv_hex)),
+            backend=default_backend(),
+        ).decryptor()
+        plain = decryptor.update(bytes.fromhex(cipher_hex)) + decryptor.finalize()
+        if not plain:
+            return {}
+        pad = plain[-1]
+        if pad < 1 or pad > 16:
+            return {}
+        decoded = json.loads(plain[:-pad].decode("utf-8"))
+    except Exception as exc:
+        logger.debug("Roxy session config decrypt failed: {}", exc)
+        return {}
+    return cast(dict[str, Any], decoded) if isinstance(decoded, dict) else {}
+
+
+def _load_roxy_session_config() -> dict[str, Any]:
+    for path in _roxy_session_config_paths():
+        if not path.is_file():
+            continue
+        try:
+            data = _decrypt_roxy_session_config(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if data:
+            return data
+    return {}
+
+
+def _roxy_app_gateway_from_config(config: dict[str, Any]) -> str:
+    configured = (_env_str("PAYPAL_ROXY_APP_GATEWAY") or _env_str("ROXY_APP_GATEWAY")).strip()
+    if configured:
+        return configured.rstrip("/")
+    node = config.get("lastSelectedNetworkNode")
+    if isinstance(node, dict) and node.get("gate"):
+        return f"https://{str(node.get('gate')).strip()}".rstrip("/")
+    # This is Roxy's first/default gateway in the bundled desktop config.
+    return "https://hz.gate.roxybrowser.cn"
+
+
+def _first_int(*values: Any) -> int | None:
+    for value in values:
+        if value is None or value == "":
+            continue
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            continue
+    return None
 
 
 @dataclass(slots=True)
@@ -161,6 +319,10 @@ class RoxyCaptureConfig:
     timeout_seconds: float = 12.0
     close_after_capture: bool = True
     delete_after_capture: bool = True
+    auto_create_workspace: bool = False
+    delete_auto_workspace: bool = False
+    force_temp_workspace: bool = False
+    workspace_name_prefix: str = "paypal-auto"
     open_width: int = 1365
     open_height: int = 768
     screen_width: int = 1536
@@ -200,6 +362,10 @@ def load_roxy_capture_config(proxy_url: str | None = None) -> RoxyCaptureConfig:
         timeout_seconds=max(2.0, _env_float("PAYPAL_ROXY_API_TIMEOUT_SECONDS", 12.0)),
         close_after_capture=_env_bool("PAYPAL_ROXY_CLOSE_AFTER_CAPTURE", True),
         delete_after_capture=_env_bool("PAYPAL_ROXY_DELETE_AFTER_CAPTURE", True),
+        auto_create_workspace=_env_bool("PAYPAL_ROXY_AUTO_CREATE_WORKSPACE", False),
+        delete_auto_workspace=_env_bool("PAYPAL_ROXY_DELETE_AUTO_WORKSPACE", False),
+        force_temp_workspace=_env_bool("PAYPAL_ROXY_FORCE_TEMP_WORKSPACE", False),
+        workspace_name_prefix=_env_str("PAYPAL_ROXY_WORKSPACE_NAME_PREFIX", "paypal-auto"),
         open_width=_env_int("PAYPAL_ROXY_OPEN_WIDTH", int(VIEWPORT.get("width", 1365) or 1365)) or 1365,
         open_height=_env_int("PAYPAL_ROXY_OPEN_HEIGHT", int(VIEWPORT.get("height", 768) or 768)) or 768,
         screen_width=_env_int("PAYPAL_ROXY_SCREEN_WIDTH", int(SCREEN.get("width", 1536) or 1536)) or 1536,
@@ -224,6 +390,9 @@ class RoxyApiClient:
         if not config.api_key:
             raise RoxyFingerprintError("PAYPAL_ROXY_API_KEY 未配置")
         self.config = config
+        self.auto_workspace_created = False
+        self.auto_workspace_id: int | None = None
+        self.auto_workspace_name = ""
         self.client = httpx.Client(
             base_url=config.api_base,
             timeout=config.timeout_seconds,
@@ -246,14 +415,143 @@ class RoxyApiClient:
             raise RoxyFingerprintError(f"Roxy API {path} failed: {msg}")
         return payload
 
+    def _set_api_key(self, api_key: str) -> None:
+        api_key = (api_key or "").strip()
+        if not api_key or api_key == self.config.api_key:
+            return
+        self.config.api_key = api_key
+        self.client.headers["token"] = api_key
+
+    def _retry_workspace_with_roxy_app_api_key(self) -> list[dict[str, Any]]:
+        api_key = _load_roxy_public_api_key()
+        if not api_key or api_key == self.config.api_key:
+            return []
+        old_prefix = self.config.api_key[:4] if self.config.api_key else ""
+        self._set_api_key(api_key)
+        logger.info(
+            "Roxy /browser/workspace returned empty; retrying with current desktop API key prefix={} (old prefix={})",
+            api_key[:4],
+            old_prefix,
+        )
+        try:
+            payload = self.request("GET", "/browser/workspace", params={"page_index": 1, "page_size": 50})
+        except Exception as exc:
+            logger.debug("Roxy workspace retry with desktop API key failed: {}", exc)
+            return []
+        data = payload.get("data") or {}
+        rows = data.get("rows") or []
+        return cast(list[dict[str, Any]], rows) if isinstance(rows, list) else []
+
+    def _app_workspace_headers(self, session_config: dict[str, Any]) -> dict[str, str]:
+        token = str(session_config.get("token") or "").strip()
+        if not token:
+            raise RoxyFingerprintError("Roxy desktop session token missing; cannot auto-create workspace")
+        headers = {
+            "token": token,
+            "source": "app",
+            "language": str(session_config.get("language") or "zh-CN"),
+        }
+        workspace_id = _first_int(session_config.get("workspaceId"), self.config.workspace_id)
+        if workspace_id is not None:
+            headers["workspaceId"] = str(workspace_id)
+        app_version = str(session_config.get("appVersion") or "").strip()
+        if app_version:
+            headers["appVersion"] = app_version
+        return headers
+
+    def _app_request(self, method: str, path: str, *, json_body: dict[str, Any] | None = None, params: dict[str, Any] | None = None) -> dict[str, Any]:
+        session_config = _load_roxy_session_config()
+        gateway = _roxy_app_gateway_from_config(session_config)
+        headers = self._app_workspace_headers(session_config)
+        try:
+            with httpx.Client(base_url=gateway, timeout=self.config.timeout_seconds, headers=headers) as client:
+                response = client.request(method, path, json=json_body, params=params)
+                response.raise_for_status()
+                payload = response.json()
+        except Exception as exc:
+            raise RoxyFingerprintError(f"Roxy app API {path} failed: {exc}") from exc
+        code = payload.get("code")
+        if code not in (0, "0", None):
+            msg = payload.get("msg") or payload.get("message") or payload
+            raise RoxyFingerprintError(f"Roxy app API {path} failed: {msg}")
+        return payload
+
+    def list_app_workspaces(self) -> list[dict[str, Any]]:
+        payload = self._app_request("GET", "/user_get_workspace_list")
+        data = payload.get("data") or {}
+        rows = data.get("rows") or []
+        return cast(list[dict[str, Any]], rows) if isinstance(rows, list) else []
+
+    def create_workspace(self) -> tuple[int, str]:
+        if not self.config.auto_create_workspace:
+            raise RoxyFingerprintError("Roxy API 没有返回 workspace，且 PAYPAL_ROXY_AUTO_CREATE_WORKSPACE=0")
+        raw_prefix = (self.config.workspace_name_prefix or "paypalauto").strip()
+        prefix = re.sub(r"[^0-9A-Za-z\u4e00-\u9fff]", "", raw_prefix)[:10] or "paypalauto"
+        workspace_name = f"{prefix}{uuid.uuid4().hex[:10]}"[:20]
+        logger.info("Creating temporary Roxy workspace name={}", workspace_name)
+        payload = self._app_request(
+            "POST",
+            "/user_add_workspace_info",
+            json_body={"workspaceName": workspace_name, "workspacePicture": ""},
+        )
+        data = payload.get("data") or {}
+        workspace_id = _first_int(data.get("workspaceId"), data.get("id"), data)
+        if workspace_id is None:
+            raise RoxyFingerprintError(f"Roxy app API /user_add_workspace_info 未返回 workspaceId: {payload}")
+        self.auto_workspace_created = True
+        self.auto_workspace_id = workspace_id
+        self.auto_workspace_name = workspace_name
+        logger.info("Temporary Roxy workspace created id={}", workspace_id)
+        return workspace_id, workspace_name
+
+    def delete_workspace(self, workspace_id: int, workspace_name: str = "") -> None:
+        if not workspace_id:
+            return
+        name = (workspace_name or self.auto_workspace_name or "").strip()
+        if not name:
+            for row in self.list_app_workspaces():
+                if _first_int(row.get("id"), row.get("workspaceId")) == int(workspace_id):
+                    name = str(row.get("workspaceName") or "")
+                    break
+        if not name:
+            raise RoxyFingerprintError(f"Roxy workspace {workspace_id} name unknown; cannot delete safely")
+        logger.info("Deleting temporary Roxy workspace id={} name={}", workspace_id, name)
+        self._app_request(
+            "POST",
+            "/user_del_workspace_info",
+            json_body={"workspaceId": int(workspace_id), "workspaceName": name},
+        )
+
     def get_workspace_project(self) -> tuple[int, int | None]:
         if self.config.workspace_id is not None:
             return self.config.workspace_id, self.config.project_id
+        if self.config.force_temp_workspace and self.config.auto_create_workspace:
+            try:
+                workspace_id, _workspace_name = self.create_workspace()
+                return workspace_id, self.config.project_id
+            except RoxyFingerprintError as exc:
+                logger.warning(
+                    "Temporary Roxy workspace creation failed ({}); falling back to existing workspace",
+                    exc,
+                )
         payload = self.request("GET", "/browser/workspace", params={"page_index": 1, "page_size": 50})
         data = payload.get("data") or {}
         rows = data.get("rows") or []
         if not rows:
-            raise RoxyFingerprintError("Roxy API 没有返回 workspace")
+            rows = self._retry_workspace_with_roxy_app_api_key()
+        if not rows:
+            try:
+                rows = self.list_app_workspaces()
+            except Exception as exc:
+                logger.debug("Roxy app workspace list fallback failed: {}", exc)
+        if not rows:
+            if self.config.auto_create_workspace:
+                workspace_id, _workspace_name = self.create_workspace()
+                return workspace_id, self.config.project_id
+            raise RoxyFingerprintError(
+                "未找到已有 Roxy workspace/team；已按配置跳过自动创建团队。"
+                "请先在 Roxy 中选择/创建团队，或设置 PAYPAL_ROXY_WORKSPACE_ID。"
+            )
         row = rows[0]
         workspace_id = int(row.get("id"))
         project_id = self.config.project_id
@@ -397,6 +695,73 @@ class RoxyApiClient:
             "/browser/delete",
             json={"workspaceId": workspace_id, "dirIds": [dir_id], "isSoftDelete": False},
         )
+
+    def list_profiles(self, workspace_id: int) -> list[dict[str, Any]]:
+        resp = self.request(
+            "GET",
+            "/browser/list",
+            params={"workspaceId": workspace_id, "page": 1, "pageSize": 200},
+        )
+        return (resp.get("data") or {}).get("rows") or []
+
+    @staticmethod
+    def _is_paypal_auto_profile(profile: dict[str, Any]) -> bool:
+        name = str(profile.get("windowName") or "")
+        remark = str(profile.get("windowRemark") or "")
+        return name.startswith("paypal-fp-") or remark == "paypal runtime fingerprint capture"
+
+    def cleanup_paypal_auto_profiles(self, workspace_id: int) -> int:
+        deleted = 0
+        for profile in self.list_profiles(workspace_id):
+            if not self._is_paypal_auto_profile(profile):
+                continue
+            dir_id = str(profile.get("dirId") or profile.get("dir_id") or "").strip()
+            if not dir_id:
+                continue
+            try:
+                self.close_profile(dir_id)
+            except Exception as exc:
+                logger.debug("Roxy auto profile close skipped/failed for {}: {}", dir_id, exc)
+            try:
+                self.delete_profile(workspace_id, dir_id)
+                deleted += 1
+            except Exception as exc:
+                logger.debug("Roxy auto profile delete failed for {}: {}", dir_id, exc)
+        if deleted:
+            logger.info("Deleted {} stale paypal-fp Roxy profiles in workspace {}", deleted, workspace_id)
+        return deleted
+
+    def create_or_reuse_profile(
+        self, workspace_id: int, project_id: int | None
+    ) -> str:
+        try:
+            return self.create_profile(workspace_id, project_id)
+        except RoxyFingerprintError as exc:
+            msg = str(exc)
+            quota_markers = ("超出", "额度不足", "limit", "quota", "insufficient", "not enough")
+            if not any(marker in msg.lower() for marker in quota_markers):
+                raise
+            deleted = self.cleanup_paypal_auto_profiles(workspace_id)
+            if deleted:
+                try:
+                    return self.create_profile(workspace_id, project_id)
+                except RoxyFingerprintError as retry_exc:
+                    logger.warning(
+                        "Roxy profile creation still failed after deleting stale auto profiles: {}",
+                        retry_exc,
+                    )
+            logger.warning(
+                "Roxy profile creation quota hit ({}), reusing existing profile",
+                exc,
+            )
+            for p in self.list_profiles(workspace_id):
+                dir_id = (p.get("dirId") or p.get("dir_id") or "").strip()
+                if dir_id:
+                    logger.info("Reusing existing profile: {}", dir_id)
+                    return dir_id
+            raise RoxyFingerprintError(
+                "Roxy 无可复用的已有窗口，请等待每日限制重置后再试"
+            )
 
 
 def _sha256_hex(value: Any) -> str:
@@ -544,6 +909,634 @@ def _connect_over_cdp(cdp_info: dict[str, Any]) -> str:
     if not http.startswith(("http://", "https://")):
         http = f"http://{http}"
     return http
+
+
+_PHASE1_EXPECTED_RISK_SIGNALS = (
+    "fraudnet_p1",
+    "fraudnet_p2",
+    "fraudnet_w",
+    "identity_di_log",
+    "tealeaf",
+    "datadog_rum",
+)
+_PHASE1_REQUIRED_ROXY_RELOAD_SIGNALS = ("identity_di_log", "datadog_rum")
+_PHASE1_DATADOG_SIGNAL = "datadog_rum"
+_PHASE1_RELOADABLE_MISSING_SIGNALS = ("identity_di_log",)
+
+
+def _phase1_signal_count(counts: dict[str, Any], name: str) -> int:
+    try:
+        return int(counts.get(name) or 0)
+    except Exception:
+        return 0
+
+
+def _phase1_missing_signals(
+    counts: dict[str, Any],
+    families: tuple[str, ...] = _PHASE1_EXPECTED_RISK_SIGNALS,
+) -> list[str]:
+    return [name for name in families if _phase1_signal_count(counts, name) <= 0]
+
+
+def _phase1_required_missing_signals(counts: dict[str, Any]) -> list[str]:
+    return _phase1_missing_signals(counts, _PHASE1_REQUIRED_ROXY_RELOAD_SIGNALS)
+
+
+def _phase1_reloadable_missing_signals(missing: list[str]) -> list[str]:
+    return [name for name in missing if name in _PHASE1_RELOADABLE_MISSING_SIGNALS]
+
+
+def _phase1_roxy_reload_attempt_limit() -> int:
+    value = _env_int("PAYPAL_RISK_ROXY_RELOAD_ATTEMPTS", None)
+    if value is None:
+        value = _env_int("PAYPAL_RISK_ROXY_REQUIRED_RELOADS", 6)
+    if value is None:
+        value = 6
+    return max(0, min(int(value), 30))
+
+
+def _roxy_datadog_view_name_for_page(page: Any) -> str:
+    try:
+        value = page.evaluate(
+            """() => {
+                const atomic = document.querySelector("[data-atomic-wait-viewname]");
+                const atomicName = atomic && atomic.getAttribute("data-atomic-wait-viewname");
+                if (atomicName) return atomicName;
+                const title = (document.title || "").trim();
+                if (title) return title;
+                if (location.pathname.includes("/signup")) return "signup";
+                if (location.pathname.includes("/pay")) return "Email UL";
+                return location.pathname || "paypal";
+            }"""
+        )
+        return str(value or "paypal")
+    except Exception:
+        return "paypal"
+
+
+def _probe_roxy_datadog_runtime(page: Any) -> dict[str, Any]:
+    try:
+        value = page.evaluate(
+            """() => {
+                const dd = window.DD_RUM || window.datadogRum || null;
+                const keys = dd ? Object.keys(dd).slice(0, 80) : [];
+                let internal = null;
+                try {
+                    internal = dd && typeof dd.getInternalContext === "function"
+                        ? dd.getInternalContext()
+                        : null;
+                } catch (error) {}
+                let initConfiguration = null;
+                try {
+                    initConfiguration = dd && typeof dd.getInitConfiguration === "function"
+                        ? dd.getInitConfiguration()
+                        : (dd && dd.initConfiguration ? dd.initConfiguration : null);
+                } catch (error) {}
+                const safeInitConfiguration = initConfiguration ? {
+                    applicationId: initConfiguration.applicationId || initConfiguration.application_id || "",
+                    clientTokenPresent: !!(initConfiguration.clientToken || initConfiguration.client_token),
+                    service: initConfiguration.service || "",
+                    site: initConfiguration.site || "",
+                    version: initConfiguration.version || "",
+                    trackViewsManually: !!initConfiguration.trackViewsManually,
+                    trackResources: !!initConfiguration.trackResources,
+                    trackUserInteractions: !!initConfiguration.trackUserInteractions,
+                    sessionSampleRate: initConfiguration.sessionSampleRate,
+                    sessionReplaySampleRate: initConfiguration.sessionReplaySampleRate,
+                    sessionPersistence: initConfiguration.sessionPersistence || "",
+                    trackingConsent: initConfiguration.trackingConsent || "",
+                    allowUntrustedEvents: !!initConfiguration.allowUntrustedEvents,
+                } : null;
+                const cookieNames = document.cookie
+                    .split(";")
+                    .map((item) => item.trim().split("=")[0])
+                    .filter((name) => name && name.startsWith("_dd_s"));
+                const datadogScripts = Array.from(document.scripts)
+                    .map((script) => script.src || "")
+                    .filter((src) => /datadog|browser-agent|api\\/v2\\/rum/i.test(src))
+                    .slice(0, 10);
+                return {
+                    readyState: document.readyState,
+                    visibilityState: document.visibilityState,
+                    hasDDRumGlobal: !!dd,
+                    present: !!dd,
+                    keys,
+                    version: dd && dd.version || "",
+                    has_add_action: !!(dd && typeof dd.addAction === "function"),
+                    has_start_view: !!(dd && (typeof dd.startView === "function" || typeof dd.setViewName === "function")),
+                    has_start_resource: !!(dd && typeof dd.startResource === "function" && typeof dd.stopResource === "function"),
+                    hasInitConfiguration: !!(dd && dd.initConfiguration),
+                    initConfiguration: safeInitConfiguration,
+                    hasInternalContext: !!internal,
+                    sessionIdPresent: !!(internal && internal.session_id),
+                    viewIdPresent: !!(internal && internal.view && internal.view.id),
+                    viewName: internal && internal.view ? internal.view.name || "" : "",
+                    cookieNames,
+                    datadogScripts,
+                    url: location.href,
+                };
+            }"""
+        )
+        return value if isinstance(value, dict) else {}
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
+def _trigger_roxy_datadog_runtime_flush(page: Any, *, view_name: str = "") -> dict[str, Any]:
+    """Ask the page's already-loaded Datadog SDK to open/flush a view.
+
+    PayPal initializes Datadog with ``trackViewsManually: true``.  When the
+    React DataDogView effect is delayed or missed, the SDK can be loaded but no
+    intake request leaves the browser.  This keeps the fix inside the browser
+    runtime: use the page-owned ``window.DD_RUM`` public API instead of
+    constructing a Python-side RUM payload.
+    """
+    try:
+        return page.evaluate(
+            """async (viewName) => {
+                const dd = window.DD_RUM || window.datadogRum || null;
+                if (!dd) return { ok: false, reason: "DD_RUM_global_missing" };
+                const result = { ok: true, actions: [], keys: Object.keys(dd).slice(0, 80) };
+                const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+                const markDatadogTrusted = (event) => {
+                    try {
+                        Object.defineProperty(event, "__ddIsTrusted", {
+                            value: true,
+                            configurable: true,
+                        });
+                    } catch (error) {
+                        try { event.__ddIsTrusted = true; } catch (ignored) {}
+                    }
+                    return event;
+                };
+                const dispatchDatadogTrusted = (target, type, factory, options) => {
+                    const Ctor = factory || Event;
+                    let event;
+                    try {
+                        event = new Ctor(type, options || {});
+                    } catch (error) {
+                        event = new Event(type, options || {});
+                    }
+                    markDatadogTrusted(event);
+                    target.dispatchEvent(event);
+                    result.actions.push(`dispatch:${type}`);
+                };
+                try {
+                    const before = typeof dd.getInternalContext === "function"
+                        ? dd.getInternalContext()
+                        : null;
+                    result.beforeInternalContext = !!before;
+                    result.beforeViewId = !!(before && before.view && before.view.id);
+                    result.beforeViewName = before && before.view ? before.view.name || "" : "";
+                } catch (error) {
+                    result.beforeError = String(error && error.message || error);
+                }
+                const resolvedViewName =
+                    viewName ||
+                    document.querySelector("[data-atomic-wait-viewname]")?.getAttribute("data-atomic-wait-viewname") ||
+                    document.title ||
+                    (location.pathname.includes("/pay") ? "Email UL" : location.pathname || "paypal");
+                try {
+                    if (typeof dd.onReady === "function") {
+                        result.onReady = await new Promise((resolve) => {
+                            let resolved = false;
+                            const done = (value) => {
+                                if (resolved) return;
+                                resolved = true;
+                                resolve(value);
+                            };
+                            try {
+                                dd.onReady(() => done(true));
+                                setTimeout(() => done(false), 1200);
+                            } catch (error) {
+                                result.onReadyError = String(error && error.message || error);
+                                done(false);
+                            }
+                        });
+                    }
+                } catch (error) {
+                    result.onReadyError = String(error && error.message || error);
+                }
+                try {
+                    if (typeof dd.setTrackingConsent === "function") {
+                        dd.setTrackingConsent("granted");
+                        result.actions.push("setTrackingConsent");
+                    }
+                } catch (error) {
+                    result.setTrackingConsentError = String(error && error.message || error);
+                }
+                try {
+                    if (typeof dd.startView === "function") {
+                        dd.startView({
+                            name: resolvedViewName,
+                            context: {
+                                roxy_phase1: true,
+                                pathname: location.pathname,
+                            },
+                        });
+                        result.actions.push("startView");
+                    } else if (typeof dd.setViewName === "function") {
+                        dd.setViewName(resolvedViewName);
+                        result.actions.push("setViewName");
+                    }
+                } catch (error) {
+                    result.startViewError = String(error && error.message || error);
+                }
+                try {
+                    if (typeof dd.setViewContextProperty === "function") {
+                        dd.setViewContextProperty("roxy_phase1", true);
+                        result.actions.push("setViewContextProperty");
+                    }
+                } catch (error) {
+                    result.setViewContextPropertyError = String(error && error.message || error);
+                }
+                try {
+                    if (typeof dd.addTiming === "function") {
+                        dd.addTiming("roxy_phase1_runtime_ready");
+                        result.actions.push("addTiming");
+                    }
+                } catch (error) {
+                    result.addTimingError = String(error && error.message || error);
+                }
+                try {
+                    if (typeof dd.addAction === "function") {
+                        dd.addAction("roxy_phase1_runtime_ready", {
+                            pathname: location.pathname,
+                            readyState: document.readyState,
+                            viewName: resolvedViewName,
+                        });
+                        result.actions.push("addAction");
+                    }
+                } catch (error) {
+                    result.addActionError = String(error && error.message || error);
+                }
+                try {
+                    if (typeof dd.startAction === "function" && typeof dd.stopAction === "function") {
+                        const actionKey = `roxy_phase1_action_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+                        dd.startAction("roxy_phase1_runtime_ready", {
+                            type: "custom",
+                            actionKey,
+                            context: { pathname: location.pathname, viewName: resolvedViewName },
+                        });
+                        await wait(40);
+                        dd.stopAction("roxy_phase1_runtime_ready", {
+                            type: "custom",
+                            actionKey,
+                            context: { pathname: location.pathname, viewName: resolvedViewName },
+                        });
+                        result.actions.push("startStopAction");
+                    }
+                } catch (error) {
+                    result.startStopActionError = String(error && error.message || error);
+                }
+                try {
+                    if (typeof dd.startResource === "function" && typeof dd.stopResource === "function") {
+                        const resourceKey = `roxy_phase1_resource_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+                        const resourceUrl = `${location.origin}/favicon.ico`;
+                        dd.startResource(resourceUrl, {
+                            method: "GET",
+                            type: "image",
+                            resourceKey,
+                            context: { roxy_phase1: true, source: "runtime_flush" },
+                        });
+                        await wait(40);
+                        dd.stopResource(resourceUrl, {
+                            statusCode: 200,
+                            size: 0,
+                            type: "image",
+                            resourceKey,
+                            context: { roxy_phase1: true, source: "runtime_flush" },
+                        });
+                        result.actions.push("startStopResource");
+                    }
+                } catch (error) {
+                    result.startStopResourceError = String(error && error.message || error);
+                }
+                await wait(120);
+                try {
+                    dispatchDatadogTrusted(window, "focus", Event);
+                    dispatchDatadogTrusted(document, "visibilitychange", Event);
+                    if (typeof PageTransitionEvent === "function") {
+                        dispatchDatadogTrusted(window, "pagehide", PageTransitionEvent, { persisted: false });
+                    } else {
+                        dispatchDatadogTrusted(window, "pagehide", Event);
+                    }
+                    dispatchDatadogTrusted(window, "freeze", Event);
+                    if (typeof BeforeUnloadEvent === "function") {
+                        dispatchDatadogTrusted(window, "beforeunload", BeforeUnloadEvent, { cancelable: true });
+                    } else {
+                        dispatchDatadogTrusted(window, "beforeunload", Event, { cancelable: true });
+                    }
+                    result.actions.push("trustedExitEvents");
+                } catch (error) {
+                    result.eventError = String(error && error.message || error);
+                }
+                await wait(500);
+                try {
+                    const after = typeof dd.getInternalContext === "function"
+                        ? dd.getInternalContext()
+                        : null;
+                    result.afterInternalContext = !!after;
+                    result.afterViewId = !!(after && after.view && after.view.id);
+                    result.afterViewName = after && after.view ? after.view.name || "" : "";
+                } catch (error) {
+                    result.afterError = String(error && error.message || error);
+                }
+                return result;
+            }""",
+            view_name,
+        )
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+def _phase1_datadog_runtime_ready(probe: dict[str, Any]) -> bool:
+    """Return true when the full browser Datadog RUM SDK is initialized enough.
+
+    In some Roxy profiles PayPal's RUM SDK is loaded and initialized, but the
+    SDK keeps the batch in memory until a real page lifecycle exit, so CDP may
+    not observe ``/api/v2/rum`` during the Phase-1 wait window.  Do not treat a
+    fully loaded SDK as missing merely because the intake batch did not flush
+    before we continue.
+    """
+    if not isinstance(probe, dict) or probe.get("error"):
+        return False
+    if not (probe.get("present") or probe.get("hasDDRumGlobal")):
+        return False
+    keys = {str(key) for key in (probe.get("keys") or [])}
+    has_full_public_api = bool(
+        probe.get("has_add_action")
+        or "addAction" in keys
+        or "startAction" in keys
+        or "startResource" in keys
+    )
+    has_context_api = bool(
+        "getInitConfiguration" in keys
+        or "getInternalContext" in keys
+        or probe.get("initConfiguration")
+        or probe.get("hasInternalContext")
+    )
+    # A bootstrap stub only has q/onReady/init; require the operational RUM API
+    # that PayPal's modxo bundle exposes after the SDK has actually loaded.
+    return bool(has_full_public_api and has_context_api)
+
+
+def _phase1_mark_datadog_runtime_observed(
+    events: dict[str, Any],
+    probe: dict[str, Any],
+    *,
+    reason: str,
+) -> bool:
+    """Fulfill the Datadog Phase-1 requirement from a loaded browser SDK."""
+    if not _phase1_datadog_runtime_ready(probe):
+        return False
+    counts = _event_dict(events, "counts")
+    if _phase1_signal_count(counts, _PHASE1_DATADOG_SIGNAL) <= 0:
+        counts[_PHASE1_DATADOG_SIGNAL] = 1
+        events["counts"] = counts
+    events["datadog_runtime_fulfilled"] = True
+    events["datadog_runtime_fulfilled_reason"] = reason
+    runtime_signals = _event_list(events, "runtime_signals")
+    runtime_signals.append(
+        {
+            "family": _PHASE1_DATADOG_SIGNAL,
+            "source": "DD_RUM_runtime",
+            "reason": reason,
+            "keys": list(probe.get("keys") or [])[:30],
+            "viewName": probe.get("viewName") or "",
+            "sessionIdPresent": bool(probe.get("sessionIdPresent")),
+            "viewIdPresent": bool(probe.get("viewIdPresent")),
+        }
+    )
+    return True
+
+
+def _env_int_between(name: str, default: int, minimum: int, maximum: int) -> int:
+    value = _env_int(name, default)
+    if value is None:
+        value = default
+    return max(minimum, min(int(value), maximum))
+
+
+def _new_interaction_rng() -> random.Random:
+    seed = _env_str("PAYPAL_ROXY_INTERACTION_SEED", "").strip()
+    if not seed:
+        return random.SystemRandom()
+    try:
+        seed_value: int | str = int(seed)
+    except ValueError:
+        seed_value = seed
+    return random.Random(seed_value)
+
+
+def _roxy_interaction_settings() -> dict[str, Any]:
+    """Return tunable browser-interaction jitter settings.
+
+    The defaults intentionally vary timing, pointer trajectory and scroll
+    cadence while avoiding form clicks or input mutations.  Environment
+    overrides are kept here so the browser runtime can be tuned without
+    touching the protocol packet code.
+    """
+    profile = _env_str("PAYPAL_ROXY_INTERACTION_PROFILE", "normal").strip().lower()
+    if _env_bool("PAYPAL_ROXY_RANDOM_INTERACTIONS", True) is False:
+        profile = "off"
+    presets: dict[str, dict[str, Any]] = {
+        "off": {
+            "enabled": False,
+            "moves_min": 0,
+            "moves_max": 0,
+            "wheels_min": 0,
+            "wheels_max": 0,
+            "think_min_ms": 0,
+            "think_max_ms": 0,
+            "pause_min_ms": 0,
+            "pause_max_ms": 0,
+        },
+        "subtle": {
+            "enabled": True,
+            "moves_min": 4,
+            "moves_max": 8,
+            "wheels_min": 1,
+            "wheels_max": 2,
+            "think_min_ms": 250,
+            "think_max_ms": 900,
+            "pause_min_ms": 60,
+            "pause_max_ms": 360,
+        },
+        "normal": {
+            "enabled": True,
+            "moves_min": 7,
+            "moves_max": 14,
+            "wheels_min": 2,
+            "wheels_max": 4,
+            "think_min_ms": 350,
+            "think_max_ms": 1400,
+            "pause_min_ms": 80,
+            "pause_max_ms": 620,
+        },
+        "active": {
+            "enabled": True,
+            "moves_min": 11,
+            "moves_max": 22,
+            "wheels_min": 3,
+            "wheels_max": 6,
+            "think_min_ms": 500,
+            "think_max_ms": 2200,
+            "pause_min_ms": 90,
+            "pause_max_ms": 850,
+        },
+    }
+    settings = dict(presets.get(profile, presets["normal"]))
+    settings["profile"] = profile if profile in presets else "normal"
+    if not settings.get("enabled"):
+        return settings
+
+    settings["moves_min"] = _env_int_between("PAYPAL_ROXY_INTERACTION_MOVES_MIN", int(settings["moves_min"]), 1, 80)
+    settings["moves_max"] = _env_int_between("PAYPAL_ROXY_INTERACTION_MOVES_MAX", int(settings["moves_max"]), 1, 100)
+    if int(settings["moves_max"]) < int(settings["moves_min"]):
+        settings["moves_max"] = settings["moves_min"]
+    settings["wheels_min"] = _env_int_between("PAYPAL_ROXY_INTERACTION_WHEELS_MIN", int(settings["wheels_min"]), 0, 20)
+    settings["wheels_max"] = _env_int_between("PAYPAL_ROXY_INTERACTION_WHEELS_MAX", int(settings["wheels_max"]), 0, 30)
+    if int(settings["wheels_max"]) < int(settings["wheels_min"]):
+        settings["wheels_max"] = settings["wheels_min"]
+    settings["think_min_ms"] = _env_int_between("PAYPAL_ROXY_INTERACTION_THINK_MIN_MS", int(settings["think_min_ms"]), 0, 10000)
+    settings["think_max_ms"] = _env_int_between("PAYPAL_ROXY_INTERACTION_THINK_MAX_MS", int(settings["think_max_ms"]), 0, 15000)
+    if int(settings["think_max_ms"]) < int(settings["think_min_ms"]):
+        settings["think_max_ms"] = settings["think_min_ms"]
+    settings["pause_min_ms"] = _env_int_between("PAYPAL_ROXY_INTERACTION_PAUSE_MIN_MS", int(settings["pause_min_ms"]), 0, 5000)
+    settings["pause_max_ms"] = _env_int_between("PAYPAL_ROXY_INTERACTION_PAUSE_MAX_MS", int(settings["pause_max_ms"]), 0, 8000)
+    if int(settings["pause_max_ms"]) < int(settings["pause_min_ms"]):
+        settings["pause_max_ms"] = settings["pause_min_ms"]
+    return settings
+
+
+def _random_int(rng: Any, low: int, high: int) -> int:
+    if high <= low:
+        return int(low)
+    return int(rng.randint(int(low), int(high)))
+
+
+def _random_float(rng: Any, low: float, high: float) -> float:
+    if high <= low:
+        return float(low)
+    return float(rng.uniform(float(low), float(high)))
+
+
+def _clamp_int(value: float | int, minimum: int, maximum: int) -> int:
+    if maximum < minimum:
+        return int(minimum)
+    return int(max(minimum, min(maximum, round(float(value)))))
+
+
+def _build_roxy_interaction_plan(
+    width: int,
+    height: int,
+    *,
+    rng: Any | None = None,
+    settings: dict[str, Any] | None = None,
+) -> list[dict[str, int | str]]:
+    """Build a randomized, non-clicking browser interaction plan.
+
+    The plan is pure data so it can be unit-tested and safely logged as counts.
+    It uses pointer moves, small pauses and wheel deltas only; no element click
+    or keyboard input is generated.
+    """
+    settings = settings or _roxy_interaction_settings()
+    if not settings.get("enabled", True):
+        return []
+    if rng is None:
+        rng = _new_interaction_rng()
+    width = max(320, int(width or 0))
+    height = max(240, int(height or 0))
+    margin_x = max(18, min(90, width // 12))
+    margin_y = max(18, min(80, height // 12))
+    min_x, max_x = margin_x, max(margin_x, width - margin_x)
+    min_y, max_y = margin_y, max(margin_y, height - margin_y)
+
+    pause_min = int(settings.get("pause_min_ms") or 0)
+    pause_max = int(settings.get("pause_max_ms") or pause_min)
+    plan: list[dict[str, int | str]] = [
+        {
+            "type": "pause",
+            "ms": _random_int(rng, int(settings.get("think_min_ms") or 0), int(settings.get("think_max_ms") or 0)),
+        }
+    ]
+
+    x = _random_int(rng, min_x, max_x)
+    y = _random_int(rng, min_y, max_y)
+    plan.append({"type": "move", "x": x, "y": y, "steps": _random_int(rng, 5, 16), "ms": _random_int(rng, pause_min, pause_max)})
+
+    move_budget = _random_int(rng, int(settings.get("moves_min") or 1), int(settings.get("moves_max") or 1))
+    wheel_budget = _random_int(rng, int(settings.get("wheels_min") or 0), int(settings.get("wheels_max") or 0))
+    scheduled_wheels = 0
+
+    for index in range(move_budget):
+        remaining = max(1, move_budget - index)
+        must_scroll = scheduled_wheels < wheel_budget and wheel_budget - scheduled_wheels >= remaining
+        do_scroll = must_scroll or (scheduled_wheels < wheel_budget and rng.random() < 0.24)
+        if do_scroll:
+            dy_abs = _random_int(rng, 70, 520)
+            dy = dy_abs if rng.random() < 0.68 else -dy_abs
+            dx = _random_int(rng, -18, 18) if rng.random() < 0.25 else 0
+            plan.append({"type": "wheel", "dx": dx, "dy": dy, "ms": _random_int(rng, max(80, pause_min), max(120, pause_max))})
+            scheduled_wheels += 1
+            continue
+
+        if rng.random() < 0.68:
+            target_x = _clamp_int(x + _random_float(rng, -0.26, 0.26) * width, min_x, max_x)
+            target_y = _clamp_int(y + _random_float(rng, -0.22, 0.22) * height, min_y, max_y)
+        else:
+            target_x = _random_int(rng, min_x, max_x)
+            target_y = _random_int(rng, min_y, max_y)
+
+        # Split many moves with an offset midpoint. This avoids a repeated
+        # straight-line cadence while still letting Playwright interpolate each
+        # short segment naturally.
+        if rng.random() < 0.58:
+            mid_x = _clamp_int((x + target_x) / 2 + _random_float(rng, -0.08, 0.08) * width, min_x, max_x)
+            mid_y = _clamp_int((y + target_y) / 2 + _random_float(rng, -0.07, 0.07) * height, min_y, max_y)
+            plan.append({"type": "move", "x": mid_x, "y": mid_y, "steps": _random_int(rng, 3, 10), "ms": _random_int(rng, 25, max(35, pause_min))})
+        plan.append({"type": "move", "x": target_x, "y": target_y, "steps": _random_int(rng, 6, 28), "ms": _random_int(rng, pause_min, pause_max)})
+        x, y = target_x, target_y
+
+        if rng.random() < 0.18:
+            wiggle_x = _clamp_int(x + _random_int(rng, -12, 12), min_x, max_x)
+            wiggle_y = _clamp_int(y + _random_int(rng, -10, 10), min_y, max_y)
+            plan.append({"type": "move", "x": wiggle_x, "y": wiggle_y, "steps": _random_int(rng, 2, 6), "ms": _random_int(rng, 35, max(60, pause_min))})
+
+    while scheduled_wheels < wheel_budget:
+        dy_abs = _random_int(rng, 70, 440)
+        plan.append({
+            "type": "wheel",
+            "dx": 0,
+            "dy": dy_abs if rng.random() < 0.62 else -dy_abs,
+            "ms": _random_int(rng, max(80, pause_min), max(120, pause_max)),
+        })
+        scheduled_wheels += 1
+    return plan
+
+
+def _execute_roxy_interaction_plan(page: Any, plan: list[dict[str, int | str]]) -> dict[str, int]:
+    summary = {"moves": 0, "wheels": 0, "pauses": 0, "total_pause_ms": 0}
+    for action in plan:
+        action_type = str(action.get("type") or "")
+        if action_type == "move":
+            page.mouse.move(
+                int(action.get("x") or 0),
+                int(action.get("y") or 0),
+                steps=max(1, int(action.get("steps") or 1)),
+            )
+            summary["moves"] += 1
+        elif action_type == "wheel":
+            page.mouse.wheel(int(action.get("dx") or 0), int(action.get("dy") or 0))
+            summary["wheels"] += 1
+        elif action_type == "pause":
+            summary["pauses"] += 1
+        pause_ms = max(0, int(action.get("ms") or 0))
+        if pause_ms:
+            page.wait_for_timeout(pause_ms)
+            summary["total_pause_ms"] += pause_ms
+    return summary
 
 
 def _evaluate_cdp_fingerprint(
@@ -748,9 +1741,10 @@ def _runtime_to_profile(js: dict[str, Any], cdp_info: dict[str, Any]) -> dict[st
     language = str(js.get("language") or BROWSER_PROFILE.get("language") or "pt-BR")
     locale = _locale_from_language(language)
     timezone_offset_minutes = int(js.get("timezoneOffsetMinutes") or BROWSER_PROFILE.get("timezone_offset_minutes") or 0)
-    connection = js.get("connection") if isinstance(js.get("connection"), dict) else {}
-    webgl = js.get("webgl") if isinstance(js.get("webgl"), dict) else {}
-    profile = dict(BROWSER_PROFILE)
+    connection = _dict_value(js.get("connection"))
+    webgl = _dict_value(js.get("webgl"))
+    window_info = _dict_value(js.get("window"))
+    profile: dict[str, Any] = dict(BROWSER_PROFILE)
     profile.update(
         {
             "fingerprint_source": "roxy",
@@ -770,7 +1764,7 @@ def _runtime_to_profile(js: dict[str, Any], cdp_info: dict[str, Any]) -> dict[st
             "sec_ch_arch": _sec_ch_arch(ua_data),
             "device_memory": int(float(js.get("deviceMemory") or BROWSER_PROFILE.get("device_memory") or 8)),
             "hardware_concurrency": int(js.get("hardwareConcurrency") or BROWSER_PROFILE.get("hardware_concurrency") or 8),
-            "device_pixel_ratio": float((js.get("window") or {}).get("devicePixelRatio") or 1),
+            "device_pixel_ratio": float(window_info.get("devicePixelRatio") or 1),
             "connection_effective_type": str(connection.get("effectiveType") or BROWSER_PROFILE.get("connection_effective_type") or "4g"),
             "connection_rtt": str(connection.get("rtt") or BROWSER_PROFILE.get("connection_rtt") or "150"),
             "connection_downlink": str(connection.get("downlink") or BROWSER_PROFILE.get("connection_downlink") or "10"),
@@ -785,7 +1779,7 @@ def _runtime_to_profile(js: dict[str, Any], cdp_info: dict[str, Any]) -> dict[st
 
 
 def _runtime_screen(js: dict[str, Any]) -> dict[str, int]:
-    source = js.get("screen") if isinstance(js.get("screen"), dict) else {}
+    source = _dict_value(js.get("screen"))
     return {
         "colorDepth": int(source.get("colorDepth") or SCREEN.get("colorDepth") or 24),
         "pixelDepth": int(source.get("pixelDepth") or SCREEN.get("pixelDepth") or 24),
@@ -797,7 +1791,7 @@ def _runtime_screen(js: dict[str, Any]) -> dict[str, int]:
 
 
 def _runtime_viewport(js: dict[str, Any]) -> dict[str, int]:
-    source = js.get("window") if isinstance(js.get("window"), dict) else {}
+    source = _dict_value(js.get("window"))
     return {
         "width": int(source.get("innerWidth") or VIEWPORT.get("width") or 1365),
         "height": int(source.get("innerHeight") or VIEWPORT.get("height") or 768),
@@ -805,11 +1799,11 @@ def _runtime_viewport(js: dict[str, Any]) -> dict[str, int]:
 
 
 def _runtime_device_fingerprint(js: dict[str, Any]) -> dict[str, Any]:
-    canvas = js.get("canvas") if isinstance(js.get("canvas"), dict) else {}
-    webgl = js.get("webgl") if isinstance(js.get("webgl"), dict) else {}
-    audio = js.get("audio") if isinstance(js.get("audio"), dict) else {}
-    memory = js.get("memory") if isinstance(js.get("memory"), dict) else {}
-    timing = js.get("timing") if isinstance(js.get("timing"), dict) else {}
+    canvas = _dict_value(js.get("canvas"))
+    webgl = _dict_value(js.get("webgl"))
+    audio = _dict_value(js.get("audio"))
+    memory = _dict_value(js.get("memory"))
+    timing = _dict_value(js.get("timing"))
     plugins = js.get("plugins") if isinstance(js.get("plugins"), list) else []
     webgl_extensions = webgl.get("extensions") if isinstance(webgl.get("extensions"), list) else []
     canvas_material = canvas.get("dataUrl") or canvas
@@ -868,7 +1862,7 @@ def capture_roxy_runtime_profile(
     dir_id = ""
     try:
         workspace_id, project_id = client.get_workspace_project()
-        dir_id = client.create_profile(workspace_id, project_id)
+        dir_id = client.create_or_reuse_profile(workspace_id, project_id)
         client.randomize_profile(workspace_id, dir_id)
         cdp_info = client.open_profile(workspace_id, dir_id)
         js = _evaluate_cdp_fingerprint(
@@ -886,6 +1880,8 @@ def capture_roxy_runtime_profile(
         if keep_browser:
             runtime["roxy_browser"] = {
                 "workspace_id": workspace_id,
+                "workspace_created": bool(client.auto_workspace_created),
+                "workspace_name": client.auto_workspace_name,
                 "dir_id": dir_id,
                 "cdp_info": cdp_info,
                 "api_base": config.api_base,
@@ -906,6 +1902,16 @@ def capture_roxy_runtime_profile(
                 client.delete_profile(workspace_id, dir_id)
             except Exception as exc:
                 logger.debug("Roxy delete profile failed: {}", exc)
+        if (
+            workspace_id is not None
+            and client.auto_workspace_created
+            and config.delete_auto_workspace
+            and not keep_browser
+        ):
+            try:
+                client.delete_workspace(workspace_id, client.auto_workspace_name)
+            except Exception as exc:
+                logger.debug("Roxy delete temporary workspace failed: {}", exc)
         client.close()
 
 
@@ -928,6 +1934,11 @@ def close_roxy_browser(roxy_browser: dict[str, Any], *, delete: bool = True) -> 
                 client.delete_profile(workspace_id, dir_id)
             except Exception as exc:
                 logger.debug("Roxy delete profile failed: {}", exc)
+            if roxy_browser.get("workspace_created") and roxy_browser.get("workspace_name"):
+                try:
+                    client.delete_workspace(workspace_id, str(roxy_browser.get("workspace_name") or ""))
+                except Exception as exc:
+                    logger.debug("Roxy delete temporary workspace failed: {}", exc)
     finally:
         client.close()
 
@@ -953,99 +1964,27 @@ def solve_datadome_with_roxy(
     cookies: list[dict[str, Any]] | None = None,
     wait_seconds: float = 12.0,
 ) -> dict[str, Any]:
-    """Load PayPal/DataDome in the already-open Roxy browser and return cookies."""
+    """Run DataDome through the shared local-headless logic on an existing Roxy browser."""
+    from paypal.local_headless import LocalHeadlessSession
+
+    session = LocalHeadlessSession(
+        cookies=cast(list[dict[str, object]] | None, cookies),
+        roxy_browser=cast(dict[str, object], roxy_browser),
+        runtime="roxy",
+    )
     try:
-        from playwright.sync_api import sync_playwright
-    except Exception as exc:  # pragma: no cover - optional runtime dependency
-        raise RoxyFingerprintError("playwright 未安装，无法连接 Roxy CDP") from exc
-
-    cdp_info = roxy_browser.get("cdp_info") if isinstance(roxy_browser, dict) else {}
-    if not isinstance(cdp_info, dict) or not (cdp_info.get("ws") or cdp_info.get("http")):
-        raise RoxyFingerprintError("Roxy browser CDP 信息不存在，无法执行 DataDome")
-
-    endpoint = _connect_over_cdp(cdp_info)
-    target_urls = ["https://www.paypal.com", "https://www.paypal.com/", "https://ddbm2.paypal.com"]
-    wait_ms = max(1000, int(wait_seconds * 1000))
-    with sync_playwright() as p:
-        browser = p.chromium.connect_over_cdp(endpoint, timeout=wait_ms)
-        context = browser.contexts[0] if browser.contexts else browser.new_context()
-        if cookies:
-            sanitized: list[dict[str, Any]] = []
-            for cookie in cookies:
-                if not cookie.get("name") or cookie.get("value") is None:
-                    continue
-                item = {
-                    "name": str(cookie.get("name")),
-                    "value": str(cookie.get("value")),
-                    "path": str(cookie.get("path") or "/"),
-                    "secure": bool(cookie.get("secure", True)),
-                }
-                domain = str(cookie.get("domain") or "")
-                if domain:
-                    item["domain"] = domain
-                else:
-                    item["url"] = "https://www.paypal.com"
-                same_site = str(cookie.get("sameSite") or cookie.get("same_site") or "")
-                if same_site in {"Strict", "Lax", "None"}:
-                    item["sameSite"] = same_site
-                sanitized.append(item)
-            if sanitized:
-                context.add_cookies(sanitized)
-        page = context.pages[0] if context.pages else context.new_page()
-        status = 0
-        final_url = ""
-        html = ""
-        try:
-            response = page.goto(url, wait_until="domcontentloaded", timeout=wait_ms)
-            status = int(response.status) if response is not None else 0
-        except Exception as exc:
-            logger.debug("Roxy DataDome navigation did not finish cleanly: {}", exc)
-        try:
-            page.wait_for_load_state("networkidle", timeout=min(wait_ms, 8000))
-        except Exception:
-            pass
-        try:
-            page.add_script_tag(url="https://ddbm2.paypal.com/tags.js")
-        except Exception as exc:
-            logger.debug("Roxy DataDome explicit tags.js load skipped/failed: {}", exc)
-        deadline = time.time() + wait_seconds
-        browser_cookies: list[dict[str, Any]] = []
-        datadome_cookie = ""
-        while time.time() < deadline:
-            browser_cookies = context.cookies(target_urls)
-            for cookie in browser_cookies:
-                if cookie.get("name") == "datadome" and cookie.get("value"):
-                    datadome_cookie = str(cookie.get("value"))
-                    break
-            if datadome_cookie:
-                break
-            page.wait_for_timeout(500)
-        try:
-            final_url = page.url
-            html = page.content()
-        except Exception:
-            html = ""
-        if not browser_cookies:
-            browser_cookies = context.cookies(target_urls)
-        client_id = _extract_datadome_clientid_from_html(html)
-        return {
-            "ok": bool(datadome_cookie),
-            "status": status,
-            "url": final_url,
-            "cookies": browser_cookies,
-            "datadome": datadome_cookie,
-            "clientid": client_id,
-            "html_head": (html or "")[:2000],
-        }
+        return cast(dict[str, Any], session.solve_datadome(url, wait_seconds=wait_seconds))
+    finally:
+        session.close()
 
 
 def _extract_mtr_response_data(value: Any) -> dict[str, Any]:
     if not isinstance(value, dict):
         return {}
-    products = value.get("products") if isinstance(value.get("products"), dict) else {}
-    identification = products.get("identification") if isinstance(products.get("identification"), dict) else {}
-    data = identification.get("data") if isinstance(identification.get("data"), dict) else {}
-    result = data.get("result") if isinstance(data.get("result"), dict) else {}
+    products = _dict_value(value.get("products"))
+    identification = _dict_value(products.get("identification"))
+    data = _dict_value(identification.get("data"))
+    result = _dict_value(data.get("result"))
     visitor_token = (
         data.get("visitorToken")
         or data.get("visitor_token")
@@ -1070,262 +2009,22 @@ def run_mtr_with_roxy_browser(
     cookies: list[dict[str, Any]] | None = None,
     wait_seconds: float = 20.0,
 ) -> dict[str, Any]:
-    """Run PayPal dfp.js/MTR in the already-open Roxy browser and capture sealedResult."""
-    try:
-        from playwright.sync_api import sync_playwright
-    except Exception as exc:  # pragma: no cover - optional runtime dependency
-        raise RoxyFingerprintError("playwright 未安装，无法连接 Roxy CDP") from exc
+    """Run PayPal dfp.js/MTR through the shared local-headless logic on Roxy."""
+    from paypal.local_headless import run_local_headless_mtr_phase1
 
-    cdp_info = roxy_browser.get("cdp_info") if isinstance(roxy_browser, dict) else {}
-    if not isinstance(cdp_info, dict) or not (cdp_info.get("ws") or cdp_info.get("http")):
-        raise RoxyFingerprintError("Roxy browser CDP 信息不存在，无法执行 MTR")
-
-    endpoint = _connect_over_cdp(cdp_info)
-    wait_ms = max(1000, int(wait_seconds * 1000))
-    mtr_path = "/mtr/1a7c3460cd8c343771081839499ed7a0"
-    target_urls = ["https://www.paypal.com", "https://www.paypal.com/", "https://ddbm2.paypal.com"]
-    events: dict[str, Any] = {
-        "x0_status": 0,
-        "x0_url": "",
-        "x0_text_len": 0,
-        "post_status": 0,
-        "post_url": "",
-        "requestId": "",
-        "sealedResult": "",
-        "visitorToken": "",
-        "responses": [],
-    }
-
-    with sync_playwright() as p:
-        browser = p.chromium.connect_over_cdp(endpoint, timeout=wait_ms)
-        context = browser.contexts[0] if browser.contexts else browser.new_context()
-        if cookies:
-            sanitized: list[dict[str, Any]] = []
-            for cookie in cookies:
-                if not cookie.get("name") or cookie.get("value") is None:
-                    continue
-                item = {
-                    "name": str(cookie.get("name")),
-                    "value": str(cookie.get("value")),
-                    "path": str(cookie.get("path") or "/"),
-                    "secure": bool(cookie.get("secure", True)),
-                }
-                domain = str(cookie.get("domain") or "")
-                if domain:
-                    item["domain"] = domain
-                else:
-                    item["url"] = "https://www.paypal.com"
-                same_site = str(cookie.get("sameSite") or cookie.get("same_site") or "")
-                if same_site in {"Strict", "Lax", "None"}:
-                    item["sameSite"] = same_site
-                sanitized.append(item)
-            if sanitized:
-                context.add_cookies(sanitized)
-
-        page = context.pages[0] if context.pages else context.new_page()
-
-        def on_response(response: Any) -> None:
-            try:
-                url = str(response.url or "")
-                if mtr_path not in url:
-                    return
-                method = str(response.request.method or "")
-                record = {"method": method, "url": url, "status": int(response.status or 0)}
-                events["responses"].append(record)
-                if "/x0" in url and method.upper() == "GET":
-                    text = response.text()
-                    events["x0_status"] = int(response.status or 0)
-                    events["x0_url"] = url
-                    events["x0_text_len"] = len(text or "")
-                    return
-                if method.upper() == "POST":
-                    text = response.text()
-                    data: dict[str, Any] = {}
-                    try:
-                        parsed = json.loads(text or "{}")
-                        if isinstance(parsed, dict):
-                            data = parsed
-                    except Exception:
-                        data = {}
-                    extracted = _extract_mtr_response_data(data)
-                    events["post_status"] = int(response.status or 0)
-                    events["post_url"] = url
-                    events["requestId"] = extracted.get("requestId") or ""
-                    events["sealedResult"] = extracted.get("sealedResult") or ""
-                    events["visitorToken"] = extracted.get("visitorToken") or ""
-                    events["raw_response"] = extracted.get("raw") or data
-            except Exception as exc:
-                logger.debug("Roxy MTR response capture failed: {}", exc)
-
-        page.on("response", on_response)
-        try:
-            page.evaluate(
-                """() => {
-                    window.__mtrCompletedDetail = null;
-                    document.addEventListener('dfp-completed-check', event => {
-                        window.__mtrCompletedDetail = event.detail || true;
-                    }, { once: false });
-                    try {
-                        sessionStorage.removeItem('4g3-fd7gc5k5');
-                        sessionStorage.removeItem('4g3-fd7gc5k5-CMID');
-                    } catch (e) {}
-                }"""
-            )
-        except Exception:
-            pass
-
-        status = 0
-        try:
-            response = page.goto(page_url, wait_until="domcontentloaded", timeout=wait_ms)
-            status = int(response.status) if response is not None else 0
-        except Exception as exc:
-            logger.debug("Roxy MTR navigation did not finish cleanly: {}", exc)
-        try:
-            page.wait_for_load_state("networkidle", timeout=min(wait_ms, 8000))
-        except Exception:
-            pass
-
-        try:
-            live_config = page.evaluate(
-                """() => {
-                    const parseMaybe = (value) => {
-                        if (!value) return null;
-                        let current = value;
-                        for (let i = 0; i < 5; i++) {
-                            if (current && typeof current === "object") return current;
-                            if (typeof current !== "string") return null;
-                            const text = current.trim();
-                            if (!text) return null;
-                            try {
-                                current = JSON.parse(text);
-                                continue;
-                            } catch (e) {}
-                            const unescaped = text
-                                .replace(/\\\\u0022/g, '"')
-                                .replace(/\\\\\\//g, "/")
-                                .replace(/\\\\+"/g, '"');
-                            if (unescaped === text) return null;
-                            current = unescaped;
-                        }
-                        return current && typeof current === "object" ? current : null;
-                    };
-                    const fromWindow = parseMaybe(window.PAYPAL && window.PAYPAL.dfpData);
-                    if (fromWindow) return { source: "window.PAYPAL.dfpData", config: fromWindow };
-                    const node = document.getElementById("dfpconfig");
-                    const fromNode = parseMaybe(node && node.textContent);
-                    if (fromNode) return { source: "script#dfpconfig", config: fromNode };
-                    const scripts = Array.from(document.scripts || []);
-                    for (const script of scripts) {
-                        const text = script.textContent || "";
-                        const idx = text.indexOf("dfpConfig");
-                        if (idx < 0) continue;
-                        const windowText = text.slice(idx, idx + 5000);
-                        const objectMatches = windowText.match(/\\{[\\s\\S]{0,1800}?\\}/g) || [];
-                        for (const item of objectMatches) {
-                            if (!item.includes("dfpChannel") && !item.includes("fppAPIKey")) continue;
-                            const parsed = parseMaybe(item);
-                            if (parsed) return { source: "script-text-dfpConfig", config: parsed };
-                        }
-                    }
-                    return null;
-                }"""
-            )
-        except Exception as exc:
-            live_config = {"error": str(exc)}
-
-        if isinstance(live_config, dict):
-            extracted = live_config.get("config")
-            if isinstance(extracted, dict):
-                # The live page/DOM wins over any fallback supplied by Python.
-                for key in ("dfpChannel", "clientMetaDataId", "fppAPIKey", "csrfNonce", "isQA"):
-                    if extracted.get(key) not in (None, ""):
-                        dfp_config[key] = extracted.get(key)
-                events["extracted_dfp_config"] = {
-                    "source": live_config.get("source") or "browser",
-                    "channel": dfp_config.get("dfpChannel") or "",
-                    "cmid": dfp_config.get("clientMetaDataId") or "",
-                    "api_key_present": bool(dfp_config.get("fppAPIKey")),
-                }
-            elif live_config.get("error"):
-                events["extract_dfp_config_error"] = live_config.get("error")
-
-        if not (dfp_config.get("fppAPIKey") and dfp_config.get("clientMetaDataId")):
-            raise RoxyFingerprintError("MTR dfpconfig 缺少 fppAPIKey/clientMetaDataId，且浏览器页面未提取到完整 dfpconfig")
-
-        def inject_dfp() -> None:
-            config_json = json.dumps(dfp_config, ensure_ascii=False, separators=(",", ":"))
-            page.evaluate(
-                """(cfgText) => {
-                    const cfg = JSON.parse(cfgText);
-                    window.PAYPAL = window.PAYPAL || {};
-                    window.PAYPAL.dfpData = cfg;
-                    let node = document.getElementById('dfpconfig');
-                    if (!node) {
-                        node = document.createElement('script');
-                        node.id = 'dfpconfig';
-                        node.type = 'application/json';
-                        document.head.appendChild(node);
-                    }
-                    node.textContent = JSON.stringify(cfg);
-                    try {
-                        sessionStorage.removeItem('4g3-fd7gc5k5');
-                        sessionStorage.removeItem('4g3-fd7gc5k5-CMID');
-                    } catch (e) {}
-                }""",
-                config_json,
-            )
-            page.add_script_tag(url=dfp_script_url)
-
-        deadline = time.time() + wait_seconds
-        injected = False
-        while time.time() < deadline:
-            if events.get("sealedResult"):
-                break
-            completed = None
-            try:
-                completed = page.evaluate(
-                    """() => ({
-                        detail: window.__mtrCompletedDetail || null,
-                        done: (() => { try { return sessionStorage.getItem('4g3-fd7gc5k5'); } catch(e) { return null; } })(),
-                        cmid: (() => { try { return sessionStorage.getItem('4g3-fd7gc5k5-CMID'); } catch(e) { return null; } })()
-                    })"""
-                )
-            except Exception:
-                completed = None
-            if completed and not events.get("completed"):
-                events["completed"] = completed
-            # If the live page did not trigger MTR quickly, force the exact
-            # dfpconfig + dfp.js chain inside the PayPal origin.
-            if not injected and time.time() + wait_seconds - deadline > 2.0 and not events.get("post_url"):
-                try:
-                    inject_dfp()
-                    injected = True
-                    events["injected_dfp"] = True
-                except Exception as exc:
-                    injected = True
-                    events["inject_error"] = str(exc)
-                    logger.debug("Roxy MTR dfp.js injection failed: {}", exc)
-            page.wait_for_timeout(500)
-
-        browser_cookies = context.cookies(target_urls)
-        try:
-            final_url = page.url
-        except Exception:
-            final_url = ""
-        return {
-            "ok": bool(events.get("requestId") and events.get("sealedResult")),
-            "status": status,
-            "url": final_url,
-            "cookies": browser_cookies,
-            "dfp_config": {
-                "dfpChannel": dfp_config.get("dfpChannel") or "",
-                "clientMetaDataId": dfp_config.get("clientMetaDataId") or "",
-                "fppAPIKey": dfp_config.get("fppAPIKey") or "",
-                "csrfNonce": dfp_config.get("csrfNonce") or "",
-                "isQA": bool(dfp_config.get("isQA", False)),
-            },
-            **events,
-        }
+    return cast(
+        dict[str, Any],
+        run_local_headless_mtr_phase1(
+            page_url,
+            dfp_config=cast(dict[str, object], dfp_config),
+            dfp_script_url=dfp_script_url,
+            cookies=cast(list[dict[str, object]] | None, cookies),
+            wait_seconds=wait_seconds,
+            mtr_wait_seconds=wait_seconds,
+            roxy_browser=cast(dict[str, object], roxy_browser),
+            runtime="roxy",
+        ),
+    )
 
 
 def run_phase1_risk_with_roxy_browser(
@@ -1337,195 +2036,24 @@ def run_phase1_risk_with_roxy_browser(
     app_id: str = "IWC_NEXT_CHECKOUT",
     correlation_id: str = "",
 ) -> dict[str, Any]:
-    """Let the already-open Roxy Chrome execute PayPal Phase-1 risk scripts."""
-    try:
-        from playwright.sync_api import sync_playwright
-    except Exception as exc:  # pragma: no cover - optional runtime dependency
-        raise RoxyFingerprintError("playwright 未安装，无法连接 Roxy CDP") from exc
+    """Run signup-context browser-risk through the shared local-headless logic on Roxy."""
+    from paypal.local_headless import run_local_headless_mtr_phase1
 
-    cdp_info = roxy_browser.get("cdp_info") if isinstance(roxy_browser, dict) else {}
-    if not isinstance(cdp_info, dict) or not (cdp_info.get("ws") or cdp_info.get("http")):
-        raise RoxyFingerprintError("Roxy browser CDP 信息不存在，无法执行 Phase1 风控脚本")
-
-    endpoint = _connect_over_cdp(cdp_info)
-    wait_ms = max(1000, int(wait_seconds * 1000))
-    target_urls = [
-        "https://www.paypal.com",
-        "https://www.paypal.com/",
-        "https://c.paypal.com",
-        "https://c6.paypal.com",
-        "https://ddbm2.paypal.com",
-        "https://browser-intake-us5-datadoghq.com",
-    ]
-    events: dict[str, Any] = {
-        "responses": [],
-        "counts": {
-            "fraudnet_p3": 0,
-            "fraudnet_p1": 0,
-            "fraudnet_p2": 0,
-            "fraudnet_w": 0,
-            "identity_di_log": 0,
-            "tealeaf": 0,
-            "datadog_rum": 0,
-            "observability": 0,
-        },
-        "injected_scripts": [],
-        "inject_errors": [],
-    }
-
-    def classify_url(url: str) -> str:
-        if "c6.paypal.com/v1/r/d/b/p3" in url:
-            return "fraudnet_p3"
-        if "c.paypal.com/v1/r/d/b/p1" in url:
-            return "fraudnet_p1"
-        if "c.paypal.com/v1/r/d/b/p2" in url:
-            return "fraudnet_p2"
-        if "c.paypal.com/v1/r/d/b/w" in url:
-            return "fraudnet_w"
-        if "paypal.com/identity/di/log" in url:
-            return "identity_di_log"
-        if "paypal.com/platform/tealeaftarget" in url:
-            return "tealeaf"
-        if "browser-intake" in url and "/api/v2/rum" in url:
-            return "datadog_rum"
-        if "observability.handleClientEmit" in url or "observability" in url:
-            return "observability"
-        return ""
-
-    with sync_playwright() as p:
-        browser = p.chromium.connect_over_cdp(endpoint, timeout=wait_ms)
-        context = browser.contexts[0] if browser.contexts else browser.new_context()
-        if cookies:
-            sanitized: list[dict[str, Any]] = []
-            for cookie in cookies:
-                if not cookie.get("name") or cookie.get("value") is None:
-                    continue
-                item = {
-                    "name": str(cookie.get("name")),
-                    "value": str(cookie.get("value")),
-                    "path": str(cookie.get("path") or "/"),
-                    "secure": bool(cookie.get("secure", True)),
-                }
-                domain = str(cookie.get("domain") or "")
-                if domain:
-                    item["domain"] = domain
-                else:
-                    item["url"] = "https://www.paypal.com"
-                same_site = str(cookie.get("sameSite") or cookie.get("same_site") or "")
-                if same_site in {"Strict", "Lax", "None"}:
-                    item["sameSite"] = same_site
-                sanitized.append(item)
-            if sanitized:
-                context.add_cookies(sanitized)
-
-        page = context.pages[0] if context.pages else context.new_page()
-
-        def on_response(response: Any) -> None:
-            try:
-                url = str(response.url or "")
-                family = classify_url(url)
-                if not family:
-                    return
-                method = str(response.request.method or "")
-                record = {"family": family, "method": method, "url": url, "status": int(response.status or 0)}
-                events["responses"].append(record)
-                counts = events.get("counts") if isinstance(events.get("counts"), dict) else {}
-                counts[family] = int(counts.get(family) or 0) + 1
-                events["counts"] = counts
-            except Exception as exc:
-                logger.debug("Roxy Phase1 risk response capture failed: {}", exc)
-
-        page.on("response", on_response)
-
-        status = 0
-        try:
-            response = page.goto(page_url, wait_until="domcontentloaded", timeout=wait_ms)
-            status = int(response.status) if response is not None else 0
-        except Exception as exc:
-            logger.debug("Roxy Phase1 navigation did not finish cleanly: {}", exc)
-        try:
-            page.wait_for_load_state("networkidle", timeout=min(wait_ms, 8000))
-        except Exception:
-            pass
-
-        # Trigger browser-native observers (FraudNet timing/rDT, Tealeaf
-        # activity, Datadog view/action resource hooks) without constructing
-        # protocol payloads in Python.
-        try:
-            width = int(page.evaluate("() => Math.max(320, window.innerWidth || 800)") or 800)
-            height = int(page.evaluate("() => Math.max(240, window.innerHeight || 600)") or 600)
-            for index in range(6):
-                x = max(10, min(width - 10, 40 + index * max(20, width // 8)))
-                y = max(10, min(height - 10, 50 + ((index * 73) % max(50, height - 80))))
-                page.mouse.move(x, y, steps=4)
-                page.wait_for_timeout(120)
-            page.mouse.wheel(0, 240)
-            page.wait_for_timeout(250)
-            page.mouse.wheel(0, -120)
-        except Exception as exc:
-            events["interaction_error"] = str(exc)
-
-        # If PayPal's current HTML did not include every script in the first
-        # paint, ask the real page to load the public runtime scripts.  CSP can
-        # reject some of these; that is recorded and the natural page traffic
-        # remains authoritative.
-        scripts = [
-            "https://c.paypal.com/da/r/fb_fp.js",
-            "https://www.paypalobjects.com/v15170r-1d3n71ph1c4710n/dfp.js",
-            "https://www.paypalobjects.com/rdaAssets/fraudnet/ext/dfp.js",
-        ]
-        try:
-            page.evaluate(
-                """(meta) => {
-                    window.PAYPAL = window.PAYPAL || {};
-                    window.PAYPAL.ulData = window.PAYPAL.ulData || {};
-                    window.PAYPAL.ulData.app_id = meta.appId;
-                    window.PAYPAL.ulData.correlation_id = meta.correlationId;
-                    window.PAYPAL.ulData.page = location.href;
-                }""",
-                {"appId": app_id, "correlationId": correlation_id},
-            )
-        except Exception:
-            pass
-        for script_url in scripts:
-            try:
-                page.add_script_tag(url=script_url)
-                events["injected_scripts"].append(script_url)
-                page.wait_for_timeout(500)
-            except Exception as exc:
-                events["inject_errors"].append({"url": script_url, "error": str(exc)})
-
-        deadline = time.time() + wait_seconds
-        while time.time() < deadline:
-            counts = events.get("counts") if isinstance(events.get("counts"), dict) else {}
-            if (
-                int(counts.get("fraudnet_p1") or 0)
-                and int(counts.get("fraudnet_p2") or 0)
-                and int(counts.get("fraudnet_w") or 0)
-                and (int(counts.get("tealeaf") or 0) or int(counts.get("datadog_rum") or 0))
-            ):
-                break
-            page.wait_for_timeout(500)
-
-        browser_cookies = context.cookies(target_urls)
-        try:
-            final_url = page.url
-        except Exception:
-            final_url = ""
-
-        counts = events.get("counts") if isinstance(events.get("counts"), dict) else {}
-        observed = [name for name, count in counts.items() if int(count or 0) > 0]
-        missing = [
-            name
-            for name in ("fraudnet_p1", "fraudnet_p2", "fraudnet_w", "identity_di_log", "tealeaf", "datadog_rum")
-            if int(counts.get(name) or 0) <= 0
-        ]
-        return {
-            "ok": bool(observed),
-            "status": status,
-            "url": final_url,
-            "cookies": browser_cookies,
-            "observed": observed,
-            "missing": missing,
-            **events,
-        }
+    return cast(
+        dict[str, Any],
+        run_local_headless_mtr_phase1(
+            page_url,
+            dfp_config={},
+            dfp_script_url="",
+            cookies=cast(list[dict[str, object]] | None, cookies),
+            wait_seconds=wait_seconds,
+            mtr_wait_seconds=0.0,
+            app_id=app_id,
+            correlation_id=correlation_id,
+            stage="signup_context",
+            new_page=True,
+            run_mtr=False,
+            roxy_browser=cast(dict[str, object], roxy_browser),
+            runtime="roxy",
+        ),
+    )

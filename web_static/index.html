@@ -12,7 +12,7 @@
       <div>
         <p class="eyebrow">Local Web Console</p>
         <h1>PayPal 协议支付网页端</h1>
-        <p class="subtitle">填写 BA Token 和手机号后启动任务；短信验证码会在页面中提示输入。</p>
+        <p class="subtitle">填写 BA Token 后启动任务；可手动输入手机号，也可使用 SMSBower 自动接码。</p>
       </div>
       <div class="status-pill" id="serverStatus">连接中…</div>
     </header>
@@ -32,6 +32,10 @@
             <span>手机号</span>
             <input id="phone" name="phone" required placeholder="+5591980133818" />
           </label>
+          <label class="check-row">
+            <input id="smsbowerEnabled" name="smsbowerEnabled" type="checkbox" />
+            <span>使用 SMSBower 自动接码</span>
+          </label>
           <div class="form-row">
             <label>
               <span>最大换卡次数</span>
@@ -39,7 +43,7 @@
             </label>
             <label>
               <span>整套流程重试</span>
-              <input id="maxFlowAttempts" name="maxFlowAttempts" type="number" min="1" max="5" value="3" />
+              <input id="maxFlowAttempts" name="maxFlowAttempts" type="number" min="1" max="5" value="1" />
             </label>
             <label>
               <span>授权重试次数</span>
@@ -58,13 +62,13 @@
               <span>显示 DEBUG 日志</span>
             </label>
             <label class="check-row">
-              <input id="proxyEnabled" name="proxyEnabled" type="checkbox" checked />
+              <input id="proxyEnabled" name="proxyEnabled" type="checkbox" />
               <span>启用代理</span>
             </label>
             <label>
               <span>代理来源</span>
               <select id="proxyMode" name="proxyMode">
-                <option value="configured">1024proxy / 环境变量代理池</option>
+                <option value="environment">环境变量代理（PAYPAL_PROXY_URL / PAYPAL_PROXY_POOL）</option>
                 <option value="custom">自定义链式代理 URL</option>
               </select>
             </label>
@@ -82,6 +86,7 @@
             <label>
               <span>浏览器指纹来源</span>
               <select id="fingerprintSource" name="fingerprintSource">
+                <option value="headless" selected>本地 Headless</option>
                 <option value="roxy">Roxy 指纹浏览器</option>
                 <option value="random">程序随机生成</option>
                 <option value="auto">自动：优先 Roxy</option>
@@ -90,7 +95,8 @@
             <label>
               <span>DataDome 模式</span>
               <select id="datadomeMode" name="datadomeMode">
-                <option value="roxy">Roxy 浏览器执行</option>
+                <option value="headless" selected>本地 Headless</option>
+                <option value="roxy">Roxy 浏览器执行（同 Headless 逻辑）</option>
                 <option value="protocol">协议边缘模拟</option>
                 <option value="auto">自动：Roxy 失败回退</option>
                 <option value="off">关闭</option>
@@ -99,19 +105,11 @@
             <label>
               <span>MTR sealedResult</span>
               <select id="mtrRuntime" name="mtrRuntime">
-                <option value="roxy">Roxy 浏览器执行 dfp.js</option>
+                <option value="headless" selected>本地 Headless</option>
+                <option value="roxy">Roxy 浏览器执行 dfp.js（同 Headless 逻辑）</option>
                 <option value="python_generated">程序模板生成</option>
                 <option value="auto">自动：Roxy 失败回退</option>
                 <option value="block">严格阻断缺失</option>
-                <option value="off">关闭</option>
-              </select>
-            </label>
-            <label>
-              <span>Phase1 风控信号</span>
-              <select id="riskSignalsMode" name="riskSignalsMode">
-                <option value="roxy">Roxy 浏览器自然执行</option>
-                <option value="protocol">程序协议模板发送</option>
-                <option value="auto">自动：Roxy 失败回退</option>
                 <option value="off">关闭</option>
               </select>
             </label>
@@ -144,7 +142,8 @@
           </div>
           <button id="startBtn" class="primary" type="submit">开始执行</button>
         </form>
-        <p class="hint">任务执行到短信验证时会暂停等待输入；代理按每个任务生效。打开“自动记录程序发包”后会在 captures/program-paypal-* 下保存请求/响应，并可和 roxy 抓包自动生成差异报告。</p>
+        <p class="hint">默认的本地 Headless 模式需要 Playwright：<code>pip install -r requirements-headless.txt &amp;&amp; python -m playwright install chromium</code>。未安装时可把上面三项切到程序随机生成、协议边缘模拟和程序模板生成。</p>
+        <p class="hint">手动模式执行到短信验证时会暂停等待输入；SMSBower 模式会自动取最低价 PayPal 巴西号码并接码。代理按每个任务生效。打开“自动记录程序发包”后会在 captures/program-paypal-* 下保存请求/响应，并可和 roxy 抓包自动生成差异报告。</p>
       </section>
 
       <section class="card jobs-card">

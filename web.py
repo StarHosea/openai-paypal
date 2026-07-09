@@ -7,6 +7,7 @@ Run:
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
 import mimetypes
 import os
@@ -36,6 +37,15 @@ from paypal.traffic_recorder import (
 
 ROOT = Path(__file__).resolve().parent
 STATIC_DIR = ROOT / "web_static"
+CAPTURES_ROOT = (ROOT / "captures").resolve()
+
+
+def _smsbower_module():
+    return importlib.import_module("paypal.smsbower")
+
+
+def _build_smsbower_provider(enabled: bool):
+    return getattr(_smsbower_module(), "build_smsbower_provider")(enabled=enabled)
 
 
 def env_bool(name: str, default: bool = False) -> bool:
@@ -54,6 +64,28 @@ def env_int(name: str, default: int, min_value: int, max_value: int) -> int:
     return max(min_value, min(value, max_value))
 
 
+def _prepare_private_dir(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(path, 0o700)
+    except Exception:
+        pass
+
+
+def resolve_traffic_dir(raw: str, job_id: str) -> Path:
+    if raw.strip():
+        requested = Path(raw).expanduser()
+        candidate = requested if requested.is_absolute() else CAPTURES_ROOT / requested
+        candidate = candidate.resolve()
+    else:
+        candidate = (CAPTURES_ROOT / f"program-paypal-{job_id}").resolve()
+    if candidate != CAPTURES_ROOT and CAPTURES_ROOT not in candidate.parents:
+        raise ValueError("发包记录目录必须位于项目 captures 目录内")
+    _prepare_private_dir(CAPTURES_ROOT)
+    _prepare_private_dir(candidate)
+    return candidate
+
+
 PRODUCTION_MODE = env_bool("PAYPAL_WEB_PRODUCTION", False)
 MAX_LOG_LINES = env_int("PAYPAL_WEB_MAX_LOG_LINES", 300, 50, 2000)
 MAX_TOTAL_JOBS = env_int("PAYPAL_WEB_MAX_TOTAL_JOBS", 200, 10, 5000)
@@ -68,10 +100,12 @@ DEVICE_COOKIE_MAX_AGE = 365 * 24 * 60 * 60
 DEVICE_ID_RE = re.compile(r"^[a-f0-9]{32}$")
 BA_TOKEN_RE = re.compile(r"^BA-[A-Za-z0-9]{8,80}$")
 PHONE_RE = re.compile(r"^\+?\d{8,20}$")
-FINGERPRINT_SOURCE_CHOICES = {"random", "program", "python", "synthetic", "roxy", "browser", "auto"}
-DATADOME_MODE_CHOICES = {"protocol", "edge", "roxy", "browser", "auto", "off"}
-MTR_RUNTIME_CHOICES = {"python_generated", "python", "protocol", "roxy", "browser", "auto", "block", "off"}
-RISK_SIGNALS_MODE_CHOICES = {"protocol", "python", "synthetic", "template", "roxy", "browser", "auto", "off"}
+FINGERPRINT_SOURCE_CHOICES = {"random", "program", "python", "synthetic", "roxy", "browser", "headless", "local_headless", "playwright", "local_playwright", "auto"}
+DATADOME_MODE_CHOICES = {"protocol", "edge", "roxy", "browser", "headless", "local_headless", "playwright", "local_playwright", "auto", "off"}
+MTR_RUNTIME_CHOICES = {"python_generated", "python", "protocol", "roxy", "browser", "headless", "local_headless", "playwright", "local_playwright", "auto", "block", "off"}
+RISK_SIGNALS_MODE_CHOICES = {"protocol", "python", "synthetic", "template", "roxy", "browser", "headless", "local_headless", "playwright", "local_playwright", "auto", "off"}
+SMS_PROVIDER_CHOICES = {"manual", "smsbower"}
+ROXY_LIKE_MODE_VALUES = {"roxy", "browser", "real_browser", "chrome", "chromium", "roxy_browser", "roxybrowser"}
 
 ACTIVE_STATUSES = {"queued", "running", "awaiting_otp"}
 RUNNER_SEMAPHORE = threading.BoundedSemaphore(MAX_ACTIVE_JOBS)
@@ -80,6 +114,27 @@ RATE_BUCKETS: dict[tuple[str, str], list[float]] = {}
 
 
 # ----------------------------- helpers -----------------------------
+
+
+def implicit_risk_signals_mode(
+    fingerprint_source: object,
+    datadome_mode: object,
+    mtr_runtime: object,
+    explicit: object = "",
+) -> str:
+    value = str(explicit or "").strip().lower().replace("-", "_")
+    if value:
+        return value
+    modes = {
+        str(fingerprint_source or "").strip().lower().replace("-", "_"),
+        str(datadome_mode or "").strip().lower().replace("-", "_"),
+        str(mtr_runtime or "").strip().lower().replace("-", "_"),
+    }
+    if modes & ROXY_LIKE_MODE_VALUES:
+        return "roxy"
+    if "auto" in modes:
+        return "auto"
+    return "headless"
 
 
 def now_ts() -> float:
@@ -138,12 +193,12 @@ def redact_text(value: Any) -> str:
 
     # URL query parameters and JSON-ish key/value pairs.
     text = re.sub(
-        r"(?i)([?&](?:ba_token|token|ec_token|billingAgreementId|access_token|code|pin|password|otp)=)([^&\s\"']+)",
+        r"(?i)([?&](?:ba_token|token|ec_token|billingAgreementId|billingAgreementToken|billing_agreement_token|access_token|code|pin|password|otp|ssrt|ctxId|ctx_id|cmid|clientMetadataId|client_metadata_id|correlationId|correlation_id|requestId|request_id|sealedResult|sealed_result|visitorToken|visitor_token)=)([^&\s\"']+)",
         lambda m: f"{m.group(1)}{mask_middle(m.group(2), 4, 4)}",
         text,
     )
     text = re.sub(
-        r"(?i)(\b(?:ba_token|ec_token|billingAgreementId|token|accessToken|password|securityCode|cvv|pin|otp)\b\s*[:=]\s*)([\"']?)([^&,\"'\s}{]+)([\"']?)",
+        r"(?i)([\"']?\b(?:ba_token|ec_token|billingAgreementId|billingAgreementToken|billing_agreement_token|token|accessToken|password|securityCode|cvv|pin|otp|ssrt|ctxId|ctx_id|cmid|clientMetadataId|client_metadata_id|correlationId|correlation_id|requestId|request_id|sealedResult|sealed_result|visitorToken|visitor_token)\b[\"']?\s*[:=]\s*)([\"']?)([^&,\"'\s}{]+)([\"']?)",
         lambda m: f"{m.group(1)}{m.group(2)}<redacted>{m.group(4)}",
         text,
     )
@@ -172,6 +227,16 @@ def redact_text(value: Any) -> str:
     return text
 
 
+WEB_PHASE1_RISK_TEXT_RE = re.compile(r"(?i)\bphase\s*1\b|\brisk\b|风控")
+
+
+def sanitize_web_visible_text(value: object, *, fallback: str = "执行前置准备") -> str:
+    text = redact_text(value).rstrip()
+    if WEB_PHASE1_RISK_TEXT_RE.search(text):
+        return fallback
+    return text
+
+
 def sanitize_payload(value: Any, key: str = "") -> Any:
     """Redact sensitive values before returning API payloads to the browser."""
     compact_key = key.lower().replace("_", "").replace("-", "")
@@ -182,8 +247,19 @@ def sanitize_payload(value: Any, key: str = "") -> Any:
     if not isinstance(value, str):
         return value
 
-    if compact_key in {"password", "securitycode", "cvv", "pin", "otp", "authorization", "cookie", "accesstoken"}:
+    if compact_key in {"password", "securitycode", "cvv", "pin", "otp", "authorization", "cookie", "accesstoken", "euat"}:
         return "<redacted>"
+    if compact_key in {
+        "sealedresult",
+        "visitortoken",
+        "requestid",
+        "correlationid",
+        "clientmetadataid",
+        "cmid",
+        "ssrt",
+        "ctxid",
+    }:
+        return mask_middle(value, 4, 4)
     if compact_key in {"token", "batoken", "ectoken", "billingagreementid", "billingagreementtoken"}:
         return mask_middle(value, 4, 4)
     if compact_key in {"cardnumber", "encryptednumber"}:
@@ -209,6 +285,9 @@ def safe_result_payload(value: Any) -> Any:
     sanitized = sanitize_payload(value)
     if isinstance(sanitized, dict) and "raw_response" in sanitized:
         sanitized["raw_response"] = "<redacted>"
+    if isinstance(sanitized, dict):
+        sanitized.pop("risk_runtime", None)
+        sanitized.pop("synthetic_risk_families", None)
     return sanitized
 
 
@@ -256,19 +335,20 @@ class WebJob:
     owner_device_id: str
     ba_token: str
     phone: str
+    sms_provider: str = "manual"
     debug: bool = False
     max_card_attempts: int = 5
-    max_flow_attempts: int = 3
+    max_flow_attempts: int = 1
     max_authorize_attempts: int = 3
     card_retry_delay_seconds: float = 6.0
     card_retry_jitter_seconds: float = 2.0
     proxy_enabled: bool = False
-    proxy_mode: str = "configured"
+    proxy_mode: str = "environment"
     proxy_label: str = "代理关闭"
-    fingerprint_source: str = "roxy"
-    datadome_mode: str = "roxy"
-    mtr_runtime: str = "roxy"
-    risk_signals_mode: str = "roxy"
+    fingerprint_source: str = "headless"
+    datadome_mode: str = "headless"
+    mtr_runtime: str = "headless"
+    risk_signals_mode: str = "headless"
     record_traffic: bool = False
     traffic_dir: str = ""
     compare_roxy_capture: str = ""
@@ -309,7 +389,7 @@ class WebJob:
             self.logs.append({
                 "time": ts or now_ts(),
                 "level": level,
-                "message": redact_text(message).rstrip(),
+                "message": sanitize_web_visible_text(message),
             })
             if len(self.logs) > MAX_LOG_LINES:
                 del self.logs[: len(self.logs) - MAX_LOG_LINES]
@@ -361,8 +441,12 @@ class WebJob:
         with self._condition:
             self.status = "failed"
             self.stage = "执行失败"
-            self.error = redact_text(str(exc))
-            self.traceback_text = redact_text(traceback.format_exc()) if (self.debug and ALLOW_DEBUG_LOGS) else ""
+            self.error = sanitize_web_visible_text(str(exc), fallback="执行前置准备失败")
+            self.traceback_text = (
+                sanitize_web_visible_text(traceback.format_exc(), fallback="调试堆栈已隐藏")
+                if (self.debug and ALLOW_DEBUG_LOGS)
+                else ""
+            )
             self.finished_at = now_ts()
             self.updated_at = now_ts()
             self.awaiting_prompt = ""
@@ -382,6 +466,7 @@ class WebJob:
                 "stage": self.stage,
                 "ba_token": mask_middle(self.ba_token),
                 "phone": mask_phone(self.phone),
+                "sms_provider": self.sms_provider,
                 "debug": self.debug and ALLOW_DEBUG_LOGS,
                 "max_card_attempts": self.max_card_attempts,
                 "max_flow_attempts": self.max_flow_attempts,
@@ -394,7 +479,6 @@ class WebJob:
                 "fingerprint_source": self.fingerprint_source,
                 "datadome_mode": self.datadome_mode,
                 "mtr_runtime": self.mtr_runtime,
-                "risk_signals_mode": self.risk_signals_mode,
                 "record_traffic": self.record_traffic,
                 "traffic_dir": self.traffic_dir,
                 "compare_roxy_capture": self.compare_roxy_capture,
@@ -402,10 +486,14 @@ class WebJob:
                 "traffic_report_md": self.traffic_report_md,
                 "generated": sanitize_payload(self.generated),
                 "awaiting_otp": self.status == "awaiting_otp",
-                "awaiting_prompt": redact_text(self.awaiting_prompt),
+                "awaiting_prompt": sanitize_web_visible_text(self.awaiting_prompt),
                 "result": safe_result_payload(self.result),
-                "error": redact_text(self.error),
-                "traceback": self.traceback_text if (self.debug and ALLOW_DEBUG_LOGS) else "",
+                "error": sanitize_web_visible_text(self.error, fallback="执行前置准备失败"),
+                "traceback": (
+                    sanitize_web_visible_text(self.traceback_text, fallback="调试堆栈已隐藏")
+                    if (self.debug and ALLOW_DEBUG_LOGS)
+                    else ""
+                ),
                 "logs": logs,
                 "log_count": len(self.logs),
             }
@@ -475,10 +563,6 @@ class WebPayPalFlow(PayPalFlow):
         self._set_stage("Phase 0：打开协议页")
         return super()._phase0_initial_load()
 
-    def _phase1_risk_controls(self):
-        self._set_stage("Phase 1：发送风控/指纹信号")
-        return super()._phase1_risk_controls()
-
     def _phase2_create_account(self):
         self._set_stage("Phase 2：进入创建账号流程")
         return super()._phase2_create_account()
@@ -509,8 +593,15 @@ class WebPayPalFlow(PayPalFlow):
         logger.info(prompt)
         return self.job.wait_for_input(prompt)
 
+    def _on_phone_updated(self) -> None:
+        self.job.phone = self.user.phone
+        self.job.set_generated(public_generated_payload(self.user, self.card, self.address))
+
     def _confirm_phone_with_retry(self, token: str, signup_url: str):
         """Web version of the CLI input loop."""
+        if self.sms_provider is not None:
+            return self._confirm_phone_with_sms_provider(token, signup_url)
+
         while True:
             try:
                 auth_id, challenge_id = self._initiate_2fa_phone_confirmation(token, signup_url)
@@ -600,31 +691,37 @@ def create_job(
     phone: str,
     debug: bool,
     max_card_attempts: int,
-    max_flow_attempts: int = 3,
+    sms_provider: str = "manual",
+    max_flow_attempts: int = 1,
     max_authorize_attempts: int = 3,
     card_retry_delay_seconds: float = 6.0,
     card_retry_jitter_seconds: float = 2.0,
     proxy_enabled: bool = False,
-    proxy_mode: str = "configured",
+    proxy_mode: str = "environment",
     proxy_url: str = "",
-    fingerprint_source: str = "roxy",
-    datadome_mode: str = "roxy",
-    mtr_runtime: str = "roxy",
-    risk_signals_mode: str = "roxy",
+    fingerprint_source: str = "headless",
+    datadome_mode: str = "headless",
+    mtr_runtime: str = "headless",
+    risk_signals_mode: str = "headless",
     record_traffic: bool = False,
     traffic_dir: str = "",
     compare_roxy_capture: str = "",
 ) -> WebJob:
     ba_token = (ba_token or "").strip()
     phone = re.sub(r"[\s().-]+", "", (phone or "").strip())
+    sms_provider = (sms_provider or "manual").strip().lower()
+    if sms_provider not in SMS_PROVIDER_CHOICES:
+        raise ValueError("短信接码方式不正确")
     if not ba_token:
         raise ValueError("BA Token 不能为空")
     if not BA_TOKEN_RE.fullmatch(ba_token):
         raise ValueError("BA Token 格式不正确")
-    if not phone:
+    if not phone and sms_provider == "manual":
         raise ValueError("手机号不能为空")
-    if not PHONE_RE.fullmatch(phone):
+    if phone and not PHONE_RE.fullmatch(phone):
         raise ValueError("手机号格式不正确")
+    if sms_provider == "smsbower":
+        _build_smsbower_provider(enabled=True)
     try:
         max_card_attempts = int(max_card_attempts)
     except Exception as exc:
@@ -651,26 +748,26 @@ def create_job(
         raise ValueError("换卡随机抖动秒数必须是数字") from exc
     card_retry_jitter_seconds = max(0.0, min(card_retry_jitter_seconds, 30.0))
     debug = bool(debug) and ALLOW_DEBUG_LOGS
-    proxy_mode = (proxy_mode or "configured").strip().lower()
-    if proxy_mode not in {"configured", "custom"}:
+    proxy_mode = (proxy_mode or "environment").strip().lower()
+    if proxy_mode not in {"environment", "custom"}:
         raise ValueError("代理来源不正确")
     proxy_url = (proxy_url or "").strip()
     if proxy_url and len(proxy_url) > 2048:
         raise ValueError("链式代理 URL 太长")
     if bool(proxy_enabled) and proxy_mode == "custom" and not proxy_url:
         raise ValueError("启用自定义链式代理时必须填写代理 URL")
-    fingerprint_source = (fingerprint_source or "roxy").strip().lower().replace("-", "_")
+    fingerprint_source = (fingerprint_source or "headless").strip().lower().replace("-", "_")
     if fingerprint_source not in FINGERPRINT_SOURCE_CHOICES:
         raise ValueError("浏览器指纹来源不正确")
-    datadome_mode = (datadome_mode or "roxy").strip().lower().replace("-", "_")
+    datadome_mode = (datadome_mode or "headless").strip().lower().replace("-", "_")
     if datadome_mode not in DATADOME_MODE_CHOICES:
         raise ValueError("DataDome 模式不正确")
-    mtr_runtime = (mtr_runtime or "roxy").strip().lower().replace("-", "_")
+    mtr_runtime = (mtr_runtime or "headless").strip().lower().replace("-", "_")
     if mtr_runtime not in MTR_RUNTIME_CHOICES:
         raise ValueError("MTR 模式不正确")
-    risk_signals_mode = (risk_signals_mode or "roxy").strip().lower().replace("-", "_")
+    risk_signals_mode = (risk_signals_mode or "headless").strip().lower().replace("-", "_")
     if risk_signals_mode not in RISK_SIGNALS_MODE_CHOICES:
-        raise ValueError("Phase1 风控信号模式不正确")
+        raise ValueError("browser risk 模式不正确")
     record_traffic = bool(record_traffic)
     traffic_dir = (traffic_dir or "").strip()
     compare_roxy_capture = (compare_roxy_capture or "").strip()
@@ -686,17 +783,14 @@ def create_job(
     )
     job_id = uuid.uuid4().hex[:12]
     if record_traffic:
-        if traffic_dir:
-            traffic_dir = str(Path(traffic_dir).expanduser().resolve())
-        else:
-            traffic_dir = str((ROOT / "captures" / f"program-paypal-{job_id}").resolve())
-        Path(traffic_dir).mkdir(parents=True, exist_ok=True)
+        traffic_dir = str(resolve_traffic_dir(traffic_dir, job_id))
 
     job = WebJob(
         id=job_id,
         owner_device_id=owner_device_id,
         ba_token=ba_token,
         phone=phone,
+        sms_provider=sms_provider,
         debug=debug,
         max_card_attempts=max_card_attempts,
         max_flow_attempts=max_flow_attempts,
@@ -704,7 +798,7 @@ def create_job(
         card_retry_delay_seconds=card_retry_delay_seconds,
         card_retry_jitter_seconds=card_retry_jitter_seconds,
         proxy_enabled=proxy_config.enabled,
-        proxy_mode=proxy_mode if proxy_config.enabled else "configured",
+        proxy_mode=proxy_mode if proxy_config.enabled else "environment",
         proxy_label=proxy_config.label,
         fingerprint_source=fingerprint_source,
         datadome_mode=datadome_mode,
@@ -748,11 +842,7 @@ def run_job(job: WebJob) -> None:
             job.started_at = now_ts()
             job.set_status("running", "生成用户、卡片和地址")
             if job.record_traffic:
-                traffic_root = (
-                    Path(job.traffic_dir).expanduser()
-                    if job.traffic_dir
-                    else ROOT / "captures" / f"program-paypal-{job.id}"
-                )
+                traffic_root = resolve_traffic_dir(job.traffic_dir, job.id)
                 traffic_recorder = TrafficRecorder(traffic_root)
                 set_current_traffic_recorder(traffic_recorder)
                 with job._condition:
@@ -761,9 +851,13 @@ def run_job(job: WebJob) -> None:
                     job._condition.notify_all()
                 logger.info("Program traffic recording enabled: {}", traffic_recorder.root)
             proxy_config = job._proxy_config or build_proxy_config(enabled=job.proxy_enabled)
+            sms_provider = None
+            if job.sms_provider == "smsbower":
+                sms_provider = _build_smsbower_provider(enabled=True)
+                logger.info("SMS provider: SMSBower auto mode")
             job.proxy_enabled = proxy_config.enabled
             job.proxy_label = proxy_config.label
-            user = generate_user(job.phone)
+            user = generate_user(job.phone or "+5500000000000")
             card = generate_card(proxy_url=proxy_config.url)
             address = generate_address()
             job.set_generated(public_generated_payload(user, card, address))
@@ -771,15 +865,17 @@ def run_job(job: WebJob) -> None:
             logger.info("Web job started: {}", job.id)
             logger.info("Proxy: {}", proxy_config.label)
             logger.info(
-                "Runtime modes: fingerprint={} datadome={} mtr={} risk={}",
+                "Runtime modes: fingerprint={} datadome={} mtr={}",
                 job.fingerprint_source,
                 job.datadome_mode,
                 job.mtr_runtime,
-                job.risk_signals_mode,
             )
             logger.info("User: {} {}", user.first_name, user.last_name)
             logger.info("Email: {}", mask_email(user.email))
-            logger.info("Phone: {}", mask_phone(user.phone))
+            if sms_provider is None:
+                logger.info("Phone: {}", mask_phone(user.phone))
+            else:
+                logger.info("Phone: SMSBower auto mode will reserve a Brazil PayPal number before OTP")
             logger.info(
                 "Address generated: {}, {}-{}",
                 address.district,
@@ -802,6 +898,7 @@ def run_job(job: WebJob) -> None:
                 datadome_mode=job.datadome_mode,
                 mtr_runtime=job.mtr_runtime,
                 risk_signals_mode=job.risk_signals_mode,
+                sms_provider=sms_provider,
                 job=job,
             )
             result = flow.run()
@@ -855,12 +952,14 @@ def run_job(job: WebJob) -> None:
 
 class WebHandler(BaseHTTPRequestHandler):
     server_version = "PayPalWebUI/1.0"
+    _set_device_cookie: str = ""
+    _device_id: str = ""
 
-    def log_message(self, fmt: str, *args: Any) -> None:  # quieter stdlib server logs
+    def log_message(self, format: str, *args: Any) -> None:  # quieter stdlib server logs
         try:
-            text = fmt % args
+            text = format % args
         except Exception:
-            text = fmt
+            text = format
         logger.debug("HTTP {}", redact_text(text))
 
     def client_key(self) -> str:
@@ -956,23 +1055,32 @@ class WebHandler(BaseHTTPRequestHandler):
                 return
             try:
                 data = self.read_json()
+                fingerprint_source = str(data.get("fingerprint_source", "headless") or "headless")
+                datadome_mode = str(data.get("datadome_mode", "headless") or "headless")
+                mtr_runtime = str(data.get("mtr_runtime", "headless") or "headless")
                 job = create_job(
                     owner_device_id=self.get_device_id(),
                     ba_token=data.get("ba_token", ""),
                     phone=data.get("phone", ""),
                     debug=bool(data.get("debug", False)),
                     max_card_attempts=int(data.get("max_card_attempts", 5) or 5),
-                    max_flow_attempts=int(data.get("max_flow_attempts", 3) or 3),
+                    sms_provider=str(data.get("sms_provider", "manual") or "manual"),
+                    max_flow_attempts=int(data.get("max_flow_attempts", 1) or 1),
                     max_authorize_attempts=int(data.get("max_authorize_attempts", 3) or 3),
                     card_retry_delay_seconds=float(data.get("card_retry_delay_seconds", 6) or 0),
                     card_retry_jitter_seconds=float(data.get("card_retry_jitter_seconds", 2) or 0),
                     proxy_enabled=bool(data.get("proxy_enabled", False)),
-                    proxy_mode=str(data.get("proxy_mode", "configured") or "configured"),
+                    proxy_mode=str(data.get("proxy_mode", "environment") or "environment"),
                     proxy_url=str(data.get("proxy_url", "") or ""),
-                    fingerprint_source=str(data.get("fingerprint_source", "roxy") or "roxy"),
-                    datadome_mode=str(data.get("datadome_mode", "roxy") or "roxy"),
-                    mtr_runtime=str(data.get("mtr_runtime", "roxy") or "roxy"),
-                    risk_signals_mode=str(data.get("risk_signals_mode", "roxy") or "roxy"),
+                    fingerprint_source=fingerprint_source,
+                    datadome_mode=datadome_mode,
+                    mtr_runtime=mtr_runtime,
+                    risk_signals_mode=implicit_risk_signals_mode(
+                        fingerprint_source,
+                        datadome_mode,
+                        mtr_runtime,
+                        data.get("risk_signals_mode", ""),
+                    ),
                     record_traffic=bool(data.get("record_traffic", False)),
                     traffic_dir=str(data.get("traffic_dir", "") or ""),
                     compare_roxy_capture=str(data.get("compare_roxy_capture", "") or ""),

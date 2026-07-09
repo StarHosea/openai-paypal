@@ -3,10 +3,16 @@ import hashlib
 import json
 import os
 import random
+import re
 import time
 import urllib.parse
 import base64
+from collections.abc import Mapping
+from collections.abc import Sequence
+from typing import Any
 from typing import Iterable
+from typing import TypeVar
+from typing import cast
 
 from paypal.models import generate_eteid
 from config import SCREEN, USER_AGENT, VIEWPORT, BROWSER_PROFILE, FINGERPRINT_SOURCE, DATADOME_MODE
@@ -20,7 +26,10 @@ PAYPAL_DFP_JS_RDA = "https://www.paypalobjects.com/rdaAssets/fraudnet/ext/dfp.js
 PAYPAL_DDBM_TAGS_JS = "https://ddbm2.paypal.com/tags.js"
 PAYPAL_DI_LOG = "https://www.paypal.com/identity/di/log"
 
-PDF_PLUGINS = [
+_T = TypeVar("_T")
+JsonDict = dict[str, Any]
+
+PDF_PLUGINS: list[JsonDict] = [
     {
         "mT": [{"t": "application/pdf", "s": "pdf"}, {"t": "text/pdf", "s": "pdf"}],
         "n": name,
@@ -81,7 +90,7 @@ def _cookie_value(session, name: str) -> str | None:
     return None
 
 
-def _risk_headers(referer: str, *, content_type: str | None = "application/json") -> dict:
+def _risk_headers(referer: str, *, content_type: str | None = "application/json") -> dict[str, str]:
     headers = {
         "Accept": "*/*",
         "Origin": "https://www.paypal.com",
@@ -104,7 +113,7 @@ def _random_hex(length: int = 64) -> str:
     return digest[:length]
 
 
-_GPU_PROFILES = [
+_GPU_PROFILES: list[dict[str, str]] = [
     {
         "gpu_vendor": "Google Inc. (Intel)",
         "gpu_renderer": "ANGLE (Intel, Intel(R) UHD Graphics 620, OpenGL 4.1)",
@@ -131,8 +140,35 @@ _GPU_PROFILES = [
     },
 ]
 
+_CHROME_VERSION_CHOICES: list[tuple[str, int]] = [
+    ("150.0.7871.46", 35),
+    ("150.0.7871.42", 25),
+    ("149.0.7834.83", 20),
+    ("149.0.7834.62", 12),
+    ("148.0.7772.122", 8),
+]
 
-_WEBGL_EXTENSION_SETS = {
+_MAINSTREAM_SCREEN_CHOICES: list[tuple[JsonDict, int]] = [
+    ({"width": 1920, "height": 1080, "availWidth": 1920, "availHeight": 1040}, 30),
+    ({"width": 1366, "height": 768, "availWidth": 1366, "availHeight": 728}, 22),
+    ({"width": 1536, "height": 864, "availWidth": 1536, "availHeight": 824}, 20),
+    ({"width": 1440, "height": 900, "availWidth": 1440, "availHeight": 860}, 12),
+    ({"width": 1600, "height": 900, "availWidth": 1600, "availHeight": 860}, 10),
+    ({"width": 1280, "height": 720, "availWidth": 1280, "availHeight": 680}, 8),
+    ({"width": 1280, "height": 800, "availWidth": 1280, "availHeight": 760}, 7),
+    ({"width": 1680, "height": 1050, "availWidth": 1680, "availHeight": 1010}, 6),
+    ({"width": 1920, "height": 1200, "availWidth": 1920, "availHeight": 1160}, 5),
+    ({"width": 2560, "height": 1440, "availWidth": 2560, "availHeight": 1400}, 5),
+]
+
+
+def _random_mainstream_screen() -> JsonDict:
+    screens = [screen for screen, _weight in _MAINSTREAM_SCREEN_CHOICES]
+    weights = [weight for _screen, weight in _MAINSTREAM_SCREEN_CHOICES]
+    return dict(random.choices(screens, weights=weights, k=1)[0])
+
+
+_WEBGL_EXTENSION_SETS: dict[str, list[str]] = {
     "intel": [
         "ANGLE_instanced_arrays",
         "EXT_blend_minmax",
@@ -251,6 +287,34 @@ _WINDOWS_FONT_STACK = [
     "Verdana",
 ]
 
+_LINUX_FONT_STACK = [
+    "Arial",
+    "Courier New",
+    "DejaVu Sans",
+    "DejaVu Sans Mono",
+    "DejaVu Serif",
+    "Liberation Mono",
+    "Liberation Sans",
+    "Liberation Serif",
+    "Noto Color Emoji",
+    "Noto Sans",
+    "Noto Serif",
+    "Roboto",
+    "Ubuntu",
+]
+
+_MAC_FONT_STACK = [
+    "Arial",
+    "Courier New",
+    "Georgia",
+    "Helvetica Neue",
+    "Menlo",
+    "Monaco",
+    "San Francisco",
+    "Times New Roman",
+    "Verdana",
+]
+
 
 def _digest_bytes(*parts: object, length: int = 32) -> bytes:
     material = "|".join(_compact_json(part) if isinstance(part, (dict, list, tuple)) else str(part) for part in parts)
@@ -272,7 +336,7 @@ def _stable_ratio(*parts: object) -> float:
     return int.from_bytes(raw, "big") / float(2**64 - 1)
 
 
-def _weighted_choice(seed_parts: tuple[object, ...], choices: list[tuple[object, int]]):
+def _weighted_choice(seed_parts: tuple[object, ...], choices: Sequence[tuple[_T, int]]) -> _T:
     total = sum(max(0, weight) for _, weight in choices)
     if total <= 0:
         return choices[0][0]
@@ -285,7 +349,7 @@ def _weighted_choice(seed_parts: tuple[object, ...], choices: list[tuple[object,
     return choices[-1][0]
 
 
-def _gpu_family(profile: dict) -> str:
+def _gpu_family(profile: Mapping[str, Any]) -> str:
     text = f"{profile.get('gpu_vendor', '')} {profile.get('gpu_renderer', '')}".lower()
     if "nvidia" in text or "geforce" in text or "rtx" in text or "gtx" in text:
         return "nvidia"
@@ -294,16 +358,69 @@ def _gpu_family(profile: dict) -> str:
     return "intel"
 
 
-def _font_stack_for_profile(profile: dict) -> list[str]:
+def _font_stack_for_profile(profile: Mapping[str, Any]) -> list[str]:
     platform = str(profile.get("platform") or "").lower()
     if "win" in platform:
         return list(_WINDOWS_FONT_STACK)
-    # The default profile is Windows.  Keep the fallback conservative rather
-    # than inventing a second OS family with inconsistent UA/client hints.
-    return list(_WINDOWS_FONT_STACK)
+    if "mac" in platform:
+        return list(_MAC_FONT_STACK)
+    return list(_LINUX_FONT_STACK)
 
 
-def _js_heap_limit_for_profile(profile: dict, salt: str) -> int:
+def _random_chrome_full_version() -> str:
+    total = sum(weight for _version, weight in _CHROME_VERSION_CHOICES)
+    point = random.randint(1, total)
+    upto = 0
+    for version, weight in _CHROME_VERSION_CHOICES:
+        upto += weight
+        if point <= upto:
+            return version
+    return _CHROME_VERSION_CHOICES[-1][0]
+
+
+def _chrome_major_from_version(version: str, default: int = 150) -> int:
+    try:
+        return int(str(version).split(".", 1)[0])
+    except Exception:
+        return default
+
+
+def _user_agent_with_chrome_version(base_user_agent: str, chrome_full_version: str) -> str:
+    if not base_user_agent:
+        base_user_agent = USER_AGENT
+    return re.sub(
+        r"((?:Chrome|Chromium|HeadlessChrome)/)[0-9.]+",
+        rf"\g<1>{chrome_full_version}",
+        base_user_agent,
+    )
+
+
+def _value_is_present(value: object) -> bool:
+    return value is not None and value != ""
+
+
+def _float_or(value: object, fallback: float) -> float:
+    if isinstance(value, (str, int, float)) and _value_is_present(value):
+        try:
+            return float(value)
+        except Exception:
+            pass
+    return fallback
+
+
+def _bool_or(value: object, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in {"1", "true", "yes", "on"}:
+            return True
+        if text in {"0", "false", "no", "off"}:
+            return False
+    return default
+
+
+def _js_heap_limit_for_profile(profile: Mapping[str, Any], salt: str) -> int:
     device_memory = int(profile.get("device_memory") or 8)
     # 64-bit desktop Chromium commonly exposes values around 4.29-4.49GB via
     # performance.memory.jsHeapSizeLimit.  Pick a stable bucket for the whole
@@ -323,7 +440,7 @@ def _js_heap_limit_for_profile(profile: dict, salt: str) -> int:
     return int(_weighted_choice(("jsHeapSizeLimit", salt, profile.get("chrome_major")), choices))
 
 
-def _build_device_fingerprint(profile: dict, screen: dict, viewport: dict) -> dict:
+def _build_device_fingerprint(profile: Mapping[str, Any], screen: Mapping[str, Any], viewport: Mapping[str, Any]) -> JsonDict:
     """Build coherent synthetic values for the fields sent by FraudNet.
 
     These values still come from Python, but they are now derived from one
@@ -388,6 +505,7 @@ def _build_device_fingerprint(profile: dict, screen: dict, viewport: dict) -> di
     total_heap = int(max(used_heap + 18_000_000, 56_000_000 + _stable_ratio("heap:total", salt) * 42_000_000))
 
     return {
+        "source": str(profile.get("fingerprint_source") or "random"),
         "device_salt": salt,
         "canvas_h": canvas_h,
         "cv_sig": cv_sig,
@@ -428,6 +546,12 @@ def _normalize_fingerprint_source(source: str | None = None) -> str:
         "roxy_browser": "roxy",
         "roxybrowser": "roxy",
         "browser": "roxy",
+        "headless": "headless",
+        "headless_optimized": "headless",
+        "optimized_headless": "headless",
+        "local_headless": "headless",
+        "playwright": "headless",
+        "local_playwright": "headless",
         "auto": "auto",
     }
     return aliases.get(value, "random")
@@ -471,31 +595,45 @@ def _roxy_fallback_to_random_enabled() -> bool:
     return value in {"", "1", "true", "yes", "on", "random", "program", "python", "synthetic"}
 
 
-def _generate_synthetic_runtime_profile() -> dict:
+def _headless_fallback_to_random_enabled() -> bool:
+    value = (
+        _load_dotenv_value("PAYPAL_HEADLESS_FINGERPRINT_FALLBACK")
+        or _load_dotenv_value("PAYPAL_LOCAL_HEADLESS_FINGERPRINT_FALLBACK")
+        or _load_dotenv_value("PAYPAL_FINGERPRINT_FALLBACK")
+        or "random"
+    ).strip().lower()
+    strict = _load_dotenv_value("PAYPAL_HEADLESS_FINGERPRINT_STRICT").strip().lower()
+    if strict in {"1", "true", "yes", "on"}:
+        return False
+    return value in {"", "1", "true", "yes", "on", "random", "program", "python", "synthetic"}
+
+
+def _generate_synthetic_runtime_profile() -> JsonDict:
     """Generate one stable synthetic browser/device profile for a single protocol run."""
-    chrome_major = int(BROWSER_PROFILE.get("chrome_major") or 150)
-    chrome_full_version = str(
-        BROWSER_PROFILE.get("chrome_full_version")
-        or f"{chrome_major}.0.0.0"
-    )
     randomize = os.getenv(
         "PAYPAL_RANDOMIZE_BROWSER_PROFILE",
-        "0",
-    ).strip().lower() in {"1", "true", "yes", "on"}
-    screen_choices = [
-        {"width": 1536, "height": 864, "availWidth": 1536, "availHeight": 864},
-        {"width": 1920, "height": 1080, "availWidth": 1920, "availHeight": 1040},
-        {"width": 1600, "height": 900, "availWidth": 1600, "availHeight": 860},
-        {"width": 1366, "height": 768, "availWidth": 1366, "availHeight": 728},
-    ]
+        "1",
+    ).strip().lower() not in {"0", "false", "no", "off", "fixed", "disabled", "disable"}
     if randomize:
-        screen = random.choice(screen_choices).copy()
+        chrome_full_version = _random_chrome_full_version()
+        chrome_major = _chrome_major_from_version(chrome_full_version)
+    else:
+        chrome_major = int(BROWSER_PROFILE.get("chrome_major") or 150)
+        chrome_full_version = str(
+            BROWSER_PROFILE.get("chrome_full_version")
+            or f"{chrome_major}.0.0.0"
+        )
+    if randomize:
+        screen = _random_mainstream_screen()
         screen.update({"colorDepth": 24, "pixelDepth": 24})
-        viewport = {
-            "width": max(1000, screen["width"] - random.randint(120, 360)),
-            "height": max(650, screen["height"] - random.randint(140, 260)),
+        screen_width = cast(int, screen["width"])
+        screen_height = cast(int, screen["height"])
+        avail_height = cast(int, screen.get("availHeight") or screen_height)
+        viewport: JsonDict = {
+            "width": max(980, min(screen_width - 16, screen_width - random.randint(120, 360))),
+            "height": max(560, min(avail_height - 40, screen_height - 96, avail_height - random.randint(70, 170))),
         }
-        gpu = random.choice(_GPU_PROFILES).copy()
+        gpu: JsonDict = random.choice(_GPU_PROFILES).copy()
         hardware_concurrency = random.choice([4, 6, 8, 8, 12])
         device_pixel_ratio = random.choice([1, 1.25, 1.5, 2])
         connection_rtt = str(random.choice([100, 125, 150, 175, 200]))
@@ -514,14 +652,15 @@ def _generate_synthetic_runtime_profile() -> dict:
         connection_rtt = str(BROWSER_PROFILE.get("connection_rtt") or "150")
         connection_downlink = str(BROWSER_PROFILE.get("connection_downlink") or "10")
     device_memory = int(BROWSER_PROFILE.get("device_memory") or 8)
-    profile = dict(BROWSER_PROFILE)
+    profile: JsonDict = dict(BROWSER_PROFILE)
     profile.update(gpu)
+    user_agent = _user_agent_with_chrome_version(str(BROWSER_PROFILE.get("user_agent") or USER_AGENT), chrome_full_version)
     profile.update(
         {
             "fingerprint_source": "random",
             "chrome_major": chrome_major,
             "chrome_full_version": chrome_full_version,
-            "user_agent": BROWSER_PROFILE.get("user_agent") or USER_AGENT,
+            "user_agent": user_agent,
             "device_memory": device_memory,
             "hardware_concurrency": hardware_concurrency,
             "device_pixel_ratio": device_pixel_ratio,
@@ -543,7 +682,7 @@ def generate_runtime_profile(
     *,
     roxy_proxy_url: str | None = None,
     keep_roxy_browser: bool = False,
-) -> dict:
+) -> JsonDict:
     """Generate one stable browser/device profile for a single protocol run.
 
     `source` can be:
@@ -551,7 +690,8 @@ def generate_runtime_profile(
       - roxy/browser: RoxyBrowser Local API + CDP runtime capture;
       - auto: Roxy when API key is configured, otherwise random.
     """
-    selected = _normalize_fingerprint_source(source)
+    requested = _normalize_fingerprint_source(source)
+    selected = requested
     if selected == "auto":
         try:
             from paypal.roxy_fingerprint import configured_roxy_api_key
@@ -583,12 +723,56 @@ def generate_runtime_profile(
             )
             return runtime
         except Exception as exc:
+            fallback_configured = bool(
+                _load_dotenv_value("PAYPAL_ROXY_FINGERPRINT_FALLBACK")
+                or _load_dotenv_value("PAYPAL_FINGERPRINT_FALLBACK")
+            )
+            if requested == "roxy" and not fallback_configured:
+                raise
             if not _roxy_fallback_to_random_enabled():
                 raise
             try:
                 from loguru import logger
 
                 logger.warning("Roxy fingerprint unavailable; falling back to program random: {}", exc)
+            except Exception:
+                pass
+
+    if selected == "headless":
+        try:
+            from loguru import logger
+            from paypal.local_headless import capture_runtime_fingerprint_with_local_headless
+
+            logger.info("Generating browser fingerprint from local headless runtime...")
+            headless_seed = _generate_synthetic_runtime_profile()
+            runtime = capture_runtime_fingerprint_with_local_headless(
+                proxy_url=roxy_proxy_url or "",
+                browser_profile=cast(JsonDict, headless_seed["browser_profile"]),
+                screen=cast(JsonDict, headless_seed["screen"]),
+                viewport=cast(JsonDict, headless_seed["viewport"]),
+            )
+            browser_profile = cast(dict[str, object], runtime["browser_profile"])
+            screen = cast(dict[str, object], runtime["screen"])
+            viewport = cast(dict[str, object], runtime["viewport"])
+            device_fingerprint = cast(dict[str, object], runtime["device_fingerprint"])
+            browser_profile["fingerprint_source"] = "headless"
+            device_fingerprint["source"] = "headless"
+            logger.info(
+                "Local headless fingerprint captured: ua={} screen={}x{} viewport={}x{}",
+                str(browser_profile.get("user_agent") or "")[:80],
+                screen.get("width"),
+                screen.get("height"),
+                viewport.get("width"),
+                viewport.get("height"),
+            )
+            return runtime
+        except Exception as exc:
+            if not _headless_fallback_to_random_enabled():
+                raise
+            try:
+                from loguru import logger
+
+                logger.warning("Local headless fingerprint unavailable; falling back to program random: {}", exc)
             except Exception:
                 pass
 
@@ -621,32 +805,36 @@ def ensure_runtime_profile(
         state.fingerprint_source = str(runtime["browser_profile"].get("fingerprint_source") or source or "")
 
 
-def _state(session):
+def _state(session: object | None) -> object | None:
     return getattr(session, "state", None)
 
 
-def _profile(session=None) -> dict:
+def _profile(session: object | None = None) -> JsonDict:
     state = _state(session)
-    return (getattr(state, "browser_profile", None) if state else None) or BROWSER_PROFILE
+    profile = (getattr(state, "browser_profile", None) if state else None) or BROWSER_PROFILE
+    return cast(JsonDict, profile)
 
 
-def _screen(session=None) -> dict:
+def _screen(session: object | None = None) -> JsonDict:
     state = _state(session)
-    return (getattr(state, "screen", None) if state else None) or SCREEN
+    screen = (getattr(state, "screen", None) if state else None) or SCREEN
+    return cast(JsonDict, screen)
 
 
-def _viewport(session=None) -> dict:
+def _viewport(session: object | None = None) -> JsonDict:
     state = _state(session)
-    return (getattr(state, "viewport", None) if state else None) or VIEWPORT
+    viewport = (getattr(state, "viewport", None) if state else None) or VIEWPORT
+    return cast(JsonDict, viewport)
 
 
-def _dfp(session=None) -> dict:
+def _dfp(session: object | None = None) -> JsonDict:
     state = _state(session)
-    return (getattr(state, "device_fingerprint", None) if state else None) or {}
+    dfp = (getattr(state, "device_fingerprint", None) if state else None) or {}
+    return cast(JsonDict, dfp)
 
 
-def _user_agent(session=None) -> str:
-    return _profile(session).get("user_agent") or USER_AGENT
+def _user_agent(session: object | None = None) -> str:
+    return str(_profile(session).get("user_agent") or USER_AGENT)
 
 
 def _rdt_string(chunks: int | None = None) -> str:
@@ -670,7 +858,7 @@ def _risk_sequence(app_id: str) -> str:
     return "3"
 
 
-def _browser_timezone(session=None) -> tuple[int, str, bool]:
+def _browser_timezone(session: object | None = None) -> tuple[int, str, bool]:
     # Keep DA/FraudNet timezone aligned with the BR checkout locale/IP profile.
     profile = _profile(session)
     return (
@@ -680,7 +868,7 @@ def _browser_timezone(session=None) -> tuple[int, str, bool]:
     )
 
 
-def _nav_timing(now_ms: int) -> dict:
+def _nav_timing(now_ms: int) -> JsonDict:
     nav_start = now_ms - random.randint(3_500, 9_500)
     fetch_start = nav_start + random.randint(1, 6)
     dns_start = fetch_start + random.randint(1, 8)
@@ -718,7 +906,7 @@ def _nav_timing(now_ms: int) -> dict:
     }
 
 
-def _window_payload(session=None) -> dict:
+def _window_payload(session: object | None = None) -> JsonDict:
     # Keep viewport stable across all FraudNet appIds in one protocol run.
     # A real browser does not materially change window geometry between the
     # ModXO, signup and Hermes pages.
@@ -735,13 +923,14 @@ def _window_payload(session=None) -> dict:
     }
 
 
-def _build_p1_payload(session, correlation_id: str, app_id: str, page_url: str, page_referer: str) -> dict:
+def _build_p1_payload(session: object, correlation_id: str, app_id: str, page_url: str, page_referer: str) -> JsonDict:
     now_ms = int(time.time() * 1000)
     profile = _profile(session)
     screen = _screen(session)
     user_agent = _user_agent(session)
     tz, tz_name, dst = _browser_timezone(session)
     rtt = str(profile["connection_rtt"])
+    webdriver = _bool_or(_dfp(session).get("navigator_webdriver"), False)
     return {
         "trt": False,
         "connectionData": {
@@ -802,21 +991,29 @@ def _build_p1_payload(session, correlation_id: str, app_id: str, page_url: str, 
             "ph2": _random_hex(64),
             "o": ["ua", "colorDepth", "width", "tz", "time", "appId", "correlationId", _risk_sequence(app_id)],
         },
-        "hlb": {"wd": False, "chromeWSRT": False, "plgSize": len(PDF_PLUGINS), "lgSize": 2, "rtt": rtt},
+        "hlb": {"wd": webdriver, "chromeWSRT": False, "plgSize": len(PDF_PLUGINS), "lgSize": 2, "rtt": rtt},
         "pkc": {"uvpa": 3, "cma": 3, "cc": 3, "ht": 3, "pkp": 3},
     }
 
 
-def _build_p2_payload(session, page_url: str) -> dict:
+def _build_p2_payload(session: object, page_url: str) -> JsonDict:
     now_ms = int(time.time() * 1000)
     profile = _profile(session)
     dfp = _dfp(session)
-    js_mem_base = dfp.get("js_memory") if isinstance(dfp.get("js_memory"), dict) else {}
-    used_heap = int(js_mem_base.get("used") or random.randint(18_000_000, 42_000_000))
-    total_heap = int(js_mem_base.get("total") or random.randint(56_000_000, 98_000_000))
-    used_heap = used_heap + random.randint(0, 3_000_000)
-    total_heap = max(total_heap, used_heap + random.randint(14_000_000, 38_000_000))
-    timings = dfp.get("timings") if isinstance(dfp.get("timings"), dict) else {}
+    raw_js_mem = dfp.get("js_memory")
+    js_mem_base = cast(JsonDict, raw_js_mem) if isinstance(raw_js_mem, dict) else {}
+    used_heap_value = js_mem_base.get("used")
+    total_heap_value = js_mem_base.get("total")
+    has_used_heap = _value_is_present(used_heap_value)
+    has_total_heap = _value_is_present(total_heap_value)
+    used_heap = int(cast(str | int | float, used_heap_value)) if has_used_heap else random.randint(18_000_000, 42_000_000)
+    total_heap = int(cast(str | int | float, total_heap_value)) if has_total_heap else random.randint(56_000_000, 98_000_000)
+    if not has_used_heap:
+        used_heap += random.randint(0, 3_000_000)
+    if not has_total_heap:
+        total_heap = max(total_heap, used_heap + random.randint(14_000_000, 38_000_000))
+    raw_timings = dfp.get("timings")
+    timings = cast(JsonDict, raw_timings) if isinstance(raw_timings, dict) else {}
     return {
         "URL": page_url,
         "tnt": "PP",
@@ -825,7 +1022,7 @@ def _build_p2_payload(session, page_url: str) -> dict:
             "cv": {
                 "h": dfp.get("canvas_h") or "D//3CNWpwAAAAGSURBVAMAvazvNp9EI5cAAAAASUVORK5CYII=",
                 "f": 1,
-                "t": f"{int(float(timings.get('tt_canvas') or random.randint(2, 29))):.2f}",
+                "t": f"{int(_float_or(timings.get('tt_canvas'), float(random.randint(2, 29)))):.2f}",
             },
             "vm": {
                 "cores": profile["hardware_concurrency"],
@@ -851,7 +1048,7 @@ def _build_p2_payload(session, page_url: str) -> dict:
     }
 
 
-def _build_w_payload() -> dict:
+def _build_w_payload() -> JsonDict:
     slt = random.randint(70, 330)
     return {
         "pkc": {"uvpa": 2, "cma": 1, "cc": 3, "ht": 3, "pkp": 3},
@@ -862,16 +1059,19 @@ def _build_w_payload() -> dict:
     }
 
 
-def _build_pa_payload(session, correlation_id: str, app_id: str) -> list[dict]:
+def _build_pa_payload(session: object, correlation_id: str, app_id: str) -> list[JsonDict]:
     profile = _profile(session)
     dfp = _dfp(session)
-    timings = dfp.get("timings") if isinstance(dfp.get("timings"), dict) else {}
-    tt_dfp = float(timings.get("tt_dfp") or random.uniform(20.0, 42.0))
-    tt_canvas = float(timings.get("tt_canvas") or max(6.0, tt_dfp - random.uniform(0.3, 2.5)))
-    tt_webgl_basic = float(timings.get("tt_webgl_basic") or random.uniform(7.5, 20.5))
-    tt_webgl_ext = float(timings.get("tt_webgl_ext") or random.uniform(10.0, 25.0))
-    tt_storage = float(timings.get("tt_storage") if "tt_storage" in timings else random.choice([0, 0.09999999776482582]))
-    tt_math = float(timings.get("tt_math") if "tt_math" in timings else random.choice([0.10000000149011612, 0.19999999925494194]))
+    raw_timings = dfp.get("timings")
+    timings = cast(JsonDict, raw_timings) if isinstance(raw_timings, dict) else {}
+    tt_dfp = _float_or(timings.get("tt_dfp"), random.uniform(20.0, 42.0))
+    tt_canvas = _float_or(timings.get("tt_canvas"), max(6.0, tt_dfp - random.uniform(0.3, 2.5)))
+    tt_webgl_basic = _float_or(timings.get("tt_webgl_basic"), random.uniform(7.5, 20.5))
+    tt_webgl_ext = _float_or(timings.get("tt_webgl_ext"), random.uniform(10.0, 25.0))
+    storage_value = timings.get("tt_storage") if "tt_storage" in timings else random.choice([0, 0.09999999776482582])
+    math_value = timings.get("tt_math") if "tt_math" in timings else random.choice([0.10000000149011612, 0.19999999925494194])
+    tt_storage = float(storage_value or 0)
+    tt_math = float(math_value or 0)
     return [{
         "dfp": [{
             "d": {
@@ -929,7 +1129,7 @@ def build_fn_sync_data(
     now_ms = int(time.time() * 1000)
     screen = _screen(session)
     user_agent = _user_agent(session)
-    data = {
+    data: JsonDict = {
         "SC_VERSION": "0.1.13" if source.startswith("IWC_NEXT_CHECKOUT") else "2.0.4",
         "syncStatus": "data",
         "f": correlation_id,
@@ -1043,7 +1243,7 @@ def send_device_fingerprint(
         except Exception as e:
             logger.debug(f"Fingerprint p3 failed: {e}")
 
-    endpoints = [
+    endpoints: list[tuple[str, object]] = [
         ("p1", _build_p1_payload(session, correlation_id, app_id, page_url, page_referer)),
         ("p2", _build_p2_payload(session, page_url)),
         ("w", _build_w_payload()),
@@ -1080,8 +1280,9 @@ def send_signup_field_events(
     """Emit FraudNet field timing beacons for a form."""
     from loguru import logger
 
-    referer = referer or getattr(session.state, "signup_url", "") or "https://www.paypal.com/"
-    headers = _risk_headers(referer, content_type=None)
+    state = getattr(session, "state", None)
+    resolved_referer = referer or getattr(state, "signup_url", "") or "https://www.paypal.com/"
+    headers = _risk_headers(str(resolved_referer), content_type=None)
     elapsed = random.randint(650, 1600)
     for field_id in field_ids:
         payload = {

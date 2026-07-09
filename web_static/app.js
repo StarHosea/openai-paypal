@@ -91,7 +91,7 @@ function renderJobs(jobs) {
         <span class="badge ${esc(job.status)}">${esc(job.status)}</span>
       </div>
       <div class="job-sub">${esc(job.stage || "")}</div>
-      <div class="job-sub">${esc(job.ba_token || "")} · ${esc(fmtTime(job.created_at))} · ${esc(job.proxy_enabled ? (job.proxy_label || "代理开") : "代理关")} · FP:${esc(job.fingerprint_source || "-")} · DD:${esc(job.datadome_mode || "-")} · MTR:${esc(job.mtr_runtime || "-")} · Risk:${esc(job.risk_signals_mode || "-")}${job.record_traffic ? " · 发包记录开" : ""}</div>
+      <div class="job-sub">${esc(job.ba_token || "")} · ${esc(fmtTime(job.created_at))} · ${esc(job.proxy_enabled ? (job.proxy_label || "代理开") : "代理关")} · SMS:${esc(job.sms_provider || "manual")} · FP:${esc(job.fingerprint_source || "-")} · DD:${esc(job.datadome_mode || "-")} · MTR:${esc(job.mtr_runtime || "-")}${job.record_traffic ? " · 发包记录开" : ""}</div>
     </div>`).join("");
   box.querySelectorAll(".job-item").forEach(item => {
     item.addEventListener("click", () => selectJob(item.dataset.jobId));
@@ -113,6 +113,13 @@ function syncTrafficFields() {
   $("#compareRoxyWrap").classList.toggle("hidden", !enabled);
   $("#trafficDir").disabled = !enabled;
   $("#compareRoxyCapture").disabled = !enabled;
+}
+
+function syncSmsFields() {
+  const enabled = $("#smsbowerEnabled").checked;
+  const phone = $("#phone");
+  phone.required = !enabled;
+  phone.placeholder = enabled ? "SMSBower 自动获取，可留空" : "+5591980133818";
 }
 
 function selectJob(jobId) {
@@ -140,7 +147,7 @@ function renderCurrent(job) {
   const trafficMeta = job.record_traffic
     ? ` · 发包记录：${job.traffic_dir || "准备中"}${job.traffic_report_json ? " · 已生成差异报告" : ""}`
     : "";
-  const runtimeMeta = ` · FP:${job.fingerprint_source || "-"} · DD:${job.datadome_mode || "-"} · MTR:${job.mtr_runtime || "-"} · Risk:${job.risk_signals_mode || "-"}`;
+  const runtimeMeta = ` · SMS:${job.sms_provider || "manual"} · FP:${job.fingerprint_source || "-"} · DD:${job.datadome_mode || "-"} · MTR:${job.mtr_runtime || "-"}`;
   $("#currentMeta").textContent = `#${job.id} · 创建于 ${fmtTime(job.created_at)} · ${job.proxy_label || "代理关闭"}${runtimeMeta}${trafficMeta}`;
   $("#jobStatus").textContent = job.status;
   $("#jobStage").textContent = job.stage || "";
@@ -191,7 +198,7 @@ async function startJob(evt) {
   evt.preventDefault();
   const btn = $("#startBtn");
   const proxyEnabled = $("#proxyEnabled").checked;
-  const proxyMode = $("#proxyMode").value || "configured";
+  const proxyMode = $("#proxyMode").value || "environment";
   const proxyUrl = proxyEnabled && proxyMode === "custom" ? $("#proxyUrl").value.trim() : "";
   const recordTraffic = $("#recordTraffic").checked || Boolean($("#compareRoxyCapture").value.trim());
   if (proxyEnabled && proxyMode === "custom" && !proxyUrl) {
@@ -207,8 +214,9 @@ async function startJob(evt) {
       body: JSON.stringify({
         ba_token: $("#baToken").value,
         phone: $("#phone").value,
+        sms_provider: $("#smsbowerEnabled").checked ? "smsbower" : "manual",
         max_card_attempts: Number($("#maxCardAttempts").value || 5),
-        max_flow_attempts: Number($("#maxFlowAttempts").value || 3),
+        max_flow_attempts: Number($("#maxFlowAttempts").value || 1),
         max_authorize_attempts: Number($("#maxAuthorizeAttempts").value || 3),
         card_retry_delay_seconds: Number($("#cardRetryDelay").value || 6),
         card_retry_jitter_seconds: Number($("#cardRetryJitter").value || 2),
@@ -216,10 +224,9 @@ async function startJob(evt) {
         proxy_enabled: proxyEnabled,
         proxy_mode: proxyMode,
         proxy_url: proxyUrl,
-        fingerprint_source: $("#fingerprintSource").value || "roxy",
-        datadome_mode: $("#datadomeMode").value || "roxy",
-        mtr_runtime: $("#mtrRuntime").value || "roxy",
-        risk_signals_mode: $("#riskSignalsMode").value || "roxy",
+        fingerprint_source: $("#fingerprintSource").value || "headless",
+        datadome_mode: $("#datadomeMode").value || "headless",
+        mtr_runtime: $("#mtrRuntime").value || "headless",
         record_traffic: recordTraffic,
         traffic_dir: recordTraffic ? $("#trafficDir").value.trim() : "",
         compare_roxy_capture: recordTraffic ? $("#compareRoxyCapture").value.trim() : "",
@@ -274,8 +281,10 @@ function bind() {
   $("#proxyMode").addEventListener("change", syncProxyFields);
   $("#recordTraffic").addEventListener("change", syncTrafficFields);
   $("#compareRoxyCapture").addEventListener("input", syncTrafficFields);
+  $("#smsbowerEnabled").addEventListener("change", syncSmsFields);
   syncProxyFields();
   syncTrafficFields();
+  syncSmsFields();
 }
 
 bind();

@@ -1,6 +1,6 @@
 USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36"
+    "(KHTML, like Gecko) Chrome/150.0.7871.46 Safari/537.36"
 )
 
 SCREEN = {
@@ -12,7 +12,7 @@ SCREEN = {
     "availWidth": 1536,
 }
 
-VIEWPORT = {"width": 567, "height": 700}
+VIEWPORT = {"width": 1365, "height": 768}
 
 # Keep every synthetic browser signal on the same regional/device profile.
 # The checkout flow is hard-coded for Brazil, so timezone, locale, analytics,
@@ -52,21 +52,11 @@ TEALEAF_APP_KEY = "76938917d7504ff7a962174c021690bd"
 HCAPTCHA_SITEKEY = "884d15d9-b649-4bbb-8d1c-2d6f0eed75eb"
 
 
-# 1024proxy 动态代理池。格式：host:port:username:password
-# 单个链式代理也可用 PAYPAL_PROXY_URL=http://user:pass@host:port 配置。
-# 默认不启用；生产环境不要把代理账号密码写入代码仓库。
-# 如需启用，请通过环境变量 PAYPAL_PROXY_POOL 或 PAYPAL_PROXY_URL 注入：
-#   PAYPAL_PROXY_ENABLED=1
-#   PAYPAL_PROXY_POOL='host:port:username:password,host2:port:username:password'
-# 或在部署平台的 secret manager 中配置同名变量。
-PROXY_ENABLED = False
-PROXY_POOL: list[str] = []
-
-
 # 浏览器指纹来源：
 #   "random" 继续使用程序内合成的随机/模板指纹；
 #   "roxy"   通过 RoxyBrowser Local API 创建随机指纹窗口，再从真实 Chromium
 #            runtime 读取 canvas/WebGL/audio/heap/screen/UA 等信号；
+#   "headless" 使用本机 Playwright headless Chromium 读取 runtime 信号；
 #   "auto"   当配置了 Roxy API key 时优先 Roxy，否则回退 random。
 # 运行时可用 PAYPAL_FINGERPRINT_SOURCE 覆盖。
 FINGERPRINT_SOURCE = "random"
@@ -78,6 +68,7 @@ FINGERPRINT_SOURCE = "random"
 ROXY_API_HOST = "127.0.0.1"
 ROXY_API_PORT = 50000
 ROXY_API_KEY = ""
+# Roxy Local API 的 /browser/open 支持 headless 字段；Roxy 模式默认使用无头模式。
 ROXY_HEADLESS = True
 
 # 可选：固定 workspace/project；为空时自动读取 /browser/workspace 第一项。
@@ -90,6 +81,7 @@ ROXY_PROJECT_ID: int | None = None
 #              datadome cookie 时注入 x-datadome-clientid；
 #   "roxy"     使用上面同一个 Roxy 指纹浏览器加载 PayPal/DataDome，让真实
 #              Chrome runtime 执行 ddbm2/paypal challenge 链并回灌 cookie；
+#   "headless" 使用本机 Playwright headless Chromium 执行 DataDome 链；
 #   "auto"     遇到 403/authchallenge 或缺 cookie 时优先 Roxy，失败后回退 protocol；
 #   "off"      不主动处理 DataDome。
 # 运行时可用 PAYPAL_DATADOME_MODE 覆盖。
@@ -102,6 +94,7 @@ DATADOME_ROXY_WAIT_SECONDS = 12.0
 #   "roxy"             使用同一个 Roxy 指纹浏览器加载 PayPal 页面/dfp.js，
 #                      监听真实 `/mtr/.../x0` 和 `/mtr/...` POST 响应并回灌
 #                      requestId/sealedResult/cookies；
+#   "headless"         使用本机 Playwright headless Chromium 执行 dfp.js；
 #   "auto"             优先 roxy，失败后回退 python_generated；
 #   "off"              不发送 MTR。
 # 运行时可用 PAYPAL_MTR_RUNTIME 覆盖。
@@ -118,13 +111,11 @@ MTR_CHANNEL = "iwc-mxo"
 MTR_API_KEY = ""
 
 
-# Phase 1 风控信号来源：
-#   "protocol" 保留原来的 Python 协议层 p3/p1/p2/w、identity/di/log、
-#              Tealeaf、Datadog RUM 模板提交；
-#   "roxy"     使用同一个 Roxy 指纹浏览器加载 PayPal 页面，让真实 Chrome
-#              runtime 自然执行 FraudNet/DFP/Tealeaf/Datadog 链，并回灌
-#              cookies；不再发送 Python 合成风险包；
-#   "auto"     优先 roxy，Roxy 不可用时回退 protocol。
+# signup-context browser risk 来源。主流程已移除独立 Phase 1 风控信号步骤。
+#   "roxy"     使用同一个 Roxy 指纹浏览器执行 signup-context browser risk；
+#   "headless" 使用本机 Playwright headless Chromium；
+#   "auto"     优先 roxy，Roxy 不可用时回退 headless。
 # 运行时可用 PAYPAL_RISK_SIGNALS_MODE 覆盖。
+# PAYPAL_ENABLE_SIGNUP_CONTEXT_RISK 是旧开关，不再允许关闭 Step 3 风控。
 RISK_SIGNALS_MODE = "protocol"
 RISK_ROXY_WAIT_SECONDS = 18.0

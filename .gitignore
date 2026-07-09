@@ -8,6 +8,8 @@ cdk_keys.json
 cdk_keys.txt
 .env
 cache/
+var/
+debug/
 
 # Local captures often contain URLs/tokens and page data
 captures/

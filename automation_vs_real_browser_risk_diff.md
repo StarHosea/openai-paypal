@@ -158,10 +158,9 @@ Datadog 方面，真实浏览器会有 resource count、long task、view/action�
 当前 `flow.py` 是阶段式：
 
 1. `_phase0_initial_load()` 加载入口。
-2. `_phase1_risk_controls()` 连续发送风险包。
-3. `_phase2_create_account()` 连续推进 ModXO 和 signup warm-up。
-4. `_phase3_signup_and_2fa()` 等待命令行 OTP，再批量 Tealeaf/Datadog/action/signUp。
-5. `_phase4_authorize()` 加载 Hagrid 后 authorize。
+2. `_phase2_create_account()` 连续推进 ModXO 和 signup warm-up。
+3. `_phase3_signup_and_2fa()` 等待命令行 OTP，再批量 Tealeaf/Datadog/action/signUp。
+4. `_phase4_authorize()` 加载 Hagrid 后 authorize。
 
 这种阶段式补包在功能上清楚，但和真实浏览器 waterfall 的并发、资源依赖、微小失败、缓存、重试、visibility/page lifecycle 差别很大。
 
