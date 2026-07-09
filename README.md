@@ -44,7 +44,13 @@ python -m playwright install chromium
 
 ## 配置 `.env`
 
-在项目根目录创建 `.env`，按实际环境填写。不要提交 `.env`。
+可以先复制示例配置：
+
+```bash
+cp .env.example .env
+```
+
+然后按实际环境填写 `.env`。不要提交真实 `.env`。
 
 ### 推荐生产配置：本地 headless
 
