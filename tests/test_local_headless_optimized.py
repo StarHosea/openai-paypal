@@ -676,6 +676,78 @@ def test_roxy_session_close_unroutes_network_handler_and_closes_owned_page() -> 
     assert session._owned_pages == []
 
 
+def test_roxy_datadome_phase0_preflight_returns_without_prewarm_or_cookie_wait(monkeypatch: Any) -> None:
+    approval_url = "https://www.paypal.com/agreements/approve?ba_token=BA-TEST"
+
+    class FakeResponse:
+        def __init__(self, status: int) -> None:
+            self.status = status
+
+    class FakePage:
+        def __init__(self, status: int, html: str) -> None:
+            self.url = ""
+            self.status = status
+            self.html = html
+            self.goto_calls: list[tuple[str, dict[str, object]]] = []
+            self.timeout_calls: list[float] = []
+
+        def goto(self, url: str, **kwargs: object) -> FakeResponse:
+            self.url = url
+            self.goto_calls.append((url, dict(kwargs)))
+            return FakeResponse(self.status)
+
+        def content(self) -> str:
+            return self.html
+
+        def wait_for_load_state(self, _state: str, **_kwargs: object) -> None:
+            return None
+
+        def wait_for_timeout(self, timeout: float) -> None:
+            self.timeout_calls.append(timeout)
+
+        def on(self, _event: str, _callback: Callable[[object], None]) -> None:
+            return None
+
+    class FakeContext:
+        def __init__(self, status: int, html: str) -> None:
+            self.page = FakePage(status, html)
+
+        def new_page(self) -> FakePage:
+            return self.page
+
+        def cookies(self, _urls: list[str]) -> list[dict[str, object]]:
+            return []
+
+    monkeypatch.setattr(local_headless, "headless_datadome_prewarm_enabled", lambda: True)
+
+    for status, html, expected_ok in (
+        (200, "<html><body><main>PayPal agreement</main></body></html>", True),
+        (403, "<html><body>DataDome captcha device_check_redirect_to_slider</body></html>", False),
+    ):
+        session = local_headless.LocalHeadlessSession(
+            roxy_browser={"cdp_info": {"http": "127.0.0.1:9222"}},
+            runtime="roxy",
+        )
+        context = FakeContext(status, html)
+        session._context = context
+        session._browser = object()
+        monkeypatch.setattr(session, "start", lambda: None)
+
+        result = session.solve_datadome(
+            approval_url,
+            wait_seconds=30,
+            accept_clean_page=True,
+        )
+
+        assert result["ok"] is expected_ok
+        assert result["clean_page"] is expected_ok
+        assert result["datadome"] == ""
+        assert context.page.goto_calls == [
+            (approval_url, {"wait_until": "commit", "timeout": 30000}),
+        ]
+        assert context.page.timeout_calls == []
+
+
 def test_roxy_page_keeps_native_fingerprint_without_headless_cdp_override(monkeypatch: Any) -> None:
     calls: list[str] = []
 

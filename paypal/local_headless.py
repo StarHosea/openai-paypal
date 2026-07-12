@@ -2706,11 +2706,31 @@ class LocalHeadlessSession:
                 or _datadome_challenge_present(current_status, current_html)
             )
 
+        def clean_page_present(current_status: int, current_html: str) -> bool:
+            return bool(
+                200 <= current_status < 400
+                and not challenge_present(current_status, current_html)
+            )
+
+        def resolution_present(current_status: int, current_html: str) -> bool:
+            if self._datadome_cookie() and not challenge_present(current_status, current_html):
+                return True
+            # Roxy Phase 0 preflight accepts an already-clean agreement
+            # document.  Do not wait for a DataDome cookie that will never be
+            # issued when the browser was not challenged.
+            return bool(accept_clean_page and clean_page_present(current_status, current_html))
+
         def navigate_once(*, reason: str, target_url: str | None = None) -> None:
             nonlocal status, html
             active_url = target_url or url
             try:
-                response = page.goto(active_url, wait_until="domcontentloaded", timeout=wait_ms)
+                # Roxy can visibly render a clean document before its page
+                # lifecycle reaches ``domcontentloaded``.  A Phase 0
+                # preflight only needs the committed response, then its
+                # normal-document readiness check below; waiting for the full
+                # lifecycle here can otherwise consume the DataDome timeout.
+                wait_until = "commit" if accept_clean_page else "domcontentloaded"
+                response = page.goto(active_url, wait_until=wait_until, timeout=wait_ms)
                 status = int(getattr(response, "status", 0) or 0) if response is not None else status
             except Exception as exc:
                 logger.debug("Local headless DataDome navigation did not finish cleanly: {}", exc)
@@ -2727,7 +2747,7 @@ class LocalHeadlessSession:
                 "networkidle",
                 timeout_ms=min(wait_ms, 3000),
                 max_wait_ms=min(wait_ms, 3000),
-                ready=lambda: bool(self._datadome_cookie()) and not challenge_present(status, read_page_html()),
+                ready=lambda: resolution_present(status, read_page_html()),
                 poll_ms=250,
             )
             html = read_page_html()
@@ -2744,32 +2764,42 @@ class LocalHeadlessSession:
             )
 
         try:
-            if headless_datadome_prewarm_enabled() and not self._datadome_cookie():
+            # Prewarming exists solely to materialize a DataDome cookie.  A
+            # Roxy Phase 0 clean-page preflight accepts the agreement document
+            # itself, so extra root/sign-in navigations only add avoidable
+            # delay.
+            if headless_datadome_prewarm_enabled() and not accept_clean_page and not self._datadome_cookie():
                 for prewarm_url in _headless_datadome_prewarm_urls(url):
                     navigate_once(reason="prewarm", target_url=prewarm_url)
                     if self._datadome_cookie() and not challenge_present(status, html):
                         self._simulate_browser_activity(page, reason="datadome_prewarm")
                         break
             navigate_once(reason="initial")
-            deadline = time.time() + wait_seconds
-            while time.time() < deadline:
-                html = read_page_html()
-                if self._datadome_cookie() and not challenge_present(status, html):
-                    break
-                page.wait_for_timeout(250)
+            # ``accept_clean_page`` is the lightweight Phase 0 probe used by
+            # Roxy.  Whether its first navigation is clean or challenged, do
+            # not turn that probe into a full cookie/reload solve: Phase 0
+            # follows it with the protocol request and invokes the full
+            # ``phase0_403`` solver only when that request really needs it.
+            if not accept_clean_page:
+                deadline = time.time() + wait_seconds
+                while time.time() < deadline:
+                    html = read_page_html()
+                    if resolution_present(status, html):
+                        break
+                    page.wait_for_timeout(250)
 
-            # DataDome often materializes the cookie on a 403 challenge document.
-            # The cookie only becomes useful after the protected URL is loaded
-            # again in the same browser context; treating the intermediate 403
-            # page as final leaves the caller with a challenge-only cookie.
-            reload_attempts = 0
-            while self._datadome_cookie() and challenge_present(status, html) and reload_attempts < 2:
-                reload_attempts += 1
-                self._simulate_browser_activity(page, reason=f"datadome_challenge_before_reload_{reload_attempts}")
-                page.wait_for_timeout(500)
-                navigate_once(reason=f"reload_after_datadome_cookie_{reload_attempts}")
-                if not challenge_present(status, html):
-                    break
+                # DataDome often materializes the cookie on a 403 challenge document.
+                # The cookie only becomes useful after the protected URL is loaded
+                # again in the same browser context; treating the intermediate 403
+                # page as final leaves the caller with a challenge-only cookie.
+                reload_attempts = 0
+                while self._datadome_cookie() and challenge_present(status, html) and reload_attempts < 2:
+                    reload_attempts += 1
+                    self._simulate_browser_activity(page, reason=f"datadome_challenge_before_reload_{reload_attempts}")
+                    page.wait_for_timeout(500)
+                    navigate_once(reason=f"reload_after_datadome_cookie_{reload_attempts}")
+                    if not challenge_present(status, html):
+                        break
         finally:
             self._network_mode = previous_network_mode
 
