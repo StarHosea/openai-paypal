@@ -222,6 +222,18 @@ def build_common_headers(state: SessionState | None = None) -> dict[str, str]:
     ) or BROWSER_PROFILE)
     user_agent = str(profile.get("user_agent") or USER_AGENT)
     language = str(profile.get("language") or "pt-BR")
+    is_ios_webkit = bool(profile.get("is_mobile")) or bool(
+        re.search(r"\b(?:iPhone|iPad|iPod)\b", user_agent, re.I)
+    )
+    if is_ios_webkit:
+        # Roxy's iOS core is WebKit/CriOS. It does not send Chromium UA Client
+        # Hints, so desktop sec-ch-* values would contradict its runtime.
+        language_base = language.split("-", 1)[0].split("_", 1)[0] or "en"
+        return {
+            "User-Agent": user_agent,
+            "Accept": "*/*",
+            "Accept-Language": f"{language},{language_base};q=0.9",
+        }
     return {
         "User-Agent": user_agent,
         "Accept": "*/*",
@@ -239,6 +251,9 @@ def build_high_entropy_hints(state: SessionState | None = None) -> dict[str, str
         if state is not None
         else None
     ) or BROWSER_PROFILE)
+    user_agent = str(profile.get("user_agent") or USER_AGENT)
+    if bool(profile.get("is_ios_webkit")) or re.search(r"\b(?:iPhone|iPad|iPod)\b", user_agent, re.I):
+        return {}
     return {
         "sec-ch-ua-arch": str(profile.get("sec_ch_arch") or '"x86"'),
         "sec-ch-device-memory": str(profile.get("device_memory") or "8"),
@@ -247,6 +262,20 @@ def build_high_entropy_hints(state: SessionState | None = None) -> dict[str, str
             _format_sec_ch_ua(_full_version_ua_brands(profile))
         ),
     }
+
+
+def _default_curl_impersonation(state: SessionState) -> str:
+    """Choose a TLS/HTTP profile compatible with the selected browser state."""
+    configured = os.getenv("PAYPAL_CURL_IMPERSONATE", "").strip()
+    if configured:
+        return configured
+    profile = cast(dict[str, object], getattr(state, "browser_profile", None) or {})
+    user_agent = str(profile.get("user_agent") or "")
+    if bool(profile.get("is_ios_webkit")) or re.search(r"\b(?:iPhone|iPad|iPod)\b", user_agent, re.I):
+        # curl_cffi currently exposes Safari 26.0 for iOS; it is the closest
+        # available TLS/HTTP2 profile to the captured iOS 26.5 browser.
+        return "safari260_ios"
+    return "chrome"
 
 
 # Hints that PayPal's Permissions-Policy delegates to c.paypal.com.
@@ -564,7 +593,7 @@ class PayPalSession:
         if proxy_url:
             client_kwargs["proxy"] = proxy_url
         if self._use_curl:
-            impersonate = os.getenv("PAYPAL_CURL_IMPERSONATE", "chrome").strip() or "chrome"
+            impersonate = _default_curl_impersonation(state)
             curl_session_factory = cast(Any, globals().get("CurlSession"))
             if curl_session_factory is None:
                 raise RuntimeError("curl_cffi is not available")

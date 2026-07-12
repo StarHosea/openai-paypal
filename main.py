@@ -2,7 +2,7 @@
 """PayPal Billing Agreement approval automation.
 
 Usage:
-    python main.py --ba-token BA-xxx --phone +5591980133818
+    python main.py --ba-token BA-xxx --region US --phone +14647681720
 """
 import argparse
 import importlib
@@ -13,6 +13,7 @@ from pathlib import Path
 from loguru import logger
 
 from paypal.models import generate_user, generate_card, generate_address
+from paypal.regions import configured_region_code, get_region, supported_region_codes
 from paypal.flow import PayPalFlow
 from paypal.proxy import build_proxy_config
 from paypal.session import sanitize_for_log
@@ -27,10 +28,11 @@ def _smsbower_enabled() -> bool:
     return bool(getattr(_smsbower_module(), "smsbower_enabled")())
 
 
-def _build_smsbower_provider(enabled: bool, api_key: str | None):
+def _build_smsbower_provider(enabled: bool, api_key: str | None, *, region: str):
     return getattr(_smsbower_module(), "build_smsbower_provider")(
         enabled=enabled,
         api_key=api_key,
+        region=region,
     )
 
 
@@ -45,12 +47,18 @@ def main():
     parser.add_argument(
         "--phone",
         default="",
-        help="Phone number with country code (e.g. +5591980133818)"
+        help="Phone number with country code (US: +14647681720)"
+    )
+    parser.add_argument(
+        "--region",
+        choices=supported_region_codes(),
+        default=configured_region_code("US"),
+        help="Checkout, generated profile and SMS-number region (default: US)",
     )
     parser.add_argument(
         "--smsbower",
         action="store_true",
-        help="Use SMSBower to acquire and receive the PayPal Brazil SMS automatically",
+        help="Use SMSBower to acquire and receive the selected-region PayPal SMS automatically",
     )
     parser.add_argument(
         "--smsbower-api-key",
@@ -133,30 +141,31 @@ def main():
     )
     parser.add_argument(
         "--fingerprint-source",
-        choices=["random", "program", "python", "synthetic", "roxy", "browser", "headless", "local_headless", "playwright", "local_playwright", "auto"],
+        choices=["random", "program", "python", "synthetic", "roxy", "roxy_ios", "browser", "headless", "headless_ios", "local_headless", "playwright", "local_playwright", "auto"],
         default=None,
-        help="Browser fingerprint source: random/program Python generator, roxy RoxyBrowser runtime, local headless Playwright, or auto",
+        help="Browser fingerprint source: random/program Python generator, roxy RoxyBrowser runtime, roxy_ios iPhone/Safari preset, headless_ios local iPhone preset, local headless Playwright, or auto",
     )
     parser.add_argument(
         "--datadome-mode",
-        choices=["protocol", "edge", "roxy", "browser", "headless", "local_headless", "playwright", "local_playwright", "auto", "off"],
+        choices=["protocol", "edge", "roxy", "roxy_ios", "browser", "headless", "headless_ios", "local_headless", "playwright", "local_playwright", "auto", "off"],
         default=None,
         help="DataDome mode: protocol edge simulation, roxy browser runtime, local headless Playwright, auto, or off",
     )
     parser.add_argument(
         "--mtr-runtime",
-        choices=["python_generated", "python", "protocol", "roxy", "browser", "headless", "local_headless", "playwright", "local_playwright", "auto", "block", "off"],
+        choices=["python_generated", "python", "protocol", "roxy", "roxy_ios", "browser", "headless", "headless_ios", "local_headless", "playwright", "local_playwright", "auto", "block", "off"],
         default=None,
         help="MTR sealedResult source: python_generated protocol template, roxy browser runtime, local headless Playwright, auto, block, or off",
     )
     parser.add_argument(
         "--risk-signals-mode",
-        choices=["protocol", "python", "synthetic", "template", "roxy", "browser", "headless", "local_headless", "playwright", "local_playwright", "auto", "off"],
+        choices=["protocol", "python", "synthetic", "template", "roxy", "browser", "headless", "headless_ios", "local_headless", "playwright", "local_playwright", "auto", "off"],
         default=None,
         help="Signup-context browser risk source: roxy browser runtime, local headless Playwright, auto, or off",
     )
 
     args = parser.parse_args()
+    region = get_region(args.region, default="US")
 
     logger.remove()
     if args.debug:
@@ -185,22 +194,28 @@ def main():
     sms_provider = _build_smsbower_provider(
         enabled=sms_provider_requested,
         api_key=args.smsbower_api_key,
+        region=region.code,
     )
     if not args.phone and sms_provider is None:
         parser.error("--phone is required unless --smsbower or SMSBOWER_ENABLED=1 is set")
 
-    user = generate_user(args.phone or "+5500000000000")
-    card = generate_card(proxy_url=proxy_config.url)
-    address = generate_address()
+    user = generate_user(args.phone or region.fallback_phone, region=region.code)
+    card = generate_card(proxy_url=proxy_config.url, region=region.code)
+    address = generate_address(region=region.code)
 
     logger.info(f"User: {user.first_name} {user.last_name}")
     logger.info("Email: {}", sanitize_for_log({"email": user.email})["email"])
     if sms_provider is None:
         logger.info("Phone: {}", sanitize_for_log({"phone": user.phone})["phone"])
     else:
-        logger.info("Phone: SMSBower auto mode will reserve a Brazil PayPal number before OTP")
-    logger.info("CPF: <redacted>")
-    logger.info("DOB: <redacted>")
+        logger.info(
+            "Phone: SMSBower auto mode will reserve a {} PayPal number before OTP",
+            region.display_name,
+        )
+    if region.requires_identity_document:
+        logger.info("CPF: <redacted>")
+    if region.requires_date_of_birth:
+        logger.info("DOB: <redacted>")
     logger.info(
         "Card: {} exp={} cvv=<redacted>",
         sanitize_for_log({"cardNumber": card.number})["cardNumber"],
@@ -225,6 +240,7 @@ def main():
         mtr_runtime=args.mtr_runtime,
         risk_signals_mode=args.risk_signals_mode,
         sms_provider=sms_provider,
+        region=region,
     )
 
     try:

@@ -11,10 +11,12 @@ from __future__ import annotations
 
 import os
 import random
+from datetime import datetime, timezone
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 from urllib.parse import quote
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 _TRUE_VALUES = {"1", "true", "yes", "on", "enable", "enabled", "y"}
 _FALSE_VALUES = {"0", "false", "no", "off", "disable", "disabled", "n", ""}
@@ -122,6 +124,67 @@ class ProxyConfig:
         if not self.enabled or not self.entry:
             return "代理关闭"
         return self.entry.masked
+
+
+def timezone_profile(timezone_name: str, *, now: datetime | None = None) -> dict[str, object]:
+    """Return browser timezone fields for an IANA timezone.
+
+    JavaScript's ``Date#getTimezoneOffset`` has the inverse sign of UTC
+    offsets.  Calculate it from the zone at runtime so US DST transitions do
+    not leave a stale, hard-coded offset in Tealeaf/FraudNet payloads.
+    """
+    try:
+        zone = ZoneInfo(str(timezone_name))
+    except (ZoneInfoNotFoundError, ValueError) as exc:
+        raise ValueError(f"无效 IANA timezone：{timezone_name!r}") from exc
+    instant = now.astimezone(timezone.utc) if now else datetime.now(timezone.utc)
+    offset = instant.astimezone(zone).utcoffset()
+    offset_minutes = -int((offset.total_seconds() if offset else 0) // 60)
+    return {
+        "timezone": zone.key,
+        "timezone_offset_minutes": offset_minutes,
+        "timezone_offset_ms": offset_minutes * 60 * 1000,
+        "dst": bool(instant.astimezone(zone).dst()),
+    }
+
+
+def proxy_timezone_profile(proxy: ProxyConfig, fallback: dict[str, object]) -> dict[str, object]:
+    """Resolve the browser timezone from the proxy exit IP when configured.
+
+    ``PAYPAL_PROXY_TIMEZONE`` is an explicit, deterministic override.  When
+    it is absent and a proxy is active, the optional lookup endpoint is called
+    *through that same proxy*, preventing the local machine's timezone from
+    leaking into the browser profile.  The endpoint may return either
+    ``timezone`` as a string (ipapi.co style) or ``timezone.id`` (ipwho.is
+    style).  Failures retain the supplied regional fallback.
+    """
+    configured = _load_dotenv_value("PAYPAL_PROXY_TIMEZONE")
+    if configured:
+        return timezone_profile(configured)
+    if not proxy.enabled or not proxy.url:
+        return dict(fallback)
+    if not parse_bool(_load_dotenv_value("PAYPAL_PROXY_GEO_LOOKUP"), True):
+        return dict(fallback)
+
+    endpoint = _load_dotenv_value("PAYPAL_PROXY_GEO_URL") or "https://ipapi.co/json/"
+    try:
+        timeout = float(_load_dotenv_value("PAYPAL_PROXY_GEO_TIMEOUT_SECONDS") or "4")
+    except ValueError:
+        timeout = 4.0
+    try:
+        import httpx
+
+        with httpx.Client(proxy=proxy.url, timeout=max(0.5, timeout)) as client:
+            payload = client.get(endpoint).json()
+        raw_timezone = payload.get("timezone") if isinstance(payload, dict) else None
+        if isinstance(raw_timezone, dict):
+            raw_timezone = raw_timezone.get("id")
+        if isinstance(raw_timezone, str) and raw_timezone.strip():
+            return timezone_profile(raw_timezone.strip())
+    except Exception:
+        # A geo-IP service must never prevent a checkout session from starting.
+        pass
+    return dict(fallback)
 
 
 def parse_bool(value: object, default: bool = False) -> bool:

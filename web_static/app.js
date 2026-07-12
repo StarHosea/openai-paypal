@@ -5,6 +5,7 @@ const state = {
   lastLogCount: 0,
   logsSignature: "",
   currentLogLines: [],
+  regionInitialized: false,
 };
 
 function fmtTime(ts) {
@@ -62,7 +63,12 @@ function setServer(ok) {
 
 async function health() {
   try {
-    await api("/api/health");
+    const data = await api("/api/health");
+    if (!state.regionInitialized && data.default_region && $("#region")) {
+      $("#region").value = data.default_region;
+      syncSmsFields();
+      state.regionInitialized = true;
+    }
     setServer(true);
   } catch (err) {
     setServer(false);
@@ -93,7 +99,7 @@ function renderJobs(jobs) {
         <span class="badge ${esc(job.status)}">${esc(job.status)}</span>
       </div>
       <div class="job-sub">${esc(job.stage || "")}</div>
-      <div class="job-sub">${esc(job.ba_token || "")} · ${esc(fmtTime(job.created_at))} · ${esc(job.proxy_enabled ? (job.proxy_label || "代理开") : "代理关")} · SMS:${esc(job.sms_provider || "manual")} · FP:${esc(job.fingerprint_source || "-")} · DD:${esc(job.datadome_mode || "-")} · MTR:${esc(job.mtr_runtime || "-")}${job.record_traffic ? " · 发包记录开" : ""}</div>
+      <div class="job-sub">${esc(job.ba_token || "")} · ${esc(fmtTime(job.created_at))} · ${esc(job.proxy_enabled ? (job.proxy_label || "代理开") : "代理关")} · 地区:${esc(job.region || "US")} · SMS:${esc(job.sms_provider || "manual")} · FP:${esc(job.fingerprint_source || "-")} · DD:${esc(job.datadome_mode || "-")} · MTR:${esc(job.mtr_runtime || "-")}${job.record_traffic ? " · 发包记录开" : ""}</div>
     </div>`).join("");
   box.querySelectorAll(".job-item").forEach(item => {
     item.addEventListener("click", () => selectJob(item.dataset.jobId));
@@ -120,8 +126,10 @@ function syncTrafficFields() {
 function syncSmsFields() {
   const enabled = $("#smsbowerEnabled").checked;
   const phone = $("#phone");
+  const region = $("#region").value || "US";
+  const placeholder = region === "BR" ? "+5591980133818" : "+14647681720";
   phone.required = !enabled;
-  phone.placeholder = enabled ? "SMSBower 自动获取，可留空" : "+5591980133818";
+  phone.placeholder = enabled ? `SMSBower 自动获取 ${region} 号码，可留空` : placeholder;
 }
 
 function selectJob(jobId) {
@@ -166,7 +174,7 @@ function renderCurrent(job) {
   const trafficMeta = job.record_traffic
     ? ` · 发包记录：${job.traffic_dir || "准备中"}${job.traffic_report_json ? " · 已生成差异报告" : ""}`
     : "";
-  const runtimeMeta = ` · SMS:${job.sms_provider || "manual"} · FP:${job.fingerprint_source || "-"} · DD:${job.datadome_mode || "-"} · MTR:${job.mtr_runtime || "-"}`;
+  const runtimeMeta = ` · 地区:${job.region || "US"} · SMS:${job.sms_provider || "manual"} · FP:${job.fingerprint_source || "-"} · DD:${job.datadome_mode || "-"} · MTR:${job.mtr_runtime || "-"}`;
   $("#currentMeta").textContent = `#${job.id} · 创建于 ${fmtTime(job.created_at)} · ${job.proxy_label || "代理关闭"}${runtimeMeta}${trafficMeta}`;
   $("#jobStatus").textContent = job.status;
   $("#jobStage").textContent = job.stage || "";
@@ -237,6 +245,7 @@ async function startJob(evt) {
       body: JSON.stringify({
         ba_token: $("#baToken").value,
         phone: $("#phone").value,
+        region: $("#region").value || "US",
         sms_provider: $("#smsbowerEnabled").checked ? "smsbower" : "manual",
         max_card_attempts: Number($("#maxCardAttempts").value || 5),
         max_flow_attempts: Number($("#maxFlowAttempts").value || 1),
@@ -332,6 +341,10 @@ function bind() {
   $("#recordTraffic").addEventListener("change", syncTrafficFields);
   $("#compareRoxyCapture").addEventListener("input", syncTrafficFields);
   $("#smsbowerEnabled").addEventListener("change", syncSmsFields);
+  $("#region").addEventListener("change", () => {
+    state.regionInitialized = true;
+    syncSmsFields();
+  });
   syncProxyFields();
   syncTrafficFields();
   syncSmsFields();

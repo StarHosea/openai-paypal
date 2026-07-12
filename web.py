@@ -28,6 +28,7 @@ from loguru import logger
 
 from paypal.flow import PayPalFlow
 from paypal.models import BillingAddress, CardInfo, UserInfo, generate_address, generate_card, generate_user
+from paypal.regions import configured_region_code, get_region, supported_region_codes
 from paypal.proxy import ProxyConfig, build_proxy_config
 from paypal.traffic_recorder import (
     TrafficRecorder,
@@ -44,8 +45,11 @@ def _smsbower_module():
     return importlib.import_module("paypal.smsbower")
 
 
-def _build_smsbower_provider(enabled: bool):
-    return getattr(_smsbower_module(), "build_smsbower_provider")(enabled=enabled)
+def _build_smsbower_provider(enabled: bool, *, region: str = "US"):
+    return getattr(_smsbower_module(), "build_smsbower_provider")(
+        enabled=enabled,
+        region=region,
+    )
 
 
 def env_bool(name: str, default: bool = False) -> bool:
@@ -100,12 +104,14 @@ DEVICE_COOKIE_MAX_AGE = 365 * 24 * 60 * 60
 DEVICE_ID_RE = re.compile(r"^[a-f0-9]{32}$")
 BA_TOKEN_RE = re.compile(r"^BA-[A-Za-z0-9]{8,80}$")
 PHONE_RE = re.compile(r"^\+?\d{8,20}$")
-FINGERPRINT_SOURCE_CHOICES = {"random", "program", "python", "synthetic", "roxy", "browser", "headless", "local_headless", "playwright", "local_playwright", "auto"}
-DATADOME_MODE_CHOICES = {"protocol", "edge", "roxy", "browser", "headless", "local_headless", "playwright", "local_playwright", "auto", "off"}
-MTR_RUNTIME_CHOICES = {"python_generated", "python", "protocol", "roxy", "browser", "headless", "local_headless", "playwright", "local_playwright", "auto", "block", "off"}
-RISK_SIGNALS_MODE_CHOICES = {"protocol", "python", "synthetic", "template", "roxy", "browser", "headless", "local_headless", "playwright", "local_playwright", "auto", "off"}
+FINGERPRINT_SOURCE_CHOICES = {"random", "program", "python", "synthetic", "roxy", "roxy_ios", "roxy_iphone", "browser", "headless", "headless_ios", "local_headless", "playwright", "local_playwright", "auto"}
+DATADOME_MODE_CHOICES = {"protocol", "edge", "roxy", "roxy_ios", "roxy_iphone", "browser", "headless", "headless_ios", "local_headless", "playwright", "local_playwright", "auto", "off"}
+MTR_RUNTIME_CHOICES = {"python_generated", "python", "protocol", "roxy", "roxy_ios", "roxy_iphone", "browser", "headless", "headless_ios", "local_headless", "playwright", "local_playwright", "auto", "block", "off"}
+RISK_SIGNALS_MODE_CHOICES = {"protocol", "python", "synthetic", "template", "roxy", "browser", "headless", "headless_ios", "local_headless", "playwright", "local_playwright", "auto", "off"}
 SMS_PROVIDER_CHOICES = {"manual", "smsbower"}
-ROXY_LIKE_MODE_VALUES = {"roxy", "browser", "real_browser", "chrome", "chromium", "roxy_browser", "roxybrowser"}
+REGION_CHOICES = set(supported_region_codes())
+DEFAULT_WEB_REGION = configured_region_code("US")
+ROXY_LIKE_MODE_VALUES = {"roxy", "roxy_ios", "roxy_iphone", "browser", "real_browser", "chrome", "chromium", "roxy_browser", "roxybrowser"}
 
 ACTIVE_STATUSES = {"queued", "running", "awaiting_otp"}
 RUNNER_SEMAPHORE = threading.BoundedSemaphore(MAX_ACTIVE_JOBS)
@@ -207,7 +213,7 @@ def redact_text(value: Any) -> str:
     text = re.sub(r"\bBA-[A-Za-z0-9]{8,80}\b", lambda m: mask_middle(m.group(0), 4, 4), text)
     text = re.sub(r"\bEC-[A-Za-z0-9]{8,80}\b", lambda m: mask_middle(m.group(0), 4, 4), text)
 
-    # Email, CPF, card-like long digit sequences, Brazil/international phone-like values.
+    # Email, CPF, card-like long digit sequences, and international phone-like values.
     text = re.sub(
         r"\b([A-Za-z0-9._%+\-]{1,64})@([A-Za-z0-9.\-]+\.[A-Za-z]{2,})\b",
         lambda m: mask_email(m.group(0)),
@@ -335,6 +341,7 @@ class WebJob:
     owner_device_id: str
     ba_token: str
     phone: str
+    region: str = "US"
     sms_provider: str = "manual"
     debug: bool = False
     max_card_attempts: int = 5
@@ -466,6 +473,7 @@ class WebJob:
                 "stage": self.stage,
                 "ba_token": mask_middle(self.ba_token),
                 "phone": mask_phone(self.phone),
+                "region": self.region,
                 "sms_provider": self.sms_provider,
                 "debug": self.debug and ALLOW_DEBUG_LOGS,
                 "max_card_attempts": self.max_card_attempts,
@@ -609,7 +617,7 @@ class WebPayPalFlow(PayPalFlow):
                 logger.error("Failed to initiate OTP for {}: {}", self._masked_phone(), e)
                 while True:
                     value = self._prompt_operator(
-                        "发送验证码失败。请输入新的手机号重新发送（如 +5591980133818）；输入 q 退出。"
+                        f"发送验证码失败。请输入新的手机号重新发送（如 {self.region.phone_example}）；输入 q 退出。"
                     )
                     if value.lower() in {"q", "quit", "exit"}:
                         raise RuntimeError("OTP confirmation cancelled by user") from e
@@ -624,7 +632,7 @@ class WebPayPalFlow(PayPalFlow):
 
             while True:
                 value = self._prompt_operator(
-                    "请输入6位短信验证码；如需换号，输入新手机号（如 +5591980133818 或 phone:+5591980133818）；输入 q 退出。"
+                    f"请输入6位短信验证码；如需换号，输入新手机号（如 {self.region.phone_example} 或 phone:{self.region.phone_example}）；输入 q 退出。"
                 )
 
                 if value.lower() in {"q", "quit", "exit"}:
@@ -691,6 +699,7 @@ def create_job(
     phone: str,
     debug: bool,
     max_card_attempts: int,
+    region: str = "BR",
     sms_provider: str = "manual",
     max_flow_attempts: int = 1,
     max_authorize_attempts: int = 3,
@@ -709,6 +718,7 @@ def create_job(
 ) -> WebJob:
     ba_token = (ba_token or "").strip()
     phone = re.sub(r"[\s().-]+", "", (phone or "").strip())
+    region_profile = get_region(region, default="US")
     sms_provider = (sms_provider or "manual").strip().lower()
     if sms_provider not in SMS_PROVIDER_CHOICES:
         raise ValueError("短信接码方式不正确")
@@ -720,8 +730,13 @@ def create_job(
         raise ValueError("手机号不能为空")
     if phone and not PHONE_RE.fullmatch(phone):
         raise ValueError("手机号格式不正确")
+    if phone:
+        try:
+            phone, _country_code, _local = region_profile.normalize_phone(phone)
+        except ValueError as exc:
+            raise ValueError(f"手机号必须是 {region_profile.display_name} 号码：{exc}") from exc
     if sms_provider == "smsbower":
-        _build_smsbower_provider(enabled=True)
+        _build_smsbower_provider(enabled=True, region=region_profile.code)
     try:
         max_card_attempts = int(max_card_attempts)
     except Exception as exc:
@@ -790,6 +805,7 @@ def create_job(
         owner_device_id=owner_device_id,
         ba_token=ba_token,
         phone=phone,
+        region=region_profile.code,
         sms_provider=sms_provider,
         debug=debug,
         max_card_attempts=max_card_attempts,
@@ -851,31 +867,36 @@ def run_job(job: WebJob) -> None:
                     job._condition.notify_all()
                 logger.info("Program traffic recording enabled: {}", traffic_recorder.root)
             proxy_config = job._proxy_config or build_proxy_config(enabled=job.proxy_enabled)
+            region = get_region(job.region, default="US")
             sms_provider = None
             if job.sms_provider == "smsbower":
-                sms_provider = _build_smsbower_provider(enabled=True)
-                logger.info("SMS provider: SMSBower auto mode")
+                sms_provider = _build_smsbower_provider(enabled=True, region=region.code)
+                logger.info("SMS provider: SMSBower auto mode region={}", region.code)
             job.proxy_enabled = proxy_config.enabled
             job.proxy_label = proxy_config.label
-            user = generate_user(job.phone or "+5500000000000")
-            card = generate_card(proxy_url=proxy_config.url)
-            address = generate_address()
+            user = generate_user(job.phone or region.fallback_phone, region=region.code)
+            card = generate_card(proxy_url=proxy_config.url, region=region.code)
+            address = generate_address(region=region.code)
             job.set_generated(public_generated_payload(user, card, address))
 
             logger.info("Web job started: {}", job.id)
             logger.info("Proxy: {}", proxy_config.label)
             logger.info(
-                "Runtime modes: fingerprint={} datadome={} mtr={}",
+                "Runtime modes: fingerprint={} datadome={} mtr={} signup_context={}",
                 job.fingerprint_source,
                 job.datadome_mode,
                 job.mtr_runtime,
+                job.risk_signals_mode,
             )
             logger.info("User: {} {}", user.first_name, user.last_name)
             logger.info("Email: {}", mask_email(user.email))
             if sms_provider is None:
                 logger.info("Phone: {}", mask_phone(user.phone))
             else:
-                logger.info("Phone: SMSBower auto mode will reserve a Brazil PayPal number before OTP")
+                logger.info(
+                    "Phone: SMSBower auto mode will reserve a {} PayPal number before OTP",
+                    region.display_name,
+                )
             logger.info(
                 "Address generated: {}, {}-{}",
                 address.district,
@@ -899,6 +920,7 @@ def run_job(job: WebJob) -> None:
                 mtr_runtime=job.mtr_runtime,
                 risk_signals_mode=job.risk_signals_mode,
                 sms_provider=sms_provider,
+                region=region,
                 job=job,
             )
             result = flow.run()
@@ -1019,7 +1041,11 @@ class WebHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path
         if path == "/api/health":
-            return self.send_json({"ok": True, "time": now_ts()})
+            return self.send_json({
+                "ok": True,
+                "time": now_ts(),
+                "default_region": DEFAULT_WEB_REGION,
+            })
         if path == "/api/jobs":
             device_id = self.get_device_id()
             with JOBS_LOCK:
@@ -1062,6 +1088,7 @@ class WebHandler(BaseHTTPRequestHandler):
                     owner_device_id=self.get_device_id(),
                     ba_token=data.get("ba_token", ""),
                     phone=data.get("phone", ""),
+                    region=str(data.get("region", DEFAULT_WEB_REGION) or DEFAULT_WEB_REGION),
                     debug=bool(data.get("debug", False)),
                     max_card_attempts=int(data.get("max_card_attempts", 5) or 5),
                     sms_provider=str(data.get("sms_provider", "manual") or "manual"),

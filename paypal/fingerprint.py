@@ -47,6 +47,25 @@ PDF_PLUGINS: list[JsonDict] = [
 ]
 
 
+# The local iOS profile mirrors the identity present in the supplied phone
+# capture.  The local browser remains Playwright Chromium, therefore the
+# corresponding runtime normalizer removes Chromium-only UA Client Hints and
+# exposes the WebKit/iPhone surface before any protected page is opened.
+IOS_PHONE_USER_AGENT = (
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) "
+    "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.5 Mobile/15E148 Safari/604.1"
+)
+IOS_PHONE_SCREEN: JsonDict = {
+    "width": 480,
+    "height": 854,
+    "availWidth": 480,
+    "availHeight": 854,
+    "colorDepth": 24,
+    "pixelDepth": 24,
+}
+IOS_PHONE_VIEWPORT: JsonDict = {"width": 480, "height": 854}
+
+
 def _compact_json(value: object) -> str:
     return json.dumps(value, separators=(",", ":"))
 
@@ -543,10 +562,18 @@ def _normalize_fingerprint_source(source: str | None = None) -> str:
         "synthetic": "random",
         "random": "random",
         "roxy": "roxy",
+        "roxy_ios": "roxy_ios",
+        "roxy_iphone": "roxy_ios",
+        "ios_roxy": "roxy_ios",
         "roxy_browser": "roxy",
         "roxybrowser": "roxy",
         "browser": "roxy",
         "headless": "headless",
+        "headless_ios": "headless_ios",
+        "headless_iphone": "headless_ios",
+        "ios_headless": "headless_ios",
+        "local_ios": "headless_ios",
+        "local_headless_ios": "headless_ios",
         "headless_optimized": "headless",
         "optimized_headless": "headless",
         "local_headless": "headless",
@@ -608,8 +635,103 @@ def _headless_fallback_to_random_enabled() -> bool:
     return value in {"", "1", "true", "yes", "on", "random", "program", "python", "synthetic"}
 
 
-def _generate_synthetic_runtime_profile() -> JsonDict:
+def _base_browser_profile(profile_overrides: Mapping[str, object] | None = None) -> JsonDict:
+    profile: JsonDict = dict(BROWSER_PROFILE)
+    if profile_overrides:
+        profile.update(dict(profile_overrides))
+    return profile
+
+
+def _headless_ios_preset_requested(
+    selected: str,
+    profile_overrides: Mapping[str, object] | None = None,
+) -> bool:
+    if selected == "headless_ios":
+        return True
+    if selected != "headless":
+        return False
+    overrides = dict(profile_overrides or {})
+    if bool(overrides.get("is_ios_webkit") or overrides.get("ios_webkit")):
+        return True
+    raw = (
+        _load_dotenv_value("PAYPAL_LOCAL_HEADLESS_DEVICE_PRESET")
+        or _load_dotenv_value("PAYPAL_HEADLESS_DEVICE_PRESET")
+        or ""
+    ).strip().lower().replace("-", "_")
+    return raw in {"ios", "iphone", "ios_phone", "headless_ios", "mobile_safari"}
+
+
+def _generate_ios_phone_runtime_profile(
+    profile_overrides: Mapping[str, object] | None = None,
+    *,
+    source: str = "headless_ios",
+) -> JsonDict:
+    """Build the coherent iPhone profile used by the local headless runtime."""
+    profile = _base_browser_profile(profile_overrides)
+    language = str(profile.get("language") or "en-US")
+    language_base = language.split("-", 1)[0].split("_", 1)[0] or "en"
+    profile.update(
+        {
+            "fingerprint_source": source,
+            "device_preset": "ios_phone",
+            "browser_engine": "webkit",
+            "browser_name": "Mobile Safari",
+            "is_mobile": True,
+            "has_touch": True,
+            "is_ios_webkit": True,
+            "user_agent": IOS_PHONE_USER_AGENT,
+            "platform": "iPhone",
+            "vendor": "Apple Computer, Inc.",
+            "languages": [language, language_base],
+            # iOS WebKit does not send Chromium UA Client Hints.
+            "chrome_major": 0,
+            "chrome_full_version": "",
+            "sec_ch_platform": "",
+            "sec_ch_platform_version": "",
+            "sec_ch_arch": "",
+            "sec_ch_bitness": "",
+            "device_memory": 0,
+            "hardware_concurrency": 6,
+            "max_touch_points": 5,
+            "device_pixel_ratio": 3,
+            "connection_effective_type": "",
+            "connection_rtt": "",
+            "connection_downlink": "",
+            "gpu_vendor": "",
+            "gpu_renderer": "",
+            "webgl_vendor": "WebKit",
+            "webgl_renderer": "WebKit WebGL",
+        }
+    )
+    screen = dict(IOS_PHONE_SCREEN)
+    viewport = dict(IOS_PHONE_VIEWPORT)
+    fingerprint = _build_device_fingerprint(profile, screen, viewport)
+    fingerprint["source"] = source
+    return {
+        "browser_profile": profile,
+        "screen": screen,
+        "viewport": viewport,
+        "device_fingerprint": fingerprint,
+    }
+
+
+def _apply_profile_overrides(
+    runtime: JsonDict,
+    profile_overrides: Mapping[str, object] | None = None,
+) -> JsonDict:
+    if not profile_overrides:
+        return runtime
+    profile = dict(cast(dict[str, object], runtime.get("browser_profile") or {}))
+    profile.update(dict(profile_overrides))
+    runtime["browser_profile"] = profile
+    return runtime
+
+
+def _generate_synthetic_runtime_profile(
+    profile_overrides: Mapping[str, object] | None = None,
+) -> JsonDict:
     """Generate one stable synthetic browser/device profile for a single protocol run."""
+    base_profile = _base_browser_profile(profile_overrides)
     randomize = os.getenv(
         "PAYPAL_RANDOMIZE_BROWSER_PROFILE",
         "1",
@@ -618,9 +740,9 @@ def _generate_synthetic_runtime_profile() -> JsonDict:
         chrome_full_version = _random_chrome_full_version()
         chrome_major = _chrome_major_from_version(chrome_full_version)
     else:
-        chrome_major = int(BROWSER_PROFILE.get("chrome_major") or 150)
+        chrome_major = int(base_profile.get("chrome_major") or 150)
         chrome_full_version = str(
-            BROWSER_PROFILE.get("chrome_full_version")
+            base_profile.get("chrome_full_version")
             or f"{chrome_major}.0.0.0"
         )
     if randomize:
@@ -642,19 +764,19 @@ def _generate_synthetic_runtime_profile() -> JsonDict:
         screen = dict(SCREEN)
         viewport = dict(VIEWPORT)
         gpu = {
-            "gpu_vendor": BROWSER_PROFILE.get("gpu_vendor"),
-            "gpu_renderer": BROWSER_PROFILE.get("gpu_renderer"),
-            "webgl_vendor": BROWSER_PROFILE.get("webgl_vendor"),
-            "webgl_renderer": BROWSER_PROFILE.get("webgl_renderer"),
+            "gpu_vendor": base_profile.get("gpu_vendor"),
+            "gpu_renderer": base_profile.get("gpu_renderer"),
+            "webgl_vendor": base_profile.get("webgl_vendor"),
+            "webgl_renderer": base_profile.get("webgl_renderer"),
         }
-        hardware_concurrency = int(BROWSER_PROFILE.get("hardware_concurrency") or 8)
-        device_pixel_ratio = BROWSER_PROFILE.get("device_pixel_ratio", 1)
-        connection_rtt = str(BROWSER_PROFILE.get("connection_rtt") or "150")
-        connection_downlink = str(BROWSER_PROFILE.get("connection_downlink") or "10")
-    device_memory = int(BROWSER_PROFILE.get("device_memory") or 8)
-    profile: JsonDict = dict(BROWSER_PROFILE)
+        hardware_concurrency = int(base_profile.get("hardware_concurrency") or 8)
+        device_pixel_ratio = base_profile.get("device_pixel_ratio", 1)
+        connection_rtt = str(base_profile.get("connection_rtt") or "150")
+        connection_downlink = str(base_profile.get("connection_downlink") or "10")
+    device_memory = int(base_profile.get("device_memory") or 8)
+    profile: JsonDict = dict(base_profile)
     profile.update(gpu)
-    user_agent = _user_agent_with_chrome_version(str(BROWSER_PROFILE.get("user_agent") or USER_AGENT), chrome_full_version)
+    user_agent = _user_agent_with_chrome_version(str(base_profile.get("user_agent") or USER_AGENT), chrome_full_version)
     profile.update(
         {
             "fingerprint_source": "random",
@@ -682,6 +804,7 @@ def generate_runtime_profile(
     *,
     roxy_proxy_url: str | None = None,
     keep_roxy_browser: bool = False,
+    profile_overrides: Mapping[str, object] | None = None,
 ) -> JsonDict:
     """Generate one stable browser/device profile for a single protocol run.
 
@@ -700,7 +823,9 @@ def generate_runtime_profile(
         except Exception:
             selected = "random"
 
-    if selected == "roxy":
+    local_ios_preset = _headless_ios_preset_requested(selected, profile_overrides)
+
+    if selected in {"roxy", "roxy_ios"}:
         try:
             from loguru import logger
             from paypal.roxy_fingerprint import capture_roxy_runtime_profile
@@ -710,9 +835,11 @@ def generate_runtime_profile(
             runtime = capture_roxy_runtime_profile(
                 keep_browser=keep_browser,
                 proxy_url=roxy_proxy_url,
+                browser_profile=profile_overrides,
+                device_preset="ios_phone" if selected == "roxy_ios" else None,
             )
-            runtime["browser_profile"]["fingerprint_source"] = "roxy"
-            runtime["device_fingerprint"]["source"] = "roxy"
+            runtime["browser_profile"]["fingerprint_source"] = selected
+            runtime["device_fingerprint"]["source"] = selected
             logger.info(
                 "Roxy fingerprint captured: ua={} screen={}x{} viewport={}x{}",
                 (runtime["browser_profile"].get("user_agent") or "")[:80],
@@ -721,13 +848,13 @@ def generate_runtime_profile(
                 runtime["viewport"].get("width"),
                 runtime["viewport"].get("height"),
             )
-            return runtime
+            return _apply_profile_overrides(runtime, profile_overrides)
         except Exception as exc:
             fallback_configured = bool(
                 _load_dotenv_value("PAYPAL_ROXY_FINGERPRINT_FALLBACK")
                 or _load_dotenv_value("PAYPAL_FINGERPRINT_FALLBACK")
             )
-            if requested == "roxy" and not fallback_configured:
+            if requested in {"roxy", "roxy_ios"} and not fallback_configured:
                 raise
             if not _roxy_fallback_to_random_enabled():
                 raise
@@ -738,13 +865,20 @@ def generate_runtime_profile(
             except Exception:
                 pass
 
-    if selected == "headless":
+    if selected in {"headless", "headless_ios"}:
         try:
             from loguru import logger
             from paypal.local_headless import capture_runtime_fingerprint_with_local_headless
 
-            logger.info("Generating browser fingerprint from local headless runtime...")
-            headless_seed = _generate_synthetic_runtime_profile()
+            logger.info(
+                "Generating browser fingerprint from local headless runtime{}...",
+                " (iPhone/iOS)" if local_ios_preset else "",
+            )
+            headless_seed = (
+                _generate_ios_phone_runtime_profile(profile_overrides)
+                if local_ios_preset
+                else _generate_synthetic_runtime_profile(profile_overrides)
+            )
             runtime = capture_runtime_fingerprint_with_local_headless(
                 proxy_url=roxy_proxy_url or "",
                 browser_profile=cast(JsonDict, headless_seed["browser_profile"]),
@@ -755,8 +889,8 @@ def generate_runtime_profile(
             screen = cast(dict[str, object], runtime["screen"])
             viewport = cast(dict[str, object], runtime["viewport"])
             device_fingerprint = cast(dict[str, object], runtime["device_fingerprint"])
-            browser_profile["fingerprint_source"] = "headless"
-            device_fingerprint["source"] = "headless"
+            browser_profile["fingerprint_source"] = "headless_ios" if local_ios_preset else "headless"
+            device_fingerprint["source"] = "headless_ios" if local_ios_preset else "headless"
             logger.info(
                 "Local headless fingerprint captured: ua={} screen={}x{} viewport={}x{}",
                 str(browser_profile.get("user_agent") or "")[:80],
@@ -765,14 +899,14 @@ def generate_runtime_profile(
                 viewport.get("width"),
                 viewport.get("height"),
             )
-            return runtime
+            return _apply_profile_overrides(runtime, profile_overrides)
         except Exception as exc:
             fallback_configured = bool(
                 _load_dotenv_value("PAYPAL_HEADLESS_FINGERPRINT_FALLBACK")
                 or _load_dotenv_value("PAYPAL_LOCAL_HEADLESS_FINGERPRINT_FALLBACK")
                 or _load_dotenv_value("PAYPAL_FINGERPRINT_FALLBACK")
             )
-            if requested == "headless" and not fallback_configured:
+            if requested in {"headless", "headless_ios"} and not fallback_configured:
                 raise
             if not _headless_fallback_to_random_enabled():
                 raise
@@ -783,7 +917,11 @@ def generate_runtime_profile(
             except Exception:
                 pass
 
-    return _generate_synthetic_runtime_profile()
+    if selected == "roxy_ios" or local_ios_preset:
+        # If a local runtime is temporarily unavailable, retain the mobile
+        # profile rather than silently reverting this job to Linux/Chromium.
+        return _generate_ios_phone_runtime_profile(profile_overrides)
+    return _generate_synthetic_runtime_profile(profile_overrides)
 
 
 def ensure_runtime_profile(
@@ -792,15 +930,19 @@ def ensure_runtime_profile(
     *,
     roxy_proxy_url: str | None = None,
     keep_roxy_browser: bool = False,
+    profile_overrides: Mapping[str, object] | None = None,
 ) -> None:
     if not state:
         return
     if getattr(state, "browser_profile", None) and getattr(state, "device_fingerprint", None):
+        if profile_overrides:
+            state.browser_profile.update(dict(profile_overrides))
         return
     runtime = generate_runtime_profile(
         source,
         roxy_proxy_url=roxy_proxy_url,
         keep_roxy_browser=keep_roxy_browser,
+        profile_overrides=profile_overrides,
     )
     state.browser_profile = runtime["browser_profile"]
     state.screen = runtime["screen"]

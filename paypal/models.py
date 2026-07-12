@@ -6,6 +6,8 @@ import time
 import uuid
 from typing import TypedDict
 
+from paypal.regions import get_region
+
 
 @dataclass
 class UserInfo:
@@ -126,7 +128,12 @@ class SessionState:
             self.euat_token = cookies[euat_key]
 
 
-def generate_random_email() -> str:
+def generate_random_email(region: str | None = None) -> str:
+    profile = get_region(region, default="BR")
+    if profile.code == "US":
+        first = random.choice(_US_FIRST_NAMES).lower()
+        last = random.choice(_US_LAST_NAMES).lower()
+        return _generate_us_email(first, last)
     first = random.choice(_BR_FIRST_NAMES).lower()
     last = random.choice(_BR_LAST_NAMES).lower()
     return _generate_br_email(first, last)
@@ -290,6 +297,70 @@ _BR_EMAIL_DOMAINS = [
 ]
 
 
+# --- Random generators for the US checkout profile ---
+
+class _UsLocation(TypedDict):
+    state: str
+    city: str
+    postal_codes: list[str]
+    streets: list[str]
+
+
+_US_FIRST_NAMES = [
+    "James", "John", "Robert", "Michael", "William", "David", "Joseph",
+    "Daniel", "Matthew", "Andrew", "Emily", "Olivia", "Sophia", "Ava",
+    "Mia", "Isabella", "Charlotte", "Amelia", "Harper", "Evelyn",
+]
+
+_US_LAST_NAMES = [
+    "Smith", "Johnson", "Williams", "Brown", "Jones", "Garcia", "Miller",
+    "Davis", "Rodriguez", "Martinez", "Hernandez", "Lopez", "Gonzalez",
+    "Wilson", "Anderson", "Thomas", "Taylor", "Moore", "Jackson", "Martin",
+]
+
+_US_LOCATIONS: list[_UsLocation] = [
+    {
+        "state": "TX",
+        "city": "San Antonio",
+        "postal_codes": ["78229", "78230", "78240", "78249"],
+        "streets": ["Babcock Road", "Wurzbach Road", "Fredericksburg Road"],
+    },
+    {
+        "state": "CA",
+        "city": "San Diego",
+        "postal_codes": ["92101", "92103", "92109", "92117"],
+        "streets": ["University Avenue", "El Cajon Boulevard", "Garnet Avenue"],
+    },
+    {
+        "state": "FL",
+        "city": "Orlando",
+        "postal_codes": ["32801", "32803", "32806", "32819"],
+        "streets": ["East Colonial Drive", "South Orange Avenue", "Kirkman Road"],
+    },
+    {
+        "state": "IL",
+        "city": "Chicago",
+        "postal_codes": ["60601", "60611", "60618", "60657"],
+        "streets": ["North Clark Street", "West Fullerton Avenue", "North Ashland Avenue"],
+    },
+    {
+        "state": "AZ",
+        "city": "Phoenix",
+        "postal_codes": ["85003", "85008", "85013", "85016"],
+        "streets": ["East Camelback Road", "North Central Avenue", "West Indian School Road"],
+    },
+]
+
+_US_CARD_BINS = [
+    ("411111", 16, "VISA"),
+    ("555555", 16, "MASTER_CARD"),
+]
+
+_US_EMAIL_DOMAINS = [
+    "gmail.com", "outlook.com", "hotmail.com", "icloud.com", "yahoo.com",
+]
+
+
 def _luhn_checksum(partial: str) -> int:
     """Calculate the Luhn check digit for a partial card number (without the check digit)."""
     total = 0
@@ -312,9 +383,18 @@ def _generate_br_email(first_name: str, last_name: str) -> str:
     )
 
 
-def generate_card(proxy_url: str | None = None) -> CardInfo:
+def _generate_us_email(first_name: str, last_name: str) -> str:
+    return (
+        f"{first_name.lower()}.{last_name.lower()}"
+        f"{random.randint(10, 9999)}@{random.choice(_US_EMAIL_DOMAINS)}"
+    )
+
+
+def generate_card(proxy_url: str | None = None, *, region: str | None = None) -> CardInfo:
     del proxy_url
-    bin_prefix, length, _issuer = random.choice(_BR_CARD_BINS)
+    profile = get_region(region, default="BR")
+    bins = _US_CARD_BINS if profile.code == "US" else _BR_CARD_BINS
+    bin_prefix, length, _issuer = random.choice(bins)
     middle_len = length - len(bin_prefix) - 1
     partial = bin_prefix + "".join(str(random.randint(0, 9)) for _ in range(middle_len))
     number = partial + str(_luhn_checksum(partial))
@@ -363,29 +443,50 @@ def generate_password() -> str:
     return "".join(pwd)
 
 
-def generate_user(phone: str) -> UserInfo:
-    first = random.choice(_BR_FIRST_NAMES)
-    last = random.choice(_BR_LAST_NAMES)
+def generate_user(phone: str, *, region: str | None = None) -> UserInfo:
+    profile = get_region(region, default="BR")
+    if profile.code == "US":
+        first = random.choice(_US_FIRST_NAMES)
+        last = random.choice(_US_LAST_NAMES)
+        email = _generate_us_email(first, last)
+        dob = ""
+        cpf = ""
+    else:
+        first = random.choice(_BR_FIRST_NAMES)
+        last = random.choice(_BR_LAST_NAMES)
+        email = _generate_br_email(first, last)
+        dob = generate_dob()
+        cpf = generate_cpf()
 
-    phone_local = phone.lstrip("+")
-    phone_country_code = "+55"
-    if phone_local.startswith("55"):
-        phone_local = phone_local[2:]
+    normalized_phone, phone_country_code, phone_local = profile.normalize_phone(phone)
 
     return UserInfo(
         first_name=first,
         last_name=last,
-        email=_generate_br_email(first, last),
-        phone=phone,
+        email=email,
+        phone=normalized_phone,
         phone_local=phone_local,
         phone_country_code=phone_country_code,
         password=generate_password(),
-        dob=generate_dob(),
-        cpf=generate_cpf(),
+        dob=dob,
+        cpf=cpf,
     )
 
 
-def generate_address() -> BillingAddress:
+def generate_address(*, region: str | None = None) -> BillingAddress:
+    profile = get_region(region, default="BR")
+    if profile.code == "US":
+        location = random.choice(_US_LOCATIONS)
+        return BillingAddress(
+            street=random.choice(location["streets"]),
+            house_number=str(random.randint(100, 9899)),
+            district="",
+            city=location["city"],
+            state=location["state"],
+            postal_code=random.choice(location["postal_codes"]),
+            country="US",
+        )
+
     location = random.choice(_BR_LOCATIONS)
     state = location["state"]
     city = location["city"]

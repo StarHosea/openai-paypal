@@ -11,6 +11,8 @@ from typing import Protocol
 import httpx
 from loguru import logger
 
+from paypal.regions import PayPalRegion, get_region
+
 
 SMSBOWER_API_URL = "https://smsbower.page/stubs/handler_api.php"
 SMSBOWER_DEFAULT_SERVICE = "ts"
@@ -41,6 +43,7 @@ class SMSBowerActivation:
     price: float
     expires_at: float
     reused: bool = False
+    country: str = SMSBOWER_DEFAULT_COUNTRY
 
 
 class SMSBowerClientProtocol(Protocol):
@@ -112,13 +115,21 @@ def _digits(value: object) -> str:
     return "".join(ch for ch in str(value or "") if ch.isdigit())
 
 
+def normalize_phone(value: object, region: str | PayPalRegion = "BR") -> str:
+    """Normalize an SMSBower number to the selected region's E.164 form."""
+    profile = region if isinstance(region, PayPalRegion) else get_region(region)
+    try:
+        full, _country_code, _local = profile.normalize_phone(value)
+    except ValueError as exc:
+        raise SMSBowerApiError(
+            f"SMSBower returned an invalid {profile.code} phone number: {exc}"
+        ) from exc
+    return full
+
+
 def normalize_brazil_phone(value: object) -> str:
-    digits = _digits(value)
-    if not digits:
-        raise SMSBowerApiError("SMSBower returned an empty phone number")
-    if digits.startswith("55"):
-        return f"+{digits}"
-    return f"+55{digits}"
+    """Backward-compatible alias retained for BR callers."""
+    return normalize_phone(value, "BR")
 
 
 def _parse_float(value: object, default: float = 0.0) -> float:
@@ -271,8 +282,14 @@ class SMSBowerActivationStore:
         tmp_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
         tmp_path.replace(self.path)
 
-    def reusable_activation(self, now: float | None = None) -> SMSBowerActivation | None:
+    def reusable_activation(
+        self,
+        now: float | None = None,
+        *,
+        country: str = SMSBOWER_DEFAULT_COUNTRY,
+    ) -> SMSBowerActivation | None:
         now = time.time() if now is None else now
+        country = str(country or SMSBOWER_DEFAULT_COUNTRY)
         data = self.load()
         activations = data.get("activations")
         if not isinstance(activations, list):
@@ -286,6 +303,9 @@ class SMSBowerActivationStore:
             if expires_at <= now:
                 continue
             fresh_rows.append(row)
+            row_country = str(row.get("country") or SMSBOWER_DEFAULT_COUNTRY)
+            if row_country != country:
+                continue
             if selected is None:
                 selected = SMSBowerActivation(
                     activation_id=str(row.get("activation_id") or ""),
@@ -294,6 +314,7 @@ class SMSBowerActivationStore:
                     price=_parse_float(row.get("price")),
                     expires_at=expires_at,
                     reused=True,
+                    country=row_country,
                 )
         if len(fresh_rows) != len(activations):
             data["activations"] = fresh_rows
@@ -310,6 +331,7 @@ class SMSBowerActivationStore:
         provider_id: str,
         price: float,
         expires_at: float,
+        country: str = SMSBOWER_DEFAULT_COUNTRY,
     ) -> None:
         data = self.load()
         activations = data.get("activations")
@@ -323,12 +345,13 @@ class SMSBowerActivationStore:
                 "provider_id": provider_id,
                 "price": price,
                 "expires_at": expires_at,
+                "country": str(country or SMSBOWER_DEFAULT_COUNTRY),
             },
         )
         data["activations"] = rows[:20]
         failures = data.get("provider_failures")
         if isinstance(failures, dict):
-            failures[str(provider_id)] = 0
+            failures[self._provider_failure_key(str(provider_id), str(country or SMSBOWER_DEFAULT_COUNTRY))] = 0
         self.save(data)
 
     def abandon(self, activation_id: str) -> None:
@@ -342,19 +365,38 @@ class SMSBowerActivationStore:
             ]
             self.save(data)
 
-    def provider_failure_count(self, provider_id: str) -> int:
+    @staticmethod
+    def _provider_failure_key(provider_id: str, country: str) -> str:
+        return f"{country}:{provider_id}"
+
+    def provider_failure_count(
+        self,
+        provider_id: str,
+        *,
+        country: str = SMSBOWER_DEFAULT_COUNTRY,
+    ) -> int:
         failures = self.load().get("provider_failures")
         if not isinstance(failures, dict):
             return 0
-        return _parse_int(failures.get(str(provider_id)))
+        key = self._provider_failure_key(str(provider_id), str(country or SMSBOWER_DEFAULT_COUNTRY))
+        # Old BR cache files used a bare provider id.  Keep them valid.
+        return _parse_int(failures.get(key, failures.get(str(provider_id), 0)))
 
-    def record_failure(self, provider_id: str) -> None:
+    def record_failure(
+        self,
+        provider_id: str,
+        *,
+        country: str = SMSBOWER_DEFAULT_COUNTRY,
+    ) -> None:
         data = self.load()
         failures = data.get("provider_failures")
         if not isinstance(failures, dict):
             failures = {}
             data["provider_failures"] = failures
-        key = str(provider_id)
+        key = self._provider_failure_key(
+            str(provider_id),
+            str(country or SMSBOWER_DEFAULT_COUNTRY),
+        )
         failures[key] = _parse_int(failures.get(key)) + 1
         self.save(data)
 
@@ -366,7 +408,8 @@ class SMSBowerOtpProvider:
         client: SMSBowerClientProtocol,
         store: SMSBowerActivationStore | None = None,
         service: str = SMSBOWER_DEFAULT_SERVICE,
-        country: str = SMSBOWER_DEFAULT_COUNTRY,
+        country: str | None = None,
+        region: str | PayPalRegion = "BR",
         wait_seconds: float = SMSBOWER_DEFAULT_WAIT_SECONDS,
         poll_interval_seconds: float = SMSBOWER_DEFAULT_POLL_INTERVAL_SECONDS,
         max_channel_failures: int = SMSBOWER_DEFAULT_MAX_CHANNEL_FAILURES,
@@ -375,8 +418,9 @@ class SMSBowerOtpProvider:
     ) -> None:
         self.client = client
         self.store = store or SMSBowerActivationStore()
+        self.region = region if isinstance(region, PayPalRegion) else get_region(region)
         self.service = service
-        self.country = country
+        self.country = str(country or self.region.smsbower_country)
         self.wait_seconds = max(1.0, float(wait_seconds)) if wait_seconds >= 1 else float(wait_seconds)
         self.poll_interval_seconds = max(0.01, float(poll_interval_seconds))
         self.max_channel_failures = max(1, int(max_channel_failures))
@@ -384,7 +428,7 @@ class SMSBowerOtpProvider:
         self.max_attempts = max(1, int(max_attempts))
 
     def reserve_number(self) -> SMSBowerActivation:
-        reusable = self.store.reusable_activation()
+        reusable = self.store.reusable_activation(country=self.country)
         if reusable is not None:
             logger.info("Reusing active SMSBower phone from provider {}", reusable.provider_id)
             self._set_status(reusable.activation_id, 3)
@@ -394,34 +438,40 @@ class SMSBowerOtpProvider:
     def _purchase_new_number(self) -> SMSBowerActivation:
         prices = self._get_provider_prices()
         if not prices:
-            raise SMSBowerApiError("SMSBower has no PayPal Brazil providers with available numbers")
+            raise SMSBowerApiError(
+                f"SMSBower has no PayPal {self.region.display_name} providers with available numbers"
+            )
         last_error: Exception | None = None
         for price in prices:
-            if self.store.provider_failure_count(price.provider_id) >= self.max_channel_failures:
+            if self.store.provider_failure_count(price.provider_id, country=self.country) >= self.max_channel_failures:
                 logger.info("Skipping SMSBower provider {} after repeated failures", price.provider_id)
                 continue
             try:
                 data = self._get_number_v2(price)
                 activation = SMSBowerActivation(
                     activation_id=str(data["activationId"]),
-                    phone_number=normalize_brazil_phone(data["phoneNumber"]),
+                    phone_number=normalize_phone(data["phoneNumber"], self.region),
                     provider_id=str(data.get("activationOperator") or data.get("provider_id") or price.provider_id),
                     price=_parse_float(data.get("activationCost"), price.price),
                     expires_at=time.time() + self.activation_ttl_seconds,
                     reused=False,
+                    country=self.country,
                 )
                 logger.info(
-                    "Reserved SMSBower PayPal Brazil number provider={} price={}",
+                    "Reserved SMSBower PayPal {} number provider={} price={}",
+                    self.region.display_name,
                     activation.provider_id,
                     activation.price,
                 )
                 return activation
             except Exception as exc:
                 last_error = exc
-                self.store.record_failure(price.provider_id)
+                self.store.record_failure(price.provider_id, country=self.country)
                 logger.warning("SMSBower provider {} failed: {}", price.provider_id, exc)
         if last_error is not None:
-            raise SMSBowerApiError(f"SMSBower could not reserve a PayPal Brazil number: {last_error}") from last_error
+            raise SMSBowerApiError(
+                f"SMSBower could not reserve a PayPal {self.region.display_name} number: {last_error}"
+            ) from last_error
         raise SMSBowerApiError("SMSBower providers are all blocked by failure thresholds")
 
     def mark_sms_sent(self, activation: SMSBowerActivation) -> None:
@@ -441,6 +491,7 @@ class SMSBowerOtpProvider:
                     provider_id=activation.provider_id,
                     price=activation.price,
                     expires_at=activation.expires_at,
+                    country=activation.country or self.country,
                 )
                 return code
             if status in {"STATUS_CANCEL", "NO_ACTIVATION"}:
@@ -461,7 +512,10 @@ class SMSBowerOtpProvider:
         except Exception as exc:
             logger.warning("SMSBower activation cancel failed: {}", exc)
         self.store.abandon(activation.activation_id)
-        self.store.record_failure(activation.provider_id)
+        self.store.record_failure(
+            activation.provider_id,
+            country=activation.country or self.country,
+        )
 
     def register_confirmation_result(self, activation: SMSBowerActivation, confirmed: bool) -> None:
         if confirmed:
@@ -471,6 +525,7 @@ class SMSBowerOtpProvider:
                 provider_id=activation.provider_id,
                 price=activation.price,
                 expires_at=activation.expires_at,
+                country=activation.country or self.country,
             )
             return
         self.abandon(activation, "paypal_rejected_code")
@@ -529,7 +584,12 @@ def smsbower_enabled(explicit: bool | None = None) -> bool:
     return _env_bool("PAYPAL_SMSBOWER_ENABLED") or _env_bool("SMSBOWER_ENABLED")
 
 
-def build_smsbower_provider(*, enabled: bool | None = None, api_key: str | None = None) -> SMSBowerOtpProvider | None:
+def build_smsbower_provider(
+    *,
+    enabled: bool | None = None,
+    api_key: str | None = None,
+    region: str | PayPalRegion = "BR",
+) -> SMSBowerOtpProvider | None:
     if not smsbower_enabled(enabled):
         return None
     resolved_key = (
@@ -537,9 +597,21 @@ def build_smsbower_provider(*, enabled: bool | None = None, api_key: str | None 
         or _load_dotenv_value("SMSBOWER_API_KEY")
         or _load_dotenv_value("PAYPAL_SMSBOWER_API_KEY")
     )
+    profile = region if isinstance(region, PayPalRegion) else get_region(region)
     client = SMSBowerClient(resolved_key)
     return SMSBowerOtpProvider(
         client=client,
+        region=profile,
+        country=(
+            _load_dotenv_value("PAYPAL_SMSBOWER_COUNTRY")
+            or _load_dotenv_value("SMSBOWER_COUNTRY")
+            or profile.smsbower_country
+        ),
+        service=(
+            _load_dotenv_value("PAYPAL_SMSBOWER_SERVICE")
+            or _load_dotenv_value("SMSBOWER_SERVICE")
+            or SMSBOWER_DEFAULT_SERVICE
+        ),
         wait_seconds=_env_float("SMSBOWER_WAIT_SECONDS", SMSBOWER_DEFAULT_WAIT_SECONDS, 1.0, 300.0),
         poll_interval_seconds=_env_float(
             "SMSBOWER_POLL_INTERVAL_SECONDS",

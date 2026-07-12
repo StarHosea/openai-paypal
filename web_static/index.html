@@ -30,7 +30,14 @@
           </label>
           <label>
             <span>手机号</span>
-            <input id="phone" name="phone" required placeholder="+5591980133818" />
+            <input id="phone" name="phone" required placeholder="+14647681720" />
+          </label>
+          <label>
+            <span>支付地区</span>
+            <select id="region" name="region">
+              <option value="US" selected>US（United States）</option>
+              <option value="BR">BR（Brazil）</option>
+            </select>
           </label>
           <label class="check-row">
             <input id="smsbowerEnabled" name="smsbowerEnabled" type="checkbox" />
@@ -86,8 +93,10 @@
             <label>
               <span>浏览器指纹来源</span>
               <select id="fingerprintSource" name="fingerprintSource">
-                <option value="headless" selected>本地 Headless</option>
+                <option value="headless">本地 Headless（桌面 Chromium）</option>
+                <option value="headless_ios" selected>本地 Headless iOS 手机（iPhone Safari）</option>
                 <option value="roxy">Roxy 指纹浏览器</option>
+                <option value="roxy_ios">Roxy iOS 手机指纹（iPhone Safari）</option>
                 <option value="random">程序随机生成</option>
                 <option value="auto">自动：优先 Roxy</option>
               </select>
@@ -95,8 +104,10 @@
             <label>
               <span>DataDome 模式</span>
               <select id="datadomeMode" name="datadomeMode">
-                <option value="headless" selected>本地 Headless</option>
+                <option value="headless">本地 Headless（桌面 Chromium）</option>
+                <option value="headless_ios" selected>本地 Headless iOS 手机执行</option>
                 <option value="roxy">Roxy 浏览器执行（同 Headless 逻辑）</option>
+                <option value="roxy_ios">Roxy iOS 手机浏览器执行</option>
                 <option value="protocol">协议边缘模拟</option>
                 <option value="auto">自动：Roxy 失败回退</option>
                 <option value="off">关闭</option>
@@ -105,8 +116,10 @@
             <label>
               <span>MTR sealedResult</span>
               <select id="mtrRuntime" name="mtrRuntime">
-                <option value="headless" selected>本地 Headless</option>
+                <option value="headless">本地 Headless（桌面 Chromium）</option>
+                <option value="headless_ios" selected>本地 Headless iOS 手机执行 dfp.js</option>
                 <option value="roxy">Roxy 浏览器执行 dfp.js（同 Headless 逻辑）</option>
+                <option value="roxy_ios">Roxy iOS 手机浏览器执行 dfp.js</option>
                 <option value="python_generated">程序模板生成</option>
                 <option value="auto">自动：Roxy 失败回退</option>
                 <option value="block">严格阻断缺失</option>
@@ -143,7 +156,7 @@
           <button id="startBtn" class="primary" type="submit">开始执行</button>
         </form>
         <p class="hint">默认的本地 Headless 模式需要 Playwright：<code>pip install -r requirements-headless.txt &amp;&amp; python -m playwright install chromium</code>。未安装时可把上面三项切到程序随机生成、协议边缘模拟和程序模板生成。</p>
-        <p class="hint">手动模式执行到短信验证时会暂停等待输入；SMSBower 模式会自动取最低价 PayPal 巴西号码并接码。代理按每个任务生效。打开“自动记录程序发包”后会在 captures/program-paypal-* 下保存请求/响应，并可和 roxy 抓包自动生成差异报告。</p>
+        <p class="hint">手动模式执行到短信验证时会暂停等待输入；SMSBower 会按所选地区取号（US 使用 US 号码）并接码。代理按每个任务生效。打开“自动记录程序发包”后会在 captures/program-paypal-* 下保存请求/响应，并可和 roxy 抓包自动生成差异报告。</p>
       </section>
 
       <section class="card jobs-card">
@@ -213,6 +226,6 @@
   </div>
 
   <div id="toast" class="toast hidden"></div>
-  <script src="/static/app.js?v=ui-wrap-1"></script>
+  <script src="/static/app.js?v=ui-wrap-2"></script>
 </body>
 </html>

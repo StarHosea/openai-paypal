@@ -241,6 +241,37 @@ query AddressAutocompleteFromPostalCodeQuery($postalCode: String!, $token: Strin
 }
 """
 
+# US checkout browser capture: the form queries suggestions as the delivery
+# line is typed, then resolves the selected Google place ID into canonical
+# address fields.  It does not normalize an address from ZIP alone.
+ADDRESS_AUTOCOMPLETE_QUERY = """
+query AddressAutocompleteQuery($count: Int, $countries: [CountryCodes], $input: String!, $language: CheckoutContentLanguageCode, $location: GeoLocation, $radius: Int, $sessionId: String!) {
+  addressAutoComplete(count: $count, countries: $countries, input: $input, language: $language, location: $location, radius: $radius, sessionId: $sessionId) {
+    suggestions {
+      addressText
+      mainText
+      placeId
+      secondaryText
+    }
+  }
+}
+"""
+
+ADDRESS_FROM_AUTOCOMPLETE_PLACE_ID_QUERY = """
+query AddressFromAutocompletePlaceIdQuery($language: CheckoutContentLanguageCode, $placeId: ID!, $sessionId: String!) {
+  addressFromAutoCompletePlaceId(language: $language, placeId: $placeId, sessionId: $sessionId) {
+    address {
+      line1
+      line2
+      city
+      state
+      postalCode
+      country
+    }
+  }
+}
+"""
+
 # Browser Weasley calls this early on signup.  The otpLoginContext payload is
 # not required by this lightweight flow, but the call warms the session and
 # keeps the GraphQL sequence closer to the captured browser trace.

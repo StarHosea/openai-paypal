@@ -3,6 +3,7 @@ import time
 from collections.abc import Callable
 from typing import Any, Protocol, cast
 
+import paypal.fingerprint as fingerprint
 import paypal.local_headless as local_headless
 
 
@@ -113,6 +114,91 @@ def test_headless_debug_log_is_disabled_by_default(monkeypatch: Any, tmp_path: A
     assert network_log.path == ""
     assert network_log.write_raw(label="body.bin", content=b"payload") == ""
     assert not (tmp_path / "prod-no-debug").exists()
+
+
+def test_local_ios_profile_uses_mobile_geometry_and_no_ch_headers() -> None:
+    runtime = fingerprint._generate_ios_phone_runtime_profile(
+        {
+            "country": "US",
+            "language": "en-US",
+            "locale": "en_US",
+            "timezone": "America/New_York",
+        }
+    )
+    profile = cast(dict[str, object], runtime["browser_profile"])
+    options = local_headless._context_options(
+        browser_profile=profile,
+        screen=cast(dict[str, object], runtime["screen"]),
+        viewport=cast(dict[str, object], runtime["viewport"]),
+    )
+    headers = local_headless._headless_extra_http_headers(profile)
+    script = local_headless._stealth_init_script(
+        browser_profile=profile,
+        screen=cast(dict[str, object], runtime["screen"]),
+        viewport=cast(dict[str, object], runtime["viewport"]),
+    )
+
+    assert local_headless._is_ios_webkit_profile(profile)
+    assert profile["user_agent"] == fingerprint.IOS_PHONE_USER_AGENT
+    assert options["is_mobile"] is True
+    assert options["has_touch"] is True
+    assert options["device_scale_factor"] == 3.0
+    assert options["viewport"] == {"width": 480, "height": 854}
+    assert options["screen"] == {"width": 480, "height": 854}
+    assert headers == {"Accept-Language": "en-US,en;q=0.9"}
+    assert "iosWebKit" in script
+    assert '"userAgentData", () => undefined' in script
+
+
+def test_local_ios_route_removes_chromium_client_hints() -> None:
+    runtime = fingerprint._generate_ios_phone_runtime_profile({"language": "en-US"})
+    profile = cast(dict[str, object], runtime["browser_profile"])
+    session = local_headless.LocalHeadlessSession(browser_profile=profile)
+
+    class Request:
+        url = "https://www.paypal.com/agreements/approve"
+        method = "GET"
+        resource_type = "document"
+        headers = {
+            "user-agent": fingerprint.IOS_PHONE_USER_AGENT,
+            "sec-ch-ua": '"Chromium";v="150"',
+            "sec-ch-ua-mobile": "?1",
+            "sec-ch-ua-platform": '"iOS"',
+        }
+
+    class Route:
+        request = Request()
+
+        def __init__(self) -> None:
+            self.continued: dict[str, object] | None = None
+            self.aborted = False
+
+        def continue_(self, **kwargs: object) -> None:
+            self.continued = kwargs
+
+        def abort(self) -> None:
+            self.aborted = True
+
+    class Context:
+        def __init__(self) -> None:
+            self.handler: Callable[[object], None] | None = None
+
+        def route(self, _pattern: str, handler: Callable[[object], None]) -> None:
+            self.handler = handler
+
+    context = Context()
+    session._context = context
+    session._network_mode = "datadome"
+    session._install_network_policy()
+    assert context.handler is not None
+    route = Route()
+    context.handler(route)
+
+    assert route.aborted is False
+    assert route.continued is not None
+    normalized = cast(dict[str, object], route.continued["headers"])
+    assert "user-agent" in normalized
+    assert not any(name.lower().startswith("sec-ch-") for name in normalized)
 
 
 def test_paypal_observability_route_urls_can_fulfill_datadog_after_counter_reset() -> None:
@@ -588,6 +674,29 @@ def test_roxy_session_close_unroutes_network_handler_and_closes_owned_page() -> 
     assert session._network_route_handler is None
     assert session._network_installed is False
     assert session._owned_pages == []
+
+
+def test_roxy_page_keeps_native_fingerprint_without_headless_cdp_override(monkeypatch: Any) -> None:
+    calls: list[str] = []
+
+    class FakePage:
+        def on(self, _event: str, _callback: object) -> None:
+            return None
+
+    monkeypatch.setattr(
+        local_headless,
+        "_apply_cdp_stealth_overrides",
+        lambda *_args, **_kwargs: calls.append("override"),
+    )
+    session = local_headless.LocalHeadlessSession(
+        roxy_browser={"cdp_info": {"http": "127.0.0.1:9222"}},
+        runtime="roxy",
+    )
+    session._context = object()
+
+    session._prepare_page_for_runtime(FakePage())
+
+    assert calls == []
 
 
 def test_signup_context_datadome_bootstrap_challenge_does_not_inject_risk(monkeypatch: Any) -> None:

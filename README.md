@@ -1,6 +1,6 @@
 # paypal-pay
 
-PayPal Billing Agreement 自动化运行工具，支持命令行和本地 Web UI 两种入口。项目会为每个任务生成运行所需的用户、账单地址、卡信息，并按配置使用本地 headless 浏览器或 RoxyBrowser 运行浏览器侧信号。
+PayPal Billing Agreement 自动化运行工具，支持命令行和本地 Web UI 两种入口。项目会为每个任务生成运行所需的用户、账单地址、卡信息，并按配置使用本地 headless 浏览器或 RoxyBrowser 运行浏览器侧信号。当前支持 US（默认）和 BR 区域；区域会同时决定 checkout headers、手机号、SMSBower 国家、资料和地址。
 
 ## 目录结构
 
@@ -57,6 +57,9 @@ cp .env.example .env
 ```env
 PAYPAL_PROXY_ENABLED=1
 PAYPAL_PROXY_URL=http://user:pass@host:port
+# 默认经代理出口查询 IANA timezone；也可固定为代理所在地时区。
+PAYPAL_PROXY_GEO_LOOKUP=1
+# PAYPAL_PROXY_TIMEZONE=America/Los_Angeles
 
 PAYPAL_FINGERPRINT_SOURCE=headless
 PAYPAL_DATADOME_MODE=headless
@@ -64,6 +67,10 @@ PAYPAL_MTR_RUNTIME=headless
 PAYPAL_RISK_SIGNALS_MODE=headless
 
 PAYPAL_HEADLESS=1
+# 本机 iOS：使用抓包中的 iPhone/Safari 身份运行本地 Playwright；DataDome、
+# MTR sealedResult 和 signup-context 会复用同一 iOS profile。
+PAYPAL_LOCAL_HEADLESS_DEVICE_PRESET=ios_phone
+# 等价写法：PAYPAL_FINGERPRINT_SOURCE=headless_ios
 PAYPAL_HEADLESS_MAX_CONCURRENCY=1
 PAYPAL_HEADLESS_ALLOWLIST_LEARNING=0
 PAYPAL_HEADLESS_ALLOWLIST_CACHE_ENABLED=0
@@ -92,6 +99,14 @@ PAYPAL_ROXY_API_HOST=127.0.0.1
 PAYPAL_ROXY_API_PORT=50000
 PAYPAL_ROXY_HEADLESS=1
 
+# iPhone/iOS 选项（网页的“Roxy iOS 手机指纹”与 CLI --fingerprint-source roxy_ios 等价）
+# 指纹 UA 基于 mitm_phone_capture_20260712_002743 中的 iPhone iOS 18.7 Safari 抓包。
+# PAYPAL_FINGERPRINT_SOURCE=roxy_ios
+# PAYPAL_ROXY_DEVICE_PRESET=ios_phone
+# DataDome/MTR 也可单独使用 roxy_ios；任一项选择后，任务会复用 iOS Roxy 浏览器。
+# PAYPAL_DATADOME_MODE=roxy_ios
+# PAYPAL_MTR_RUNTIME=roxy_ios
+
 # 生产不要自动创建团队/workspace
 PAYPAL_ROXY_FORCE_TEMP_WORKSPACE=0
 PAYPAL_ROXY_AUTO_CREATE_WORKSPACE=0
@@ -110,7 +125,7 @@ SMSBOWER_API_KEY=your_smsbower_api_key
 SMSBOWER_WAIT_SECONDS=30
 ```
 
-也可以不配置 SMSBower，运行时通过 `--phone` 使用手动验证码。
+US 抓包对应配置：`PAYPAL_REGION=US`，SMSBower 国家 ID 为 `12`，号码以 `+1` 和 10 位本地号码提交。也可以不配置 SMSBower，运行时通过 `--phone` 使用手动验证码。
 
 ## CLI 使用
 
@@ -119,7 +134,8 @@ SMSBOWER_WAIT_SECONDS=30
 ```bash
 python main.py \
   --ba-token BA-xxxxxxxxxxxxxxxx \
-  --phone +5591999999999 \
+  --region US \
+  --phone +14647681720 \
   --fingerprint-source headless \
   --datadome-mode headless \
   --mtr-runtime headless \
@@ -132,6 +148,7 @@ SMSBower 自动取号：
 ```bash
 python main.py \
   --ba-token BA-xxxxxxxxxxxxxxxx \
+  --region US \
   --smsbower \
   --fingerprint-source headless \
   --datadome-mode headless \
@@ -145,15 +162,16 @@ python main.py \
 | 参数 | 说明 |
 | --- | --- |
 | `--ba-token` | Billing Agreement token，必填 |
+| `--region` | checkout、手机号、地址和 SMSBower 使用的地区：`US`（默认）或 `BR` |
 | `--phone` | 手动手机号，未启用 SMSBower 时必填 |
 | `--smsbower` | 启用 SMSBower 自动取号和收码 |
 | `--proxy` / `--no-proxy` | 启用或禁用代理 |
 | `--proxy-url` | 本次运行指定代理 URL 或 `host:port:user:pass` |
 | `--proxy-index` | 从 `PAYPAL_PROXY_POOL` 选择指定代理 |
-| `--fingerprint-source` | `headless`、`roxy`、`random`、`auto` 等 |
-| `--datadome-mode` | `headless`、`roxy`、`protocol`、`auto`、`off` |
-| `--mtr-runtime` | `headless`、`roxy`、`python_generated`、`auto`、`off` |
-| `--risk-signals-mode` | `headless`、`roxy`、`protocol`、`auto`、`off` |
+| `--fingerprint-source` | `headless`、`headless_ios`、`roxy`、`roxy_ios`、`random`、`auto` 等 |
+| `--datadome-mode` | `headless`、`headless_ios`、`roxy`、`protocol`、`auto`、`off` |
+| `--mtr-runtime` | `headless`、`headless_ios`、`roxy`、`python_generated`、`auto`、`off` |
+| `--risk-signals-mode` | `headless`、`headless_ios`、`roxy`、`protocol`、`auto`、`off` |
 | `--max-card-attempts` | 卡提交失败后的换卡重试次数 |
 | `--max-flow-attempts` | 完整流程重试次数，默认 1 |
 | `--debug` | CLI 输出 DEBUG 日志 |
@@ -225,7 +243,7 @@ PAYPAL_HEADLESS_DEBUG_RAW=1
 程序侧流量记录默认关闭；需要对比时手动开启：
 
 ```bash
-python main.py --ba-token BA-xxx --phone +5591999999999 --record-traffic
+python main.py --ba-token BA-xxx --region US --phone +14647681720 --record-traffic
 ```
 
 记录会写入 `captures/`，不会提交到 Git。

@@ -551,6 +551,10 @@ class BrowserFlowOrderTest(unittest.TestCase):
 
         getattr(job, "add_log")("INFO", "Browser risk signal dispatch")
         getattr(job, "add_log")("WARNING", "Risk signal runtime failed")
+        getattr(job, "add_log")(
+            "INFO",
+            "Step 3 browser preflight completed: runtime=Roxy status=200 page_ready=True seed_used=True observed=fraudnet_p1 required_missing=<none>",
+        )
         try:
             raise RuntimeError("Risk signal runtime failed before SignUpNewMemberMutation")
         except RuntimeError as exc:
@@ -570,6 +574,7 @@ class BrowserFlowOrderTest(unittest.TestCase):
         self.assertNotIn("phase 1", browser_text)
         self.assertNotIn("risk", browser_text)
         self.assertNotIn("风控", browser_text)
+        self.assertIn("step 3 browser preflight completed: runtime=roxy", browser_text)
 
     def test_web_form_defaults_proxy_off_and_hides_risk_control(self):
         html = (Path(__file__).resolve().parents[1] / "web_static" / "index.html").read_text(encoding="utf-8")
@@ -716,7 +721,10 @@ class BrowserFlowOrderTest(unittest.TestCase):
     def test_signup_context_roxy_runs_even_when_legacy_enable_flag_is_off(self):
         flow, fake = make_flow(risk_signals_mode="roxy")
         setattr(flow, "_roxy_runtime_disabled_reason", "")
-        setattr(flow, "_last_signup_url", "https://www.paypal.com/checkoutweb/signup?token=EC-TEST123")
+        # A checkout response can report a normalized/redirected response URL
+        # while its HTML is still the valid signup document.  The current
+        # signup target, rather than this cached URL, must govern seeding.
+        setattr(flow, "_last_signup_url", "https://www.paypal.com/pay?token=EC-TEST123")
         setattr(flow, "_last_signup_html", "<html><body>Create account</body></html>")
         setattr(flow, "_last_signup_status", 200)
         send_signup_context = cast(Callable[[str, str], bool], getattr(flow, "_send_signup_context_risk_signals_with_roxy"))
@@ -758,8 +766,8 @@ class BrowserFlowOrderTest(unittest.TestCase):
         self.assertEqual(signup_context["correlation_id"], "EC-TEST123")
         self.assertEqual(fake.browser_cookies[-1]["value"], "dd-roxy")
 
-    def test_signup_attempt_falls_back_to_headless_when_roxy_context_fails_before_signup(self):
-        flow, _fake = make_flow(risk_signals_mode="roxy")
+    def test_signup_attempt_auto_falls_back_to_headless_when_roxy_context_fails_before_signup(self):
+        flow, _fake = make_flow(risk_signals_mode="auto")
         setattr(flow, "_roxy_runtime_disabled_reason", "")
         flow.state.ec_token = "EC-TEST123"
         flow.state.signup_url = "https://www.paypal.com/checkoutweb/signup?token=EC-TEST123"
@@ -805,6 +813,77 @@ class BrowserFlowOrderTest(unittest.TestCase):
             calls,
             ["roxy_signup_context", "headless_signup_context", "field_events", "signup"],
         )
+
+    def test_signup_attempt_explicit_roxy_blocks_graphql_when_browser_preflight_is_incomplete(self):
+        flow, fake = make_flow(risk_signals_mode="roxy")
+        setattr(flow, "_roxy_runtime_disabled_reason", "")
+        flow.state.ec_token = "EC-TEST123"
+        flow.state.signup_url = "https://www.paypal.com/checkoutweb/signup?token=EC-TEST123"
+        flow.state.content_identifier = "BR:pt:content:compliance.signupTerms"
+        flow.state.content_hash = "content"
+
+        incomplete_result = {
+            "ok": False,
+            "status": 403,
+            "url": flow.state.signup_url,
+            "observed": ["observability"],
+            "missing": ["fraudnet_p1", "fraudnet_p2", "fraudnet_w", "identity_di_log", "datadog_rum"],
+            "required_missing": ["fraudnet_p1", "fraudnet_p2", "fraudnet_w", "identity_di_log", "datadog_rum"],
+            "counts": {"observability": 1},
+            "signup_context_page": {"ok": False},
+            "signup_context_seeded_document": {"enabled": False},
+        }
+
+        with (
+            patch.object(flow, "_ensure_roxy_browser_for_datadome", return_value={"cdp_info": {}}),
+            patch("paypal.roxy_fingerprint.run_phase1_risk_with_roxy_browser", return_value=incomplete_result),
+            self.assertRaises(RuntimeError) as raised,
+        ):
+            run_signup_attempt(flow)
+
+        self.assertIn("fraudnet_p1", str(raised.exception))
+        self.assertNotIn("SignUpNewMemberMutation", fake.graphql_operations)
+
+    def test_signup_attempt_explicit_roxy_blocks_graphql_when_preflight_fails_without_missing_signal(self):
+        """A failed Roxy page must not be treated as success merely because it observed requests."""
+        flow, fake = make_flow(risk_signals_mode="roxy")
+        setattr(flow, "_roxy_runtime_disabled_reason", "")
+        flow.state.ec_token = "EC-TEST123"
+        flow.state.signup_url = "https://www.paypal.com/checkoutweb/signup?token=EC-TEST123"
+        flow.state.content_identifier = "BR:pt:content:compliance.signupTerms"
+        flow.state.content_hash = "content"
+
+        failed_result = {
+            "ok": False,
+            "status": 403,
+            "url": flow.state.signup_url,
+            "reason": "signup_context_datadome_challenge",
+            # The browser can observe all expected endpoints before the page
+            # transitions to a challenge.  This must still block an explicitly
+            # selected Roxy preflight.
+            "observed": ["fraudnet_p1", "fraudnet_p2", "fraudnet_w", "identity_di_log", "datadog_rum"],
+            "missing": [],
+            "required_missing": [],
+            "counts": {
+                "fraudnet_p1": 1,
+                "fraudnet_p2": 1,
+                "fraudnet_w": 1,
+                "identity_di_log": 1,
+                "datadog_rum": 1,
+            },
+            "signup_context_page": {"ok": False, "reason": "signup_context_datadome_challenge"},
+            "signup_context_seeded_document": {"enabled": True},
+        }
+
+        with (
+            patch.object(flow, "_ensure_roxy_browser_for_datadome", return_value={"cdp_info": {}}),
+            patch("paypal.roxy_fingerprint.run_phase1_risk_with_roxy_browser", return_value=failed_result),
+            self.assertRaises(RuntimeError) as raised,
+        ):
+            run_signup_attempt(flow)
+
+        self.assertIn("browser preflight did not complete", str(raised.exception))
+        self.assertNotIn("SignUpNewMemberMutation", fake.graphql_operations)
 
     def test_signup_attempt_runs_context_before_strict_signup_preflight(self):
         flow, _fake = make_flow(risk_signals_mode="off")
@@ -2797,6 +2876,65 @@ class BrowserFlowOrderTest(unittest.TestCase):
         self.assertEqual(mtr_runtime_mode(), "python_generated")
         self.assertEqual(risk_signals_mode(), "protocol")
         self.assertIn("Connection refused", str(flow.state.datadome_browser_result.get("error") or ""))
+
+    def test_roxy_transition_closes_active_local_headless_session_before_capture(self):
+        with patch.dict(os.environ, {"PAYPAL_FINGERPRINT_SOURCE": "random"}, clear=False):
+            flow, _fake = make_flow()
+
+        class ActiveHeadlessSession:
+            def __init__(self) -> None:
+                self._browser = object()
+                self._manager = object()
+                self.close_calls = 0
+
+            def close(self) -> None:
+                self.close_calls += 1
+                self._browser = None
+                self._manager = None
+
+        active = ActiveHeadlessSession()
+        setattr(flow, "_headless_session", active)
+        setattr(flow, "_headless_optimized_session", active)
+        ensure_roxy = cast(Callable[[], dict[str, object]], getattr(flow, "_ensure_roxy_browser_for_datadome"))
+
+        with patch(
+            "paypal.roxy_fingerprint.capture_roxy_runtime_profile",
+            return_value={"roxy_browser": {"cdp_info": {"http": "127.0.0.1:9222"}}},
+        ) as capture:
+            result = ensure_roxy()
+
+        self.assertEqual(active.close_calls, 1)
+        self.assertIsNone(getattr(flow, "_headless_session"))
+        self.assertEqual(result["cdp_info"], {"http": "127.0.0.1:9222"})
+        self.assertEqual(capture.call_args.kwargs["browser_profile"]["country"], "BR")
+
+    def test_ios_roxy_fallback_reopens_with_ios_device_preset(self):
+        with patch.dict(os.environ, {"PAYPAL_FINGERPRINT_SOURCE": "random"}, clear=False):
+            flow, _fake = make_flow()
+        setattr(flow, "fingerprint_source", "roxy_ios")
+        setattr(flow, "datadome_mode", "roxy_ios")
+        setattr(flow, "mtr_runtime", "roxy_ios")
+        ensure_roxy = cast(Callable[[], dict[str, object]], getattr(flow, "_ensure_roxy_browser_for_datadome"))
+
+        with patch(
+            "paypal.roxy_fingerprint.capture_roxy_runtime_profile",
+            return_value={"roxy_browser": {"cdp_info": {"http": "127.0.0.1:9222"}}},
+        ) as capture:
+            ensure_roxy()
+
+        assert capture.call_args.kwargs["device_preset"] == "ios_phone"
+
+    def test_ios_roxy_never_downgrades_signup_context_to_local_headless(self):
+        with patch.dict(os.environ, {"PAYPAL_FINGERPRINT_SOURCE": "random"}, clear=False):
+            flow, _fake = make_flow()
+        setattr(flow, "fingerprint_source", "roxy_ios")
+        setattr(flow, "datadome_mode", "roxy_ios")
+        setattr(flow, "mtr_runtime", "roxy_ios")
+        setattr(flow, "_roxy_runtime_disabled_reason", "prior DataDome attempt")
+
+        signup_mode = cast(Callable[[], str], getattr(flow, "_signup_context_risk_mode"))
+
+        self.assertEqual(signup_mode(), "roxy")
 
     def test_mtr_send_block_runtime_still_raises_when_required(self):
         send_mtr_signals = cast(Callable[..., bool], getattr(mtr_module, "send_mtr_signals"))

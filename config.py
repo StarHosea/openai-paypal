@@ -14,9 +14,9 @@ SCREEN = {
 
 VIEWPORT = {"width": 1365, "height": 768}
 
-# Keep every synthetic browser signal on the same regional/device profile.
-# The checkout flow is hard-coded for Brazil, so timezone, locale, analytics,
-# FraudNet and Client-Hints must all agree.
+# Baseline profile retained for programmatic BR callers.  PayPalFlow applies a
+# regional override and, when a proxy is enabled, derives the IANA timezone and
+# JavaScript offset from the proxy exit IP before any browser runtime is opened.
 BROWSER_PROFILE = {
     "country": "BR",
     "language": "pt-BR",
@@ -56,6 +56,7 @@ HCAPTCHA_SITEKEY = "884d15d9-b649-4bbb-8d1c-2d6f0eed75eb"
 #   "random" 继续使用程序内合成的随机/模板指纹；
 #   "roxy"   通过 RoxyBrowser Local API 创建随机指纹窗口，再从真实 Chromium
 #            runtime 读取 canvas/WebGL/audio/heap/screen/UA 等信号；
+#   "roxy_ios" 使用 Roxy 的 iOS 手机预设（iPhone iOS 18.7 / Safari UA）；
 #   "headless" 使用本机 Playwright headless Chromium 读取 runtime 信号；
 #   "auto"   当配置了 Roxy API key 时优先 Roxy，否则回退 random。
 # 运行时可用 PAYPAL_FINGERPRINT_SOURCE 覆盖。

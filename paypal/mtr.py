@@ -49,7 +49,13 @@ class _MtrState(Protocol):
 
 
 class _RoxyCaptureProfile(Protocol):
-    def __call__(self, *, keep_browser: bool, proxy_url: object = None) -> dict[str, object]: ...
+    def __call__(
+        self,
+        *,
+        keep_browser: bool,
+        proxy_url: object = None,
+        browser_profile: dict[str, object] | None = None,
+    ) -> dict[str, object]: ...
 
 
 class _RoxyMtrRunner(Protocol):
@@ -98,6 +104,7 @@ DEFAULT_DFP_SCRIPT_URL = "https://www.paypalobjects.com/v15170r-1d3n71ph1c4710n/
 MTR_RUNTIME_BLOCK = "block"
 MTR_RUNTIME_PYTHON_GENERATED = "python_generated"
 MTR_RUNTIME_ROXY = "roxy"
+MTR_RUNTIME_ROXY_IOS = "roxy_ios"
 MTR_RUNTIME_HEADLESS = "headless"
 MTR_RUNTIME_AUTO = "auto"
 MTR_RUNTIME_OFF = "off"
@@ -177,6 +184,8 @@ def mtr_runtime_mode(mode: str | None = None) -> str:
         return MTR_RUNTIME_OFF
     if mode in {"python", "protocol", "generated", "python_generated"}:
         return MTR_RUNTIME_PYTHON_GENERATED
+    if mode in {"roxy_ios", "roxy_iphone", "ios_roxy"}:
+        return MTR_RUNTIME_ROXY_IOS
     if mode in {"roxy", "browser", "real_browser", "chrome", "chromium"}:
         return MTR_RUNTIME_ROXY
     if mode in {"headless", "headless_optimized", "optimized_headless", "local_headless", "playwright", "local_playwright"}:
@@ -973,6 +982,7 @@ def _default_signal_value(kind: str) -> object:
 def _uses_runtime_profile(profile: dict[str, object]) -> bool:
     return _str_value(profile.get("fingerprint_source")).lower() in {
         "roxy",
+        "roxy_ios",
         "runtime",
         "browser",
         "headless",
@@ -1005,18 +1015,21 @@ def _apply_runtime_profile_to_state(state: _MtrState, runtime: dict[str, object]
 
 
 def _ensure_mtr_runtime_fingerprint_source(session: _MtrSession, state: _MtrState, source: str) -> None:
-    if _state_fingerprint_source(state) == source:
+    current_source = _state_fingerprint_source(state)
+    # roxy_ios is a Roxy runtime profile too; do not replace it with the
+    # desktop Roxy preset merely because MTR is configured as `roxy`.
+    if current_source == source or (source == MTR_RUNTIME_ROXY and current_source == "roxy_ios"):
         return
     fingerprint_module = importlib.import_module("paypal.fingerprint")
     generate_runtime_profile = cast(Callable[..., dict[str, object]], getattr(fingerprint_module, "generate_runtime_profile"))
-    strict_env = "PAYPAL_ROXY_FINGERPRINT_STRICT" if source == MTR_RUNTIME_ROXY else "PAYPAL_HEADLESS_FINGERPRINT_STRICT"
+    strict_env = "PAYPAL_ROXY_FINGERPRINT_STRICT" if source in {MTR_RUNTIME_ROXY, MTR_RUNTIME_ROXY_IOS} else "PAYPAL_HEADLESS_FINGERPRINT_STRICT"
     previous_strict = os.environ.get(strict_env)
     os.environ[strict_env] = "1"
     try:
         runtime = generate_runtime_profile(
             source,
             roxy_proxy_url=getattr(session, "proxy_url", None) or "",
-            keep_roxy_browser=source == MTR_RUNTIME_ROXY,
+            keep_roxy_browser=source in {MTR_RUNTIME_ROXY, MTR_RUNTIME_ROXY_IOS},
         )
     finally:
         if previous_strict is None:
@@ -2204,6 +2217,7 @@ def _send_mtr_with_roxy_browser(session: _MtrSession, state: _MtrState, *, page_
         runtime = capture_roxy_runtime_profile(
             keep_browser=True,
             proxy_url=proxy_url,
+            browser_profile=dict(getattr(state, "browser_profile", {}) or {}),
         )
         roxy_browser = _dict_value(runtime.get("roxy_browser"))
         setattr(state, "roxy_browser", roxy_browser)
@@ -2272,12 +2286,16 @@ def send_mtr_signals(
             raise RuntimeError("MTR is disabled while PAYPAL_REQUIRE_MTR=1")
         return False
 
-    if mode in {MTR_RUNTIME_ROXY, MTR_RUNTIME_AUTO}:
+    if mode in {MTR_RUNTIME_ROXY, MTR_RUNTIME_ROXY_IOS, MTR_RUNTIME_AUTO}:
         try:
-            _ensure_mtr_runtime_fingerprint_source(session, state, MTR_RUNTIME_ROXY)
+            _ensure_mtr_runtime_fingerprint_source(
+                session,
+                state,
+                MTR_RUNTIME_ROXY_IOS if mode == MTR_RUNTIME_ROXY_IOS else MTR_RUNTIME_ROXY,
+            )
             return _send_mtr_with_roxy_browser(session, state, page_url=page_url)
         except Exception as exc:
-            if mode == MTR_RUNTIME_ROXY and not roxy_runtime_fallback_enabled():
+            if mode in {MTR_RUNTIME_ROXY, MTR_RUNTIME_ROXY_IOS} and not roxy_runtime_fallback_enabled():
                 raise
             if getattr(state, "mtr_browser_result", None) is not None:
                 setattr(state, "mtr_browser_result", {"ok": False, "error": str(exc)})

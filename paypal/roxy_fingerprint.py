@@ -10,6 +10,7 @@ import re
 import time
 import urllib.parse
 import uuid
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
@@ -29,11 +30,42 @@ from config import (
     USER_AGENT,
     VIEWPORT,
 )
+from paypal.playwright_sync import run_sync_playwright_operation
 
 
 class RoxyFingerprintError(RuntimeError):
     """Raised when RoxyBrowser cannot provide a runtime fingerprint."""
 
+
+# Values observed in mitm_phone_capture_20260712_002743.  Keep this preset in
+# one place: a Roxy profile, its browser-side runtime, and protocol requests
+# must all use the same mobile identity for the lifetime of a flow.
+IOS_PHONE_CAPTURE_PRESET: dict[str, Any] = {
+    "user_agent": (
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) "
+        "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.5 "
+        "Mobile/15E148 Safari/604.1"
+    ),
+    "language": "zh-CN",
+    "display_language": "zh-CN",
+    # Roxy's Local API uses the enum spelling `IOS` (uppercase), while the UI
+    # renders it as iOS.  Sending the display text `iOS` causes os参数值错误.
+    "os_name": "IOS",
+    # Current Roxy iOS profile catalogue (shown in the desktop UI) exposes
+    # iOS 26. Keep the captured UA independently configurable below.
+    "os_version": "26",
+    # Roxy Local API only accepts Chrome/Firefox as `coreType`; iOS/Safari is
+    # selected through the OS/mobile fingerprint fields below, not this engine
+    # selector.  Passing Safari here makes /browser/create reject the profile.
+    "core_type": "Chrome",
+    # Roxy's current iOS catalogue uses CSS-pixel mobile resolutions.  The
+    # previous 1179x2556 values were physical pixels paired with DPR=3, which
+    # made `screen`/`innerWidth` three times too large for an iPhone UA.
+    "open_width": 480,
+    "open_height": 854,
+    "screen_width": 480,
+    "screen_height": 854,
+}
 
 def _load_dotenv_value(name: str) -> str:
     """Read one value from local .env without adding a runtime dependency."""
@@ -332,12 +364,22 @@ class RoxyCaptureConfig:
     timezone: str = "America/Sao_Paulo"
     follow_ip: bool = False
     core_version: str = ""
+    core_type: str = "Chrome"
     os_name: str = "Windows"
     os_version: str = "11"
+    device_preset: str = "desktop"
+    user_agent: str = ""
+    mobile: bool = False
+    random_fingerprint: bool = True
     proxy_url: str = ""
 
 
-def load_roxy_capture_config(proxy_url: str | None = None) -> RoxyCaptureConfig:
+def load_roxy_capture_config(
+    proxy_url: str | None = None,
+    *,
+    browser_profile: Mapping[str, object] | None = None,
+    device_preset: str | None = None,
+) -> RoxyCaptureConfig:
     port = _env_int("PAYPAL_ROXY_API_PORT", ROXY_API_PORT) or ROXY_API_PORT
     host = _env_str("PAYPAL_ROXY_API_HOST", ROXY_API_HOST)
     api_base = (
@@ -345,12 +387,32 @@ def load_roxy_capture_config(proxy_url: str | None = None) -> RoxyCaptureConfig:
         or _env_str("ROXY_API_BASE")
         or f"http://{host}:{port}"
     ).rstrip("/")
-    language = str(BROWSER_PROFILE.get("language") or "pt-BR")
+    profile = dict(BROWSER_PROFILE)
+    if browser_profile:
+        profile.update(dict(browser_profile))
+    selected_preset = (device_preset or _env_str("PAYPAL_ROXY_DEVICE_PRESET", "desktop")).strip().lower().replace("-", "_")
+    if selected_preset in {"ios", "iphone", "ios_phone", "roxy_ios"}:
+        selected_preset = "ios_phone"
+        profile = {**profile, **IOS_PHONE_CAPTURE_PRESET}
+    elif selected_preset != "desktop":
+        raise RoxyFingerprintError(f"Unsupported Roxy device preset: {selected_preset}")
+    language = str(profile.get("language") or "pt-BR")
+    timezone_offset = _first_int(profile.get("timezone_offset_minutes"))
+    if timezone_offset is None:
+        timezone_offset = 180
     timezone = _roxy_timezone_value(
-        str(BROWSER_PROFILE.get("timezone") or "America/Sao_Paulo"),
-        int(BROWSER_PROFILE.get("timezone_offset_minutes") or 180),
+        str(profile.get("timezone") or "America/Sao_Paulo"),
+        timezone_offset,
     )
-    headless = _env_bool("PAYPAL_ROXY_HEADLESS", ROXY_HEADLESS)
+    ios_phone = selected_preset == "ios_phone"
+    # Roxy's IOS core closes its CDP target when opened with `headless=true`.
+    # Do not inherit the desktop PAYPAL_ROXY_HEADLESS=1 setting for this
+    # preset; use a separate opt-in switch if a future Roxy build supports it.
+    headless = (
+        _env_bool("PAYPAL_ROXY_IOS_HEADLESS", False)
+        if ios_phone
+        else _env_bool("PAYPAL_ROXY_HEADLESS", ROXY_HEADLESS)
+    )
     return RoxyCaptureConfig(
         api_base=api_base,
         api_key=configured_roxy_api_key(),
@@ -366,17 +428,31 @@ def load_roxy_capture_config(proxy_url: str | None = None) -> RoxyCaptureConfig:
         delete_auto_workspace=_env_bool("PAYPAL_ROXY_DELETE_AUTO_WORKSPACE", False),
         force_temp_workspace=_env_bool("PAYPAL_ROXY_FORCE_TEMP_WORKSPACE", False),
         workspace_name_prefix=_env_str("PAYPAL_ROXY_WORKSPACE_NAME_PREFIX", "paypal-auto"),
-        open_width=_env_int("PAYPAL_ROXY_OPEN_WIDTH", int(VIEWPORT.get("width", 1365) or 1365)) or 1365,
-        open_height=_env_int("PAYPAL_ROXY_OPEN_HEIGHT", int(VIEWPORT.get("height", 768) or 768)) or 768,
-        screen_width=_env_int("PAYPAL_ROXY_SCREEN_WIDTH", int(SCREEN.get("width", 1536) or 1536)) or 1536,
-        screen_height=_env_int("PAYPAL_ROXY_SCREEN_HEIGHT", int(SCREEN.get("height", 864) or 864)) or 864,
+        open_width=_env_int("PAYPAL_ROXY_OPEN_WIDTH", int(profile.get("open_width") or VIEWPORT.get("width", 1365) or 1365)) or 1365,
+        open_height=_env_int("PAYPAL_ROXY_OPEN_HEIGHT", int(profile.get("open_height") or VIEWPORT.get("height", 768) or 768)) or 768,
+        screen_width=_env_int("PAYPAL_ROXY_SCREEN_WIDTH", int(profile.get("screen_width") or SCREEN.get("width", 1536) or 1536)) or 1536,
+        screen_height=_env_int("PAYPAL_ROXY_SCREEN_HEIGHT", int(profile.get("screen_height") or SCREEN.get("height", 864) or 864)) or 864,
         language=_env_str("PAYPAL_ROXY_LANGUAGE", language),
         display_language=_env_str("PAYPAL_ROXY_DISPLAY_LANGUAGE", language),
-        timezone=_env_str("PAYPAL_ROXY_TIMEZONE", timezone),
-        follow_ip=_env_bool("PAYPAL_ROXY_FOLLOW_IP", False),
+        # The iOS UI uses "based on IP" timezone.  Do not inherit the
+        # desktop PAYPAL_ROXY_TIMEZONE override here: desktop GMT values are
+        # rejected by /browser/create for IOS profiles.  An iOS-specific
+        # override remains available for users who deliberately need one.
+        timezone=(
+            _env_str("PAYPAL_ROXY_IOS_TIMEZONE", "")
+            if ios_phone
+            else _env_str("PAYPAL_ROXY_TIMEZONE", timezone)
+        ),
+        follow_ip=_env_bool("PAYPAL_ROXY_FOLLOW_IP", ios_phone),
         core_version=_env_str("PAYPAL_ROXY_CORE_VERSION", ""),
-        os_name=_env_str("PAYPAL_ROXY_OS", "Windows"),
-        os_version=_env_str("PAYPAL_ROXY_OS_VERSION", "11"),
+        core_type=_env_str("PAYPAL_ROXY_CORE_TYPE", str(profile.get("core_type") or "Chrome")),
+        os_name=_env_str("PAYPAL_ROXY_OS", str(profile.get("os_name") or "Windows")),
+        os_version=_env_str("PAYPAL_ROXY_OS_VERSION", str(profile.get("os_version") or "11")),
+        device_preset=selected_preset,
+        user_agent=_env_str("PAYPAL_ROXY_USER_AGENT", str(profile.get("user_agent") or "")),
+        mobile=ios_phone,
+        # random_env can replace the iOS UA/device fields after creation.
+        random_fingerprint=not ios_phone,
         # `proxy_url` is tri-state:
         #   None => standalone/default mode may use PAYPAL_ROXY_PROXY_URL;
         #   ""   => explicit no-proxy, used when the Web/CLI flow disables proxy;
@@ -402,15 +478,66 @@ class RoxyApiClient:
     def close(self) -> None:
         self.client.close()
 
-    def request(self, method: str, path: str, **kwargs: Any) -> dict[str, Any]:
+    def _refresh_api_key_from_desktop(self) -> bool:
+        """Refresh a stale configured Local API key from the running desktop app."""
+        api_key = _load_roxy_public_api_key()
+        if not api_key or api_key == self.config.api_key:
+            return False
+        old_prefix = self.config.api_key[:4] if self.config.api_key else ""
+        self._set_api_key(api_key)
+        logger.info(
+            "Roxy Local API key was rejected; retrying with current desktop API key prefix={} (old prefix={})",
+            api_key[:4],
+            old_prefix,
+        )
+        return True
+
+    @staticmethod
+    def _is_api_key_error(payload: dict[str, Any]) -> bool:
+        message = str(payload.get("msg") or payload.get("message") or "").lower()
+        return any(marker in message for marker in ("token", "api key", "apikey", "unauthorized", "auth", "验证失败"))
+
+    def request(
+        self,
+        method: str,
+        path: str,
+        *,
+        _retry_current_desktop_key: bool = True,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
         response = self.client.request(method, path, **kwargs)
-        response.raise_for_status()
+        try:
+            response.raise_for_status()
+        except httpx.HTTPStatusError:
+            if (
+                _retry_current_desktop_key
+                and int(getattr(response, "status_code", 0) or 0) in {401, 403}
+                and self._refresh_api_key_from_desktop()
+            ):
+                return self.request(
+                    method,
+                    path,
+                    _retry_current_desktop_key=False,
+                    **kwargs,
+                )
+            raise
         try:
             payload = response.json()
         except Exception as exc:
             raise RoxyFingerprintError(f"Roxy API {path} 返回非 JSON 响应") from exc
         code = payload.get("code")
         if code not in (0, "0", None):
+            if (
+                _retry_current_desktop_key
+                and self._is_api_key_error(payload)
+                and self._refresh_api_key_from_desktop()
+            ):
+                return self.request(
+                    method,
+                    path,
+                    _retry_current_desktop_key=False,
+                    **kwargs,
+                )
             msg = payload.get("msg") or payload.get("message") or payload
             raise RoxyFingerprintError(f"Roxy API {path} failed: {msg}")
         return payload
@@ -438,9 +565,70 @@ class RoxyApiClient:
         except Exception as exc:
             logger.debug("Roxy workspace retry with desktop API key failed: {}", exc)
             return []
-        data = payload.get("data") or {}
-        rows = data.get("rows") or []
-        return cast(list[dict[str, Any]], rows) if isinstance(rows, list) else []
+        return self._workspace_rows(payload)
+
+    @staticmethod
+    def _workspace_rows(payload: dict[str, Any]) -> list[dict[str, Any]]:
+        """Read workspace rows from Local API and desktop-app response shapes."""
+        data = payload.get("data")
+        candidates: list[object] = []
+        if isinstance(data, dict):
+            candidates.extend(
+                [
+                    data.get("rows"),
+                    data.get("list"),
+                    data.get("workspaceList"),
+                    data.get("workspaces"),
+                ]
+            )
+        else:
+            candidates.append(data)
+        for candidate in candidates:
+            if isinstance(candidate, list):
+                return [cast(dict[str, Any], row) for row in candidate if isinstance(row, dict)]
+        return []
+
+    @staticmethod
+    def _project_id_from_workspace_row(row: dict[str, Any]) -> int | None:
+        direct = _first_int(
+            row.get("projectId"),
+            row.get("project_id"),
+            row.get("defaultProjectId"),
+        )
+        if direct is not None:
+            return direct
+        projects = row.get("project_details") or row.get("projectDetails") or row.get("projects") or []
+        if isinstance(projects, list):
+            for project in projects:
+                if isinstance(project, dict):
+                    project_id = _first_int(project.get("projectId"), project.get("id"), project.get("project_id"))
+                    if project_id is not None:
+                        return project_id
+        return None
+
+    @staticmethod
+    def _desktop_workspace_selection() -> tuple[int | None, int | None]:
+        """Use the workspace currently selected in the Roxy desktop app.
+
+        The local ``/browser/workspace`` endpoint can briefly return an empty
+        list after its OpenAPI key rotates even though the desktop app has a
+        valid active workspace.  The encrypted desktop config is the source of
+        truth for that selected workspace and is accepted by profile APIs.
+        """
+        session_config = _load_roxy_session_config()
+        workspace_id = _first_int(
+            session_config.get("workspaceId"),
+            session_config.get("workspace_id"),
+            session_config.get("selectedWorkspaceId"),
+            session_config.get("lastWorkspaceId"),
+        )
+        project_id = _first_int(
+            session_config.get("projectId"),
+            session_config.get("project_id"),
+            session_config.get("selectedProjectId"),
+            session_config.get("lastProjectId"),
+        )
+        return workspace_id, project_id
 
     def _app_workspace_headers(self, session_config: dict[str, Any]) -> dict[str, str]:
         token = str(session_config.get("token") or "").strip()
@@ -478,9 +666,7 @@ class RoxyApiClient:
 
     def list_app_workspaces(self) -> list[dict[str, Any]]:
         payload = self._app_request("GET", "/user_get_workspace_list")
-        data = payload.get("data") or {}
-        rows = data.get("rows") or []
-        return cast(list[dict[str, Any]], rows) if isinstance(rows, list) else []
+        return self._workspace_rows(payload)
 
     def create_workspace(self) -> tuple[int, str]:
         if not self.config.auto_create_workspace:
@@ -535,11 +721,19 @@ class RoxyApiClient:
                     exc,
                 )
         payload = self.request("GET", "/browser/workspace", params={"page_index": 1, "page_size": 50})
-        data = payload.get("data") or {}
-        rows = data.get("rows") or []
+        rows = self._workspace_rows(payload)
         if not rows:
             rows = self._retry_workspace_with_roxy_app_api_key()
         if not rows:
+            desktop_workspace_id, desktop_project_id = self._desktop_workspace_selection()
+            if desktop_workspace_id is not None:
+                project_id = self.config.project_id if self.config.project_id is not None else desktop_project_id
+                logger.info(
+                    "Roxy workspace list is empty; using desktop-selected workspace_id={} project_id={}",
+                    desktop_workspace_id,
+                    project_id if project_id is not None else "<default>",
+                )
+                return desktop_workspace_id, project_id
             try:
                 rows = self.list_app_workspaces()
             except Exception as exc:
@@ -552,20 +746,22 @@ class RoxyApiClient:
                 "未找到已有 Roxy workspace/team；已按配置跳过自动创建团队。"
                 "请先在 Roxy 中选择/创建团队，或设置 PAYPAL_ROXY_WORKSPACE_ID。"
             )
-        row = rows[0]
-        workspace_id = int(row.get("id"))
-        project_id = self.config.project_id
-        projects = row.get("project_details") or []
-        if project_id is None and projects:
-            project_id = int(projects[0].get("projectId"))
-        return workspace_id, project_id
+        for row in rows:
+            workspace_id = _first_int(row.get("id"), row.get("workspaceId"), row.get("workspace_id"))
+            if workspace_id is None:
+                continue
+            project_id = self.config.project_id
+            if project_id is None:
+                project_id = self._project_id_from_workspace_row(row)
+            return workspace_id, project_id
+        raise RoxyFingerprintError("Roxy workspace response did not include a usable workspace id")
 
     def create_profile(self, workspace_id: int, project_id: int | None) -> str:
         proxy_info = _roxy_proxy_info(self.config.proxy_url)
         payload: dict[str, Any] = {
             "workspaceId": workspace_id,
             "windowName": f"paypal-fp-{uuid.uuid4().hex[:10]}",
-            "coreType": "Chrome",
+            "coreType": self.config.core_type,
             "os": self.config.os_name,
             "osVersion": self.config.os_version,
             "cookie": [],
@@ -579,7 +775,6 @@ class RoxyApiClient:
                 "isDisplayLanguageBaseIp": self.config.follow_ip,
                 "displayLanguage": self.config.display_language,
                 "isTimeZone": self.config.follow_ip,
-                "timeZone": self.config.timezone,
                 "position": 0,
                 "isPositionBaseIp": self.config.follow_ip,
                 "forbidAudio": False,
@@ -601,7 +796,7 @@ class RoxyApiClient:
                 "clearCacheFile": True,
                 "clearCookie": True,
                 "clearLocalStorage": True,
-                "randomFingerprint": True,
+                "randomFingerprint": self.config.random_fingerprint,
                 "forbidSavePassword": True,
                 "stopOpenNet": False,
                 "stopOpenIP": False,
@@ -636,6 +831,24 @@ class RoxyApiClient:
                 "startupParam": "",
             },
         }
+        # With "based on IP" selected, Roxy's own UI does not need a desktop
+        # timezone value. Omitting it avoids validation of a stale/unsupported
+        # timezone string during an IOS profile fallback.
+        if self.config.timezone:
+            payload["fingerInfo"]["timeZone"] = self.config.timezone
+        if self.config.mobile:
+            # Roxy's profile API accepts these mobile fields on current builds.
+            # Keeping them in fingerInfo also leaves older Local API versions
+            # free to ignore an unknown field rather than changing launch args.
+            payload["fingerInfo"].update(
+                {
+                    "userAgent": self.config.user_agent,
+                    "isMobile": True,
+                    "mobile": True,
+                    "devicePixelRatio": 3,
+                    "touch": True,
+                }
+            )
         if self.config.core_version:
             payload["coreVersion"] = self.config.core_version
         if project_id is not None:
@@ -654,6 +867,9 @@ class RoxyApiClient:
         return dir_id
 
     def randomize_profile(self, workspace_id: int, dir_id: str) -> None:
+        if not self.config.random_fingerprint:
+            logger.debug("Keeping configured {} Roxy fingerprint for {}", self.config.device_preset, dir_id)
+            return
         self.request("POST", "/browser/random_env", json={"workspaceId": workspace_id, "dirId": dir_id})
 
     def open_profile(self, workspace_id: int, dir_id: str) -> dict[str, Any]:
@@ -831,7 +1047,7 @@ def _sha256_b64(value: Any) -> str:
 
 
 def _parse_chrome_major(user_agent: str, fallback: int = 150) -> int:
-    match = re.search(r"(?:Chrome|Chromium|Edg)/(\d+)", user_agent or "")
+    match = re.search(r"(?:Chrome|Chromium|Edg|CriOS)/(\d+)", user_agent or "")
     if not match:
         return fallback
     try:
@@ -850,7 +1066,7 @@ def _full_version_from_ua_data(ua_data: dict[str, Any] | None, user_agent: str, 
         version = str(ua_data.get("uaFullVersion") or "")
         if version:
             return version
-    match = re.search(r"(?:Chrome|Chromium)/([0-9.]+)", user_agent or "")
+    match = re.search(r"(?:Chrome|Chromium|CriOS)/([0-9.]+)", user_agent or "")
     if match:
         return match.group(1)
     return f"{major}.0.0.0"
@@ -1539,7 +1755,7 @@ def _execute_roxy_interaction_plan(page: Any, plan: list[dict[str, int | str]]) 
     return summary
 
 
-def _evaluate_cdp_fingerprint(
+def _evaluate_cdp_fingerprint_direct(
     cdp_info: dict[str, Any],
     timeout_ms: int,
     *,
@@ -1721,15 +1937,52 @@ async () => {
   };
 }
 """
+    # The visible iOS core sometimes publishes CDP before its first tab is
+    # stable. Reconnect instead of treating that short window as a failed
+    # Roxy fingerprint and falling back to a desktop Python profile.
+    last_error: Exception | None = None
     with sync_playwright() as p:
-        browser = p.chromium.connect_over_cdp(endpoint, timeout=timeout_ms)
-        context = browser.contexts[0] if browser.contexts else browser.new_context()
-        page = context.pages[0] if context.pages else context.new_page()
-        page.goto("about:blank", wait_until="domcontentloaded", timeout=timeout_ms)
-        result = page.evaluate(script)
-        if close_browser:
-            browser.close()
-        return result
+        for attempt in range(3):
+            browser: Any | None = None
+            try:
+                browser = p.chromium.connect_over_cdp(endpoint, timeout=timeout_ms)
+                context = browser.contexts[0] if browser.contexts else browser.new_context()
+                pages = [candidate for candidate in context.pages if not getattr(candidate, "is_closed", lambda: False)()]
+                page = pages[0] if pages else context.new_page()
+                page.goto("about:blank", wait_until="domcontentloaded", timeout=timeout_ms)
+                result = page.evaluate(script)
+                if close_browser:
+                    browser.close()
+                return result
+            except Exception as exc:
+                last_error = exc
+                if browser is not None:
+                    try:
+                        browser.close()
+                    except Exception:
+                        pass
+                if attempt < 2:
+                    time.sleep(0.75 * (attempt + 1))
+        if last_error is not None:
+            raise last_error
+    raise RoxyFingerprintError("Roxy CDP fingerprint probe did not return a result")
+
+
+def _evaluate_cdp_fingerprint(
+    cdp_info: dict[str, Any],
+    timeout_ms: int,
+    *,
+    close_browser: bool = True,
+) -> dict[str, Any]:
+    """Evaluate the Roxy CDP runtime without nesting sync Playwright loops."""
+    return run_sync_playwright_operation(
+        lambda: _evaluate_cdp_fingerprint_direct(
+            cdp_info,
+            timeout_ms,
+            close_browser=close_browser,
+        ),
+        label="roxy-cdp-fingerprint",
+    )
 
 
 def _runtime_to_profile(js: dict[str, Any], cdp_info: dict[str, Any]) -> dict[str, Any]:
@@ -1744,6 +1997,7 @@ def _runtime_to_profile(js: dict[str, Any], cdp_info: dict[str, Any]) -> dict[st
     connection = _dict_value(js.get("connection"))
     webgl = _dict_value(js.get("webgl"))
     window_info = _dict_value(js.get("window"))
+    is_ios_mobile = "iphone" in user_agent.lower() or platform.lower() in {"iphone", "ipad", "ipod"}
     profile: dict[str, Any] = dict(BROWSER_PROFILE)
     profile.update(
         {
@@ -1773,8 +2027,15 @@ def _runtime_to_profile(js: dict[str, Any], cdp_info: dict[str, Any]) -> dict[st
             "webgl_vendor": str(webgl.get("vendor") or BROWSER_PROFILE.get("webgl_vendor") or "WebKit"),
             "webgl_renderer": str(webgl.get("renderer") or BROWSER_PROFILE.get("webgl_renderer") or "WebKit WebGL"),
             "user_agent": user_agent,
+            "is_mobile": is_ios_mobile,
+            "browser_family": "ios_chrome" if "crios/" in user_agent.lower() else ("ios_safari" if is_ios_mobile else "chrome"),
         }
     )
+    if is_ios_mobile:
+        # iOS WebKit/CriOS has no Chromium UA Client Hints.  Preserve this
+        # fact for HTTP fallbacks instead of retaining baseline Linux hints.
+        profile["sec_ch_platform"] = ""
+        profile["sec_ch_arch"] = ""
     return profile
 
 
@@ -1850,8 +2111,14 @@ def capture_roxy_runtime_profile(
     *,
     keep_browser: bool = False,
     proxy_url: str | None = None,
+    browser_profile: Mapping[str, object] | None = None,
+    device_preset: str | None = None,
 ) -> dict[str, Any]:
-    config = config or load_roxy_capture_config(proxy_url=proxy_url)
+    config = config or load_roxy_capture_config(
+        proxy_url=proxy_url,
+        browser_profile=browser_profile,
+        device_preset=device_preset,
+    )
     if proxy_url is not None:
         config.proxy_url = _canonical_proxy_url(proxy_url)
     if keep_browser:
@@ -1963,19 +2230,30 @@ def solve_datadome_with_roxy(
     *,
     cookies: list[dict[str, Any]] | None = None,
     wait_seconds: float = 12.0,
+    accept_clean_page: bool = False,
 ) -> dict[str, Any]:
     """Run DataDome through the shared local-headless logic on an existing Roxy browser."""
     from paypal.local_headless import LocalHeadlessSession
 
-    session = LocalHeadlessSession(
-        cookies=cast(list[dict[str, object]] | None, cookies),
-        roxy_browser=cast(dict[str, object], roxy_browser),
-        runtime="roxy",
-    )
-    try:
-        return cast(dict[str, Any], session.solve_datadome(url, wait_seconds=wait_seconds))
-    finally:
-        session.close()
+    def run() -> dict[str, Any]:
+        session = LocalHeadlessSession(
+            cookies=cast(list[dict[str, object]] | None, cookies),
+            roxy_browser=cast(dict[str, object], roxy_browser),
+            runtime="roxy",
+        )
+        try:
+            return cast(
+                dict[str, Any],
+                session.solve_datadome(
+                    url,
+                    wait_seconds=wait_seconds,
+                    accept_clean_page=accept_clean_page,
+                ),
+            )
+        finally:
+            session.close()
+
+    return run_sync_playwright_operation(run, label="roxy-datadome")
 
 
 def _extract_mtr_response_data(value: Any) -> dict[str, Any]:

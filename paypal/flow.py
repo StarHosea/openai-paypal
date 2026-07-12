@@ -31,6 +31,7 @@ from paypal.models import (
     generate_card,
     generate_random_email,
 )
+from paypal.regions import PayPalRegion, get_region
 from paypal.session import (
     CAPTCHA_SOLVED_CFCI,
     CAPTCHA_FRONTEND_DISABLE_MODE,
@@ -45,7 +46,13 @@ from paypal.session import (
     strict_browser_risk_enabled,
 )
 from paypal.mtr import MTR_RUNTIME_PYTHON_GENERATED, extract_dfp_script_url, extract_mtr_config, ensure_mtr_config, send_mtr_signals
-from paypal.proxy import build_proxy_config, ProxyConfig, _load_dotenv_value as _load_proxy_dotenv_value
+from paypal.proxy import (
+    build_proxy_config,
+    ProxyConfig,
+    proxy_timezone_profile,
+    timezone_profile,
+    _load_dotenv_value as _load_proxy_dotenv_value,
+)
 from paypal.fingerprint import (
     ensure_runtime_profile,
     build_fn_sync_data,
@@ -76,6 +83,8 @@ from paypal.graphql import (
     DEFERRED_FEATURE_QUERY,
     INSTALLMENT_OPTIONS_QUERY,
     ADDRESS_AUTOCOMPLETE_FROM_POSTAL_CODE_QUERY,
+    ADDRESS_AUTOCOMPLETE_QUERY,
+    ADDRESS_FROM_AUTOCOMPLETE_PLACE_ID_QUERY,
     INITIATE_2FA_PHONE_MUTATION,
     CONFIRM_2FA_PHONE_MUTATION,
     SIGNUP_NEW_MEMBER_MUTATION,
@@ -152,13 +161,22 @@ class PayPalFlow:
         mtr_runtime: str | None = None,
         risk_signals_mode: str | None = None,
         sms_provider: SmsOtpProviderProtocol | None = None,
+        region: str | PayPalRegion | None = None,
     ):
         self.ba_token = ba_token
+        self.address = address
+        self.region = (
+            region
+            if isinstance(region, PayPalRegion)
+            else get_region(region or self.address.country, default="BR")
+        )
+        # A flow must not combine a US phone/provider with BR checkout headers.
+        self.address.country = self.region.code
+        self._regional_browser_profile = self.region.browser_profile_overrides()
         self.user = user
         if not self.user.email:
-            self.user.email = generate_random_email()
+            self.user.email = generate_random_email(self.region.code)
         self.card = card
-        self.address = address
         self.max_card_attempts = max(1, max_card_attempts)
         self.max_flow_attempts = max(1, max_flow_attempts)
         self.max_authorize_attempts = max(1, max_authorize_attempts)
@@ -168,11 +186,29 @@ class PayPalFlow:
             enabled=proxy_enabled,
             index=proxy_index,
         )
+        # Keep the browser's IANA zone and both offset fields tied to the
+        # proxy exit, not to the host running this process.  Locale/country
+        # remain the selected checkout region and are deliberately untouched.
+        regional_timezone = timezone_profile(self.region.timezone)
+        self._regional_browser_profile.update(regional_timezone)
+        self._regional_browser_profile = proxy_timezone_profile(
+            self.proxy_config,
+            self._regional_browser_profile,
+        )
         self.fingerprint_source = fingerprint_source
         self.datadome_mode = datadome_mode
         self.mtr_runtime = mtr_runtime
         self.risk_signals_mode = risk_signals_mode
         self.sms_provider = sms_provider
+        if self._local_ios_runtime_requested() and not self._fingerprint_runtime_requested_roxy():
+            # Selecting the local iOS runtime for any browser stage means the
+            # initial profile must be iPhone-shaped as well.  Otherwise Phase
+            # 0 would first create a Linux/Chromium HTTP identity and only
+            # switch to iOS after DataDome had already challenged it.
+            self.fingerprint_source = "headless_ios"
+            self._regional_browser_profile.update(
+                {"is_ios_webkit": True, "device_preset": "ios_phone"}
+            )
         self._requested_risk_signals_mode = self._risk_signals_mode_raw()
         self._roxy_runtime_disabled_reason = ""
         keep_roxy_browser = self._roxy_runtime_requested()
@@ -182,6 +218,7 @@ class PayPalFlow:
             source=self.fingerprint_source,
             roxy_proxy_url=self.proxy_config.url or "",
             keep_roxy_browser=keep_roxy_browser,
+            profile_overrides=self._regional_browser_profile,
         )
         self.session = PayPalSession(
             self.state,
@@ -204,7 +241,7 @@ class PayPalFlow:
                 or ""
             ).lower()
             roxy_browser = getattr(self.state, "roxy_browser", None) or {}
-            if profile_source != "roxy" and not roxy_browser.get("cdp_info"):
+            if profile_source not in {"roxy", "roxy_ios"} and not roxy_browser.get("cdp_info"):
                 self._disable_roxy_runtime(
                     "Roxy fingerprint fell back to program random; Roxy Local API/runtime is unavailable."
                 )
@@ -221,6 +258,8 @@ class PayPalFlow:
     def _mode_requests_roxy(raw: str) -> bool:
         return (raw or "").strip().lower().replace("-", "_") in {
             "roxy",
+            "roxy_ios",
+            "roxy_iphone",
             "browser",
             "real_browser",
             "chrome",
@@ -251,6 +290,35 @@ class PayPalFlow:
         )
         return self._mode_requests_roxy(raw)
 
+    def _local_ios_runtime_requested(self) -> bool:
+        values = (
+            self._raw_mode_value(
+                self.fingerprint_source,
+                ("PAYPAL_FINGERPRINT_SOURCE", "FINGERPRINT_SOURCE"),
+                FINGERPRINT_SOURCE,
+            ),
+            self._raw_mode_value(
+                self.datadome_mode,
+                ("PAYPAL_DATADOME_MODE", "DATADOME_MODE"),
+                DATADOME_MODE,
+            ),
+            self._raw_mode_value(
+                self.mtr_runtime,
+                ("PAYPAL_MTR_RUNTIME", "MTR_RUNTIME"),
+                MTR_RUNTIME_MODE,
+            ),
+            self._raw_mode_value(
+                self.risk_signals_mode,
+                ("PAYPAL_RISK_SIGNALS_MODE", "RISK_SIGNALS_MODE"),
+                RISK_SIGNALS_MODE,
+            ),
+        )
+        return any(
+            str(value or "").strip().lower().replace("-", "_")
+            in {"headless_ios", "headless_iphone", "ios_headless", "local_ios", "local_headless_ios"}
+            for value in values
+        )
+
     def _disable_roxy_runtime(self, reason: object) -> None:
         """Stop retrying Roxy during this flow and fall back to protocol paths."""
         if not self._roxy_runtime_fallback_enabled():
@@ -268,11 +336,11 @@ class PayPalFlow:
             setattr(self.state, "roxy_runtime_disabled_reason", reason_text)
         except Exception:
             pass
-        if self._datadome_mode_raw() == "roxy":
+        if self._datadome_mode_raw() in {"roxy", "roxy_ios"}:
             self.datadome_mode = "protocol"
         if self._risk_signals_mode_raw() == "roxy":
             self.risk_signals_mode = "protocol"
-        if self._mtr_runtime_raw() == "roxy":
+        if self._mtr_runtime_raw() in {"roxy", "roxy_ios"}:
             self.mtr_runtime = "python_generated"
 
     def _roxy_runtime_requested(self) -> bool:
@@ -301,6 +369,14 @@ class PayPalFlow:
             for value in (fingerprint_source, datadome_mode, mtr_runtime, risk_mode)
         )
 
+    def _ios_roxy_requested(self) -> bool:
+        values = (
+            self._raw_mode_value(self.fingerprint_source, ("PAYPAL_FINGERPRINT_SOURCE", "FINGERPRINT_SOURCE"), FINGERPRINT_SOURCE),
+            self._datadome_mode_raw(),
+            self._mtr_runtime_raw(),
+        )
+        return any(str(value or "").strip().lower().replace("-", "_") in {"roxy_ios", "roxy_iphone", "ios_roxy"} for value in values)
+
     def close(self):
         self._cleanup_headless_session()
         self._cleanup_roxy_browser()
@@ -317,21 +393,24 @@ class PayPalFlow:
         return str((self.state.browser_profile or {}).get("user_agent") or USER_AGENT)
 
     def _profile_country(self) -> str:
-        return str((self.state.browser_profile or {}).get("country") or self.address.country or "BR")
+        return str((self.state.browser_profile or {}).get("country") or self.address.country or self.region.code)
 
     def _profile_locale(self) -> str:
-        return str((self.state.browser_profile or {}).get("locale") or "pt_BR")
+        return str((self.state.browser_profile or {}).get("locale") or self.region.locale)
 
     def _profile_lang(self) -> str:
         locale = self._profile_locale()
-        return str((self.state.browser_profile or {}).get("language") or locale.replace("_", "-") or "pt-BR")
+        return str((self.state.browser_profile or {}).get("language") or locale.replace("_", "-") or self.region.language)
+
+    def _checkout_language_code(self) -> str:
+        return self._profile_lang().split("-", 1)[0].split("_", 1)[0].lower()
 
     def _content_country(self) -> str:
         # SignUpNewMember sends `country` from the billing/account country.
         # The compliance identifier in the browser capture follows that same
         # country (for BR it sends BR:pt:<manifest hash>:compliance.signupTerms),
         # even when geolocation/proxy fields in __INITIAL_DATA__ differ.
-        return str(self.address.country or self._profile_country() or "BR").upper()
+        return str(self.address.country or self._profile_country() or self.region.code).upper()
 
     def _content_lang(self) -> str:
         locale = self._profile_locale()
@@ -340,7 +419,7 @@ class PayPalFlow:
             if sep in locale:
                 language, locale_country = locale.split(sep, 1)
                 if locale_country.upper() == country:
-                    return (language or "pt").lower()
+                    return (language or self.region.language_code).lower()
                 break
         if country == "BR":
             return "pt"
@@ -348,7 +427,7 @@ class PayPalFlow:
             return locale.split("_", 1)[0].lower()
         if "-" in locale:
             return locale.split("-", 1)[0].lower()
-        return (locale or "pt").lower()
+        return (locale or self.region.language_code).lower()
 
     def _short_content_identifier(self) -> str:
         return f"{self._content_country()}:{self._content_lang()}:compliance.signupTerms"
@@ -457,9 +536,15 @@ class PayPalFlow:
             "headers": "protocol",
             "clientid": "protocol",
             "roxy": "roxy",
+            "roxy_ios": "roxy_ios",
+            "roxy_iphone": "roxy_ios",
             "browser": "roxy",
             "real_browser": "roxy",
             "headless": "headless",
+            "headless_ios": "headless",
+            "headless_iphone": "headless",
+            "ios_headless": "headless",
+            "local_ios": "headless",
             "headless_optimized": "headless",
             "optimized_headless": "headless",
             "local_headless": "headless",
@@ -477,6 +562,8 @@ class PayPalFlow:
 
     def _datadome_mode(self) -> str:
         mode = self._datadome_mode_raw()
+        if mode == "roxy_ios":
+            mode = "roxy"
         if mode in {"roxy", "auto"} and self._roxy_runtime_disabled_reason:
             return "protocol"
         return mode
@@ -490,15 +577,24 @@ class PayPalFlow:
         ).strip().lower()
         return raw not in {"0", "false", "no", "off", "strict", "disabled", "disable"}
 
-    @staticmethod
-    def _datadome_phase0_preflight_enabled() -> bool:
+    def _datadome_phase0_preflight_enabled(self) -> bool:
         raw = (
             _load_proxy_dotenv_value("PAYPAL_DATADOME_PHASE0_PREFLIGHT")
             or _load_proxy_dotenv_value("PAYPAL_DATADOME_PREFLIGHT")
             or _load_proxy_dotenv_value("PAYPAL_HEADLESS_DATADOME_PREFLIGHT")
             or ""
         ).strip().lower()
-        return raw in {"1", "true", "yes", "on", "enable", "enabled"}
+        if raw:
+            return raw in {"1", "true", "yes", "on", "enable", "enabled"}
+        # A protocol navigation cannot reproduce an iOS WebKit HTTP identity.
+        # When the local iOS preset is active, open the protected document in
+        # that context first instead of deliberately generating a protocol
+        # 403 before the browser has established its cookie/session.
+        profile = self.state.browser_profile or {}
+        local_ios = bool(profile.get("is_ios_webkit")) or str(
+            profile.get("device_preset") or ""
+        ).strip().lower().replace("-", "_") in {"ios", "iphone", "ios_phone", "headless_ios"}
+        return self._datadome_mode_raw() == "roxy_ios" or local_ios
 
     @staticmethod
     def _headless_datadome_roxy_fallback_enabled() -> bool:
@@ -562,6 +658,20 @@ class PayPalFlow:
             roxy_browser_matches_proxy,
         )
 
+        # A LocalHeadlessSession keeps a sync Playwright dispatcher attached to
+        # this thread.  Starting Roxy's separate CDP capture before releasing
+        # it triggers Playwright's misleading "inside the asyncio loop" error.
+        # The flow has already copied any browser cookies into PayPalSession at
+        # each hand-off, so closing it is safe and avoids two browser runtimes
+        # competing for the same job/semaphore.
+        active_headless = getattr(self, "_headless_session", None) or getattr(self, "_headless_optimized_session", None)
+        if active_headless is not None and (
+            getattr(active_headless, "_browser", None) is not None
+            or getattr(active_headless, "_manager", None) is not None
+        ):
+            logger.info("Closing active local headless runtime before switching to Roxy.")
+            self._cleanup_headless_session()
+
         if roxy_browser.get("cdp_info") and roxy_browser_matches_proxy(roxy_browser, self.proxy_config.url):
             return roxy_browser
         if roxy_browser.get("cdp_info"):
@@ -576,6 +686,8 @@ class PayPalFlow:
         runtime = capture_roxy_runtime_profile(
             keep_browser=True,
             proxy_url=self.proxy_config.url or "",
+            browser_profile=cast(dict[str, object], self.state.browser_profile or {}),
+            device_preset="ios_phone" if self._ios_roxy_requested() else None,
         )
         if not self.state.browser_profile:
             self.state.browser_profile = runtime.get("browser_profile", {})
@@ -668,6 +780,15 @@ class PayPalFlow:
                 len(str(result.get("datadome") or "")),
             )
             return True
+        if solved and document:
+            logger.info(
+                "{} browser navigation completed without a DataDome challenge reason={} status={} cookies={}",
+                runtime,
+                reason,
+                result.get("status"),
+                len(result.get("cookies") or []),
+            )
+            return True
         logger.warning(
             "{} DataDome run did not clear challenge reason={} status={} url={} datadome_present={} blocked_by_datadome={}",
             runtime,
@@ -736,6 +857,7 @@ class PayPalFlow:
                 url,
                 cookies=self.session.export_cookies_for_browser(),
                 wait_seconds=self._datadome_roxy_wait_seconds(),
+                accept_clean_page=reason == "phase0_preflight",
             )
             return self._apply_datadome_browser_result(result, reason=reason, runtime="roxy")
         except Exception as exc:
@@ -774,11 +896,17 @@ class PayPalFlow:
             "template": "python_generated",
             "templates": "python_generated",
             "roxy": "roxy",
+            "roxy_ios": "roxy_ios",
+            "roxy_iphone": "roxy_ios",
             "browser": "roxy",
             "real_browser": "roxy",
             "chrome": "roxy",
             "chromium": "roxy",
             "headless": "headless",
+            "headless_ios": "headless",
+            "headless_iphone": "headless",
+            "ios_headless": "headless",
+            "local_ios": "headless",
             "headless_optimized": "headless",
             "optimized_headless": "headless",
             "local_headless": "headless",
@@ -797,6 +925,8 @@ class PayPalFlow:
 
     def _mtr_runtime_mode(self) -> str:
         mode = self._mtr_runtime_raw()
+        if mode == "roxy_ios":
+            mode = "roxy"
         if mode in {"roxy", "auto"} and self._roxy_runtime_disabled_reason:
             return "python_generated"
         return mode
@@ -821,11 +951,17 @@ class PayPalFlow:
             "template": "protocol",
             "templates": "protocol",
             "roxy": "roxy",
+            "roxy_ios": "roxy",
+            "roxy_iphone": "roxy",
             "browser": "roxy",
             "real_browser": "roxy",
             "chrome": "roxy",
             "chromium": "roxy",
             "headless": "headless",
+            "headless_ios": "headless",
+            "headless_iphone": "headless",
+            "ios_headless": "headless",
+            "local_ios": "headless",
             "headless_optimized": "headless",
             "optimized_headless": "headless",
             "local_headless": "headless",
@@ -849,6 +985,14 @@ class PayPalFlow:
         return mode
 
     def _signup_context_risk_mode(self) -> str:
+        # A local Playwright/Chromium page cannot faithfully continue an iOS
+        # Roxy identity.  In particular it creates a desktop TLS/UA/runtime
+        # transition immediately before the signup-context page, which is
+        # precisely the path that causes a DataDome challenge.  Keep this
+        # stage in the native Roxy iOS browser even after a prior Roxy attempt
+        # has been marked unavailable; do not silently switch to headless.
+        if self._ios_roxy_requested():
+            return "roxy"
         current_mode = self._risk_signals_mode()
         requested_mode = str(getattr(self, "_requested_risk_signals_mode", "") or "")
         runtime_source = str(getattr(self.state, "risk_signals_runtime_source", "") or "")
@@ -1119,6 +1263,28 @@ class PayPalFlow:
                 return True
         return False
 
+    def _signup_context_seed_document(self, signup_url: str) -> tuple[str, int]:
+        """Return the last protocol signup document for the browser preflight.
+
+        The response URL may have been normalized or redirected after the
+        document was captured.  The current signup URL is the authoritative
+        target, while ``run_mtr_phase1`` independently validates the supplied
+        HTML before fulfilling it.  Do not discard a usable cached document
+        merely because its recorded response URL changed shape.
+        """
+        html = str(getattr(self, "_last_signup_html", "") or "")
+        if not html or "/checkoutweb/signup" not in (signup_url or ""):
+            return "", 200
+        try:
+            status = int(getattr(self, "_last_signup_status", 200) or 200)
+        except Exception:
+            status = 200
+        return html, status
+
+    def _signup_context_roxy_is_explicitly_required(self) -> bool:
+        """Whether this job explicitly selected Roxy for the Step-3 browser preflight."""
+        return str(getattr(self, "_requested_risk_signals_mode", "") or "").strip().lower() == "roxy"
+
     def _send_signup_context_risk_signals_with_roxy(self, signup_url: str, token: str, *, force: bool = False) -> bool:
         mode = self._signup_context_risk_mode()
         if not force and mode not in {"roxy", "auto"} and not self._roxy_risk_runtime_active():
@@ -1127,18 +1293,12 @@ class PayPalFlow:
             from paypal.roxy_fingerprint import run_phase1_risk_with_roxy_browser
 
             roxy_browser = self._ensure_roxy_browser_for_datadome()
-            seeded_signup_html = ""
-            seeded_signup_status = 200
-            last_signup_url = str(getattr(self, "_last_signup_url", "") or "")
-            if (
-                str(getattr(self, "_last_signup_html", "") or "")
-                and "/checkoutweb/signup" in last_signup_url
-            ):
-                seeded_signup_html = str(getattr(self, "_last_signup_html", "") or "")
-                try:
-                    seeded_signup_status = int(getattr(self, "_last_signup_status", 200) or 200)
-                except Exception:
-                    seeded_signup_status = 200
+            seeded_signup_html, seeded_signup_status = self._signup_context_seed_document(signup_url)
+            logger.info(
+                "Step 3 browser preflight started: runtime=Roxy wait_seconds={:.1f} seed_available={}",
+                self._risk_roxy_wait_seconds(),
+                bool(seeded_signup_html),
+            )
             result = run_phase1_risk_with_roxy_browser(
                 roxy_browser,
                 signup_url,
@@ -1152,6 +1312,20 @@ class PayPalFlow:
             if result.get("cookies"):
                 self.session.import_browser_cookies(result["cookies"])
             browser_ok = self._normalize_phase1_roxy_datadog_runtime_result(result)
+            seeded_document = result.get("signup_context_seeded_document")
+            seed_used = bool(seeded_document.get("enabled")) if isinstance(seeded_document, dict) else False
+            page_assessment = result.get("signup_context_page_after_runtime") or result.get("signup_context_page") or {}
+            page_ready = bool(page_assessment.get("ok")) if isinstance(page_assessment, dict) else False
+            observed_for_log = ",".join(str(item) for item in (result.get("observed") or [])) or "<none>"
+            required_missing_for_log = ",".join(str(item) for item in (result.get("required_missing") or [])) or "<none>"
+            logger.info(
+                "Step 3 browser preflight completed: runtime=Roxy status={} page_ready={} seed_used={} observed={} required_missing={}",
+                result.get("status") or 0,
+                page_ready,
+                seed_used,
+                observed_for_log,
+                required_missing_for_log,
+            )
             counts = result.get("counts") if isinstance(result.get("counts"), dict) else {}
             signup_context_result = {
                 "ok": browser_ok,
@@ -1215,14 +1389,31 @@ class PayPalFlow:
                 for item in (result.get("required_missing") or [])
                 if str(item)
             ]
-            if required_missing:
-                message = (
-                    "Roxy signup-context risk runtime is missing required browser signals: "
-                    f"{','.join(required_missing)}"
+            if required_missing or not browser_ok:
+                if required_missing:
+                    message = (
+                        "Roxy signup-context risk runtime is missing required browser signals: "
+                        f"{','.join(required_missing)}"
+                    )
+                else:
+                    message = (
+                        "Roxy signup-context browser preflight did not complete: "
+                        f"status={result.get('status') or 0} "
+                        f"reason={result.get('reason') or '<none>'}"
+                    )
+                must_block = (
+                    self._signup_context_roxy_is_explicitly_required()
+                    or (mode == "roxy" and not self._roxy_runtime_fallback_enabled())
+                    or strict_browser_risk_enabled()
                 )
-                if mode == "roxy" or strict_browser_risk_enabled():
+                if must_block:
                     raise RuntimeError(message)
                 logger.warning(message)
+                # In automatic/fallback mode, mark this Roxy runtime unusable
+                # before returning.  _send_signup_attempt will then run the
+                # local-headless preflight instead of continuing straight to
+                # SignUpNewMemberMutation after a failed Roxy page.
+                self._disable_roxy_runtime(message)
             return browser_ok
         except Exception as exc:
             error_text = self._safe_error_text(exc)
@@ -1231,7 +1422,12 @@ class PayPalFlow:
                 "ok": False,
                 "signup_context": {"ok": False, "error": error_text},
             }
-            if (mode == "roxy" and not self._roxy_runtime_fallback_enabled()) or strict_browser_risk_enabled():
+            logger.warning("Step 3 browser preflight failed: runtime=Roxy error={}", error_text)
+            if (
+                self._signup_context_roxy_is_explicitly_required()
+                or (mode == "roxy" and not self._roxy_runtime_fallback_enabled())
+                or strict_browser_risk_enabled()
+            ):
                 raise RuntimeError(error_text) from None
             self._disable_roxy_runtime(exc)
             logger.warning(
@@ -1258,18 +1454,7 @@ class PayPalFlow:
             headless_session = self._get_headless_session()
             dfp_config = self._headless_mtr_config_for_page(signup_url)
             run_mtr = self._mtr_runtime_mode() == "headless"
-            seeded_signup_html = ""
-            seeded_signup_status = 200
-            last_signup_url = str(getattr(self, "_last_signup_url", "") or "")
-            if (
-                str(getattr(self, "_last_signup_html", "") or "")
-                and "/checkoutweb/signup" in last_signup_url
-            ):
-                seeded_signup_html = str(getattr(self, "_last_signup_html", "") or "")
-                try:
-                    seeded_signup_status = int(getattr(self, "_last_signup_status", 200) or 200)
-                except Exception:
-                    seeded_signup_status = 200
+            seeded_signup_html, seeded_signup_status = self._signup_context_seed_document(signup_url)
             result = run_local_headless_mtr_phase1(
                 signup_url,
                 dfp_config=dfp_config,
@@ -1471,7 +1656,7 @@ class PayPalFlow:
         country = self._first_query_value(iframe_src, "country.x")
         locale = self._first_query_value(iframe_src, "locale.x")
         expected_country = self.address.country
-        expected_locale = (self.state.browser_profile or {}).get("locale") or "pt_BR"
+        expected_locale = (self.state.browser_profile or {}).get("locale") or self.region.locale
         if country and country.upper() != expected_country.upper():
             logger.warning(
                 "Challenge server country.x={} differs from configured checkout country {}; "
@@ -2216,8 +2401,8 @@ class PayPalFlow:
         except Exception:
             pass
 
-        self.user = generate_user(current_phone)
-        self.card = generate_card(proxy_url=self.proxy_config.url)
+        self.user = generate_user(current_phone, region=self.region.code)
+        self.card = generate_card(proxy_url=self.proxy_config.url, region=self.region.code)
         self.address = current_address
         self.state = SessionState(ba_token=self.ba_token)
         ensure_runtime_profile(
@@ -2225,6 +2410,7 @@ class PayPalFlow:
             source=self.fingerprint_source,
             roxy_proxy_url=self.proxy_config.url or "",
             keep_roxy_browser=self._roxy_runtime_requested(),
+            profile_overrides=self._regional_browser_profile,
         )
         self.session = PayPalSession(
             self.state,
@@ -2265,11 +2451,12 @@ class PayPalFlow:
         ):
             solved_preflight = self._solve_datadome_with_roxy_browser(url, reason="phase0_preflight")
             datadome_mode = self._datadome_mode()
-            if solved_preflight and datadome_mode == "headless":
+            if solved_preflight:
                 resp = self._response_from_browser_document(self._datadome_browser_document)
                 if resp is not None:
                     logger.info(
-                        "Using local headless browser document for Phase 0 after DataDome preflight status={} url={}",
+                        "Using {} browser document for Phase 0 after DataDome preflight status={} url={}",
+                        "Roxy" if datadome_mode == "roxy" else "local headless",
                         resp.status_code,
                         sanitize_for_log({"url": str(resp.url)})["url"],
                     )
@@ -5255,28 +5442,8 @@ class PayPalFlow:
 
 
     def _update_user_phone(self, phone: str):
-        """Update the BR phone fields used by the signup/2FA GraphQL calls."""
-        raw = (phone or "").strip()
-        if raw.lower().startswith("phone:"):
-            raw = raw.split(":", 1)[1].strip()
-
-        digits = "".join(ch for ch in raw if ch.isdigit())
-        if len(digits) < 8:
-            raise ValueError("phone number is too short")
-
-        # This flow is hard-coded for BR checkout. Accept either +55xxxxxxxxxx
-        # or a local BR mobile number and normalize to the fields PayPal expects.
-        if digits.startswith("55") and len(digits) > 10:
-            country_code = "+55"
-            local = digits[2:]
-            full = f"+{digits}"
-        else:
-            country_code = "+55"
-            local = digits
-            full = f"+55{digits}"
-
-        if len(local) < 8:
-            raise ValueError("local phone number is too short")
+        """Update phone fields using the active checkout region's dialing code."""
+        full, country_code, local = self.region.normalize_phone(phone)
 
         self.user.phone = full
         self.user.phone_country_code = country_code
@@ -5427,15 +5594,18 @@ class PayPalFlow:
                 "weasley_api_request_initiate_risk_based_two_factor_phone_confirmation_mutation",
             ],
             country=self.address.country,
-            lang="pt",
+            lang=self._checkout_language_code(),
         )
         initiate_result = self._graphql_with_authchallenge_frontend_retry(
             "InitiateRiskBasedTwoFactorPhoneConfirmationMutation",
             INITIATE_2FA_PHONE_MUTATION,
             {
                 "phoneNumber": self.user.phone_local,
-                "locale": {"country": "BR", "lang": "pt"},
-                "phoneCountry": "BR",
+                "locale": {
+                    "country": self.region.code,
+                    "lang": self._checkout_language_code(),
+                },
+                "phoneCountry": self.region.code,
                 "token": token,
             },
             signup_url,
@@ -5477,7 +5647,7 @@ class PayPalFlow:
                 "weasley_api_request_confirm_risk_based_two_factor_phone_confirmation_mutation",
             ],
             country=self.address.country,
-            lang="pt",
+            lang=self._checkout_language_code(),
         )
         confirm_result = self._graphql_with_authchallenge_frontend_retry(
             "ConfirmRiskBasedTwoFactorPhoneConfirmationMutation",
@@ -5526,7 +5696,7 @@ class PayPalFlow:
                 while True:
                     value = input(
                         "\n>>> 发送验证码失败。请输入新的手机号重新发送"
-                        "（如 +5591980133818）；输入 q 退出: "
+                        f"（如 {self.region.phone_example}）；输入 q 退出: "
                     ).strip()
                     if value.lower() in {"q", "quit", "exit"}:
                         raise RuntimeError("OTP confirmation cancelled by user") from e
@@ -5541,7 +5711,7 @@ class PayPalFlow:
             while True:
                 value = input(
                     "\n>>> 输入6位短信验证码；如需换号，直接输入新手机号"
-                    "（如 +5591980133818 或 phone:+5591980133818）；输入 q 退出: "
+                    f"（如 {self.region.phone_example} 或 phone:{self.region.phone_example}）；输入 q 退出: "
                 ).strip()
 
                 if value.lower() in {"q", "quit", "exit"}:
@@ -5617,6 +5787,10 @@ class PayPalFlow:
 
     def _billing_line1(self) -> str:
         house_number = self.address.house_number.strip()
+        if self.region.code == "US":
+            if house_number and self.address.street.startswith(f"{house_number} "):
+                return self.address.street
+            return " ".join(part for part in (house_number, self.address.street.strip()) if part)
         if house_number and f", {house_number}" in self.address.street:
             return self.address.street
         return f"{self.address.street}, {self.address.house_number}"
@@ -5631,16 +5805,22 @@ class PayPalFlow:
         if self._content_metadata_is_unresolved():
             self._apply_configured_or_cached_signup_content_metadata()
         content_identifier = self._resolved_content_identifier()
-        billing_autocomplete_type = (
-            "ANS" if self._billing_address_autocomplete_succeeded else "MANUAL"
-        )
-        return {
+        if self.region.code == "US":
+            billing_autocomplete_type = (
+                "GOOGLE" if self._billing_address_autocomplete_succeeded else "MANUAL"
+            )
+            billing_user_modified = not self._billing_address_autocomplete_succeeded
+        else:
+            billing_autocomplete_type = (
+                "ANS" if self._billing_address_autocomplete_succeeded else "MANUAL"
+            )
+            billing_user_modified = True
+        variables: dict[str, object] = {
             "card": {
                 "cardNumber": self.card.number,
                 "expirationDate": self._card_expiration_date(),
                 "securityCode": self.card.cvv,
                 "type": card_type,
-                "productClass": self.card.card_type,
             },
             "country": self.address.country,
             "email": self.user.email,
@@ -5661,7 +5841,7 @@ class PayPalFlow:
                 "state": self.address.state,
                 "accountQuality": {
                     "autoCompleteType": billing_autocomplete_type,
-                    "isUserModified": True,
+                    "isUserModified": billing_user_modified,
                 },
                 "country": self.address.country,
                 "familyName": self.user.last_name,
@@ -5681,33 +5861,94 @@ class PayPalFlow:
                 "givenName": self.user.first_name,
             },
             "contentIdentifier": content_identifier,
-            "marketingOptOut": True,
+            "marketingOptOut": self.region.marketing_opt_out,
             "password": self.user.password,
-            "dateOfBirth": self._dob_payload(),
-            "identityDocument": {
-                "type": "CPF",
-                "value": self.user.cpf,
-            },
             "crsData": None,
             "legalAgreements": {},
         }
+        if self.region.code != "US":
+            card = cast(dict[str, object], variables["card"])
+            card["productClass"] = self.card.card_type
+        billing_address = cast(dict[str, object], variables["billingAddress"])
+        if not self.address.district.strip():
+            billing_address.pop("line2", None)
+        if self.region.requires_date_of_birth:
+            variables["dateOfBirth"] = self._dob_payload()
+        if self.region.requires_identity_document and self.user.cpf:
+            variables["identityDocument"] = {
+                "type": "CPF",
+                "value": self.user.cpf,
+            }
+        return variables
 
     def _send_address_autocomplete(self, token: str) -> None:
         self._billing_address_autocomplete_succeeded = False
         try:
-            address_result = self.session.graphql(
-                "AddressAutocompleteFromPostalCodeQuery",
-                ADDRESS_AUTOCOMPLETE_FROM_POSTAL_CODE_QUERY,
-                {
-                    "country": self.address.country,
-                    "postalCode": self.address.postal_code,
-                    "token": token,
-                },
-            )
+            if self.region.code == "US":
+                # Matches the browser sequence captured for US checkout:
+                # AddressAutocompleteQuery -> selected placeId -> canonical
+                # AddressFromAutocompletePlaceIdQuery.  ZIP-only lookup does
+                # not prove a specific delivery address.
+                session_id = uuid4().hex[:13]
+                input_line = self._billing_line1()
+                suggestions_result = self.session.graphql(
+                    "AddressAutocompleteQuery",
+                    ADDRESS_AUTOCOMPLETE_QUERY,
+                    {
+                        "count": 4,
+                        "countries": ["US"],
+                        "input": input_line,
+                        "language": self._checkout_language_code(),
+                        "radius": 1500,
+                        "sessionId": session_id,
+                    },
+                )
+                suggestion_root = suggestions_result[0] if isinstance(suggestions_result, list) else suggestions_result
+                suggestion_data = suggestion_root.get("data") if isinstance(suggestion_root, dict) else {}
+                autocomplete = suggestion_data.get("addressAutoComplete") if isinstance(suggestion_data, dict) else {}
+                suggestions = autocomplete.get("suggestions") if isinstance(autocomplete, dict) else []
+                wanted = input_line.casefold().strip()
+                selected = next(
+                    (
+                        item for item in suggestions
+                        if isinstance(item, dict)
+                        and str(item.get("mainText") or item.get("addressText") or "").casefold().strip() == wanted
+                    ),
+                    None,
+                )
+                place_id = str(selected.get("placeId") or "") if isinstance(selected, dict) else ""
+                if not place_id:
+                    logger.warning(
+                        "US address autocomplete returned no exact suggestion for {!r}; using MANUAL billing address metadata.",
+                        input_line,
+                    )
+                    return
+                address_result = self.session.graphql(
+                    "AddressFromAutocompletePlaceIdQuery",
+                    ADDRESS_FROM_AUTOCOMPLETE_PLACE_ID_QUERY,
+                    {
+                        "language": self._checkout_language_code(),
+                        "placeId": place_id,
+                        "sessionId": session_id,
+                    },
+                )
+            else:
+                address_result = self.session.graphql(
+                    "AddressAutocompleteFromPostalCodeQuery",
+                    ADDRESS_AUTOCOMPLETE_FROM_POSTAL_CODE_QUERY,
+                    {
+                        "country": self.address.country,
+                        "postalCode": self.address.postal_code,
+                        "token": token,
+                    },
+                )
             result_obj = address_result[0] if isinstance(address_result, list) else address_result
             result_dict = cast(dict[str, Any], result_obj) if isinstance(result_obj, dict) else {}
             data = result_dict.get("data") if isinstance(result_dict.get("data"), dict) else {}
             normalized = cast(dict[str, Any], data).get("addressNormalization") or {}
+            if self.region.code == "US":
+                place_result = cast(dict[str, Any], data).get("addressFromAutoCompletePlaceId") or {}
+                normalized = place_result.get("address") if isinstance(place_result, dict) else normalized
             if not isinstance(normalized, dict) or not normalized:
                 logger.warning(
                     "AddressAutocompleteFromPostalCodeQuery returned no usable normalized "
@@ -5733,13 +5974,22 @@ class PayPalFlow:
                 return
 
             logger.info(
-                "Address normalized: {}, {}, {} {}",
+                "Address normalized: line1={!r}, line2={!r}, city={!r}, state={!r}, postalCode={!r}, country={}",
                 normalized.get("line1"),
-                normalized.get("line2"),
+                normalized.get("line2") or "<empty>",
                 normalized.get("city"),
                 normalized.get("state"),
+                normalized.get("postalCode"),
+                self.address.country,
             )
-            self.address.street = normalized.get("line1") or self.address.street
+            normalized_line1 = str(normalized.get("line1") or "").strip()
+            self.address.street = normalized_line1 or self.address.street
+            # US normalizer line1 is a complete delivery line (for example
+            # "4200 N 1st Ave"), whereas the generator stores number and
+            # street separately.  Clear the old number so _billing_line1()
+            # cannot construct an invalid "old-number normalized-line1".
+            if self.region.code == "US" and normalized_line1:
+                self.address.house_number = ""
             self.address.district = normalized.get("line2") or self.address.district
             self.address.city = normalized.get("city") or self.address.city
             self.address.state = normalized.get("state") or self.address.state
@@ -5750,13 +6000,10 @@ class PayPalFlow:
 
     def _send_signup_attempt(self, token: str, signup_url: str) -> dict[str, Any] | list[Any]:
         card_type = self._card_issuer_type()
-        # InstallmentOptionsQuery is only a UI warm-up for BR installment
-        # offers.  PayPal resolves the payee from the EC checkout token here;
-        # sending the original BA token produces INVALID_RESOURCE_ID at
-        # payService.getPayee-contingency.  Do not let this optional preflight
-        # pollute the job as an ERROR or block SignUpNewMember.
+        # InstallmentOptionsQuery is a BR-only UI warm-up.  The US browser
+        # capture proceeds directly to signup after address/OTP handling.
         installment_token = self.state.ec_token or token
-        if self._is_ec_token(installment_token):
+        if self.region.code == "BR" and self._is_ec_token(installment_token):
             try:
                 installment_result = self.session.graphql(
                     "InstallmentOptionsQuery",
@@ -5781,7 +6028,7 @@ class PayPalFlow:
                     )
             except Exception as e:
                 logger.warning(f"Optional InstallmentOptionsQuery failed: {e}")
-        else:
+        elif self.region.code == "BR":
             logger.warning(
                 "Skipping optional InstallmentOptionsQuery: no EC checkout token "
                 "is available (current token is {}).",
@@ -5807,25 +6054,28 @@ class PayPalFlow:
 
         self._strict_signup_preflight_or_raise()
 
+        signup_fields = [
+            "email",
+            "phone",
+            "cardNumber",
+            "cardExpiry",
+            "cardCvv",
+            "password",
+            "firstName",
+            "lastName",
+            "billingLine1",
+            "billingCity",
+            "billingPostalCode",
+            "billingState",
+        ]
+        if self.region.requires_date_of_birth:
+            signup_fields.append("dateOfBirth")
+        if self.region.requires_identity_document:
+            signup_fields.append("identityDocumentNumber")
         self._send_signup_field_events(
             self.session,
             token,
-            [
-                "email",
-                "phone",
-                "cardNumber",
-                "cardExpiry",
-                "cardCvv",
-                "password",
-                "firstName",
-                "lastName",
-                "billingLine1",
-                "billingCity",
-                "billingPostalCode",
-                "billingState",
-                "dateOfBirth",
-                "identityDocumentNumber",
-            ],
+            signup_fields,
         )
         send_weasley_log(
             self.session,
@@ -5836,7 +6086,7 @@ class PayPalFlow:
                 "weasley_api_request_sign_up_new_member_mutation",
             ],
             country=self.address.country,
-            lang="pt",
+            lang=self._checkout_language_code(),
         )
         signup_variables = self._build_signup_variables(token)
         signup_result = self._post_signup_with_authchallenge_ignore(
@@ -6216,7 +6466,7 @@ class PayPalFlow:
             logger.info("Waiting {:.1f}s before next card retry...", delay)
             time.sleep(delay)
 
-        self.card = generate_card(proxy_url=self.proxy_config.url)
+        self.card = generate_card(proxy_url=self.proxy_config.url, region=self.region.code)
         logger.info(
             "New generated card for retry: {} exp={}",
             self._masked_card_number(),
@@ -6237,8 +6487,8 @@ class PayPalFlow:
             time.sleep(delay)
 
         current_phone = self.user.phone
-        self.user = generate_user(current_phone)
-        self.card = generate_card(proxy_url=self.proxy_config.url)
+        self.user = generate_user(current_phone, region=self.region.code)
+        self.card = generate_card(proxy_url=self.proxy_config.url, region=self.region.code)
         self.state.user_id = ""
         self.state.euat_token = ""
         self.state.signup_fallback_reason = ""
@@ -6661,7 +6911,12 @@ class PayPalFlow:
                     ("_1_login_password", (None, "")),
                     (
                         "_1_login_phone_country_code",
-                        (None, self.state.login_phone_country_code or self.user.phone_country_code or "+55"),
+                        (
+                            None,
+                            self.state.login_phone_country_code
+                            or self.user.phone_country_code
+                            or self.region.dialing_code_with_plus,
+                        ),
                     ),
                     ("_1_formName", (None, "email")),
                     ("0", (None, '["$K1"]')),
@@ -6938,7 +7193,7 @@ class PayPalFlow:
                     "weasley_payment_request_api_available",
                 ],
                 country=self.address.country,
-                lang="pt",
+                lang=self._checkout_language_code(),
             )
 
         logger.info("Sending checkout session GraphQL queries...")
@@ -6964,7 +7219,7 @@ class PayPalFlow:
                 GRIFFIN_METADATA_QUERY,
                 {
                     "countryCode": self.address.country,
-                    "languageCode": "pt",
+                    "languageCode": self._checkout_language_code(),
                     "shippingCountryCode": self.address.country,
                 },
             )
@@ -7047,12 +7302,16 @@ class PayPalFlow:
         # phone number to trigger a fresh challenge.
         self._confirm_phone_with_retry(token, signup_url)
 
-        self._send_tealeaf_form_interaction_batch(signup_url, [
+        phase3_fields = [
             "email", "phone", "cardNumber", "cardExpiry", "cardCvv",
             "password", "firstName", "lastName",
             "billingLine1", "billingCity", "billingPostalCode", "billingState",
-            "dateOfBirth", "identityDocumentNumber",
-        ])
+        ]
+        if self.region.requires_date_of_birth:
+            phase3_fields.append("dateOfBirth")
+        if self.region.requires_identity_document:
+            phase3_fields.append("identityDocumentNumber")
+        self._send_tealeaf_form_interaction_batch(signup_url, phase3_fields)
         self._send_datadog_rum_action(
             self.session,
             "signup_form_fill",

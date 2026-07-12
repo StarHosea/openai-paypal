@@ -19,6 +19,7 @@ from uuid import uuid4
 from loguru import logger
 
 from config import BROWSER_PROFILE, SCREEN, USER_AGENT, VIEWPORT
+from paypal.playwright_sync import run_sync_playwright_operation
 
 
 JsonObject = dict[str, object]
@@ -314,8 +315,11 @@ def _runtime_browser_profile(js: JsonObject, seed_profile: JsonObject | None = N
     timezone_offset_minutes = _int_value(js.get("timezoneOffsetMinutes"), _int_value(BROWSER_PROFILE.get("timezone_offset_minutes"), 180))
     profile: JsonObject = dict(cast(JsonObject, BROWSER_PROFILE))
     profile.update(seed)
+    ios_webkit = _is_ios_webkit_profile(profile) or bool(
+        re.search(r"\b(?:iphone|ipad|ipod)\b", user_agent, re.I)
+    )
     updates: JsonObject = {
-            "fingerprint_source": "headless",
+            "fingerprint_source": "headless_ios" if ios_webkit else "headless",
             "country": _country_from_locale(locale),
             "language": language,
             "languages": _list_value(js.get("languages")) or [language, language.split("-", 1)[0], "en-US", "en"],
@@ -324,14 +328,17 @@ def _runtime_browser_profile(js: JsonObject, seed_profile: JsonObject | None = N
             "timezone_offset_minutes": timezone_offset_minutes,
             "timezone_offset_ms": timezone_offset_minutes * 60 * 1000,
             "dst": bool(BROWSER_PROFILE.get("dst", False)),
-            "chrome_major": chrome_major,
-            "chrome_full_version": _full_version_from_ua_data(ua_data, user_agent, chrome_major, seed),
+            "chrome_major": 0 if ios_webkit else chrome_major,
+            "chrome_full_version": "" if ios_webkit else _full_version_from_ua_data(ua_data, user_agent, chrome_major, seed),
             "platform": platform,
-            "sec_ch_platform": _sec_ch_platform(ua_data, platform),
-            "sec_ch_platform_version": json.dumps(_str_value(high_entropy.get("platformVersion") or ua_data.get("platformVersion"))),
-            "sec_ch_arch": _sec_ch_arch(ua_data),
-            "sec_ch_bitness": _str_value(high_entropy.get("bitness") or ua_data.get("bitness"), str(BROWSER_PROFILE.get("sec_ch_bitness") or "64")),
-            "device_memory": _int_value(js.get("deviceMemory"), _int_value(BROWSER_PROFILE.get("device_memory"), 8)),
+            "is_mobile": ios_webkit,
+            "is_ios_webkit": ios_webkit,
+            "device_preset": "ios_phone" if ios_webkit else _str_value(profile.get("device_preset")),
+            "sec_ch_platform": "" if ios_webkit else _sec_ch_platform(ua_data, platform),
+            "sec_ch_platform_version": "" if ios_webkit else json.dumps(_str_value(high_entropy.get("platformVersion") or ua_data.get("platformVersion"))),
+            "sec_ch_arch": "" if ios_webkit else _sec_ch_arch(ua_data),
+            "sec_ch_bitness": "" if ios_webkit else _str_value(high_entropy.get("bitness") or ua_data.get("bitness"), str(BROWSER_PROFILE.get("sec_ch_bitness") or "64")),
+            "device_memory": 0 if ios_webkit else _int_value(js.get("deviceMemory"), _int_value(BROWSER_PROFILE.get("device_memory"), 8)),
             "hardware_concurrency": _int_value(js.get("hardwareConcurrency"), _int_value(BROWSER_PROFILE.get("hardware_concurrency"), 8)),
             "device_pixel_ratio": _float_value(window.get("devicePixelRatio"), _float_value(BROWSER_PROFILE.get("device_pixel_ratio"), 1.0)),
             "max_touch_points": _int_value(js.get("maxTouchPoints"), 0),
@@ -441,11 +448,47 @@ def _runtime_device_fingerprint(js: JsonObject) -> JsonObject:
     return result
 
 
-def _runtime_profile_from_js(js: JsonObject, seed_profile: JsonObject | None = None) -> JsonObject:
+def _runtime_profile_from_js(
+    js: JsonObject,
+    seed_profile: JsonObject | None = None,
+    *,
+    screen: JsonObject | None = None,
+    viewport: JsonObject | None = None,
+) -> JsonObject:
+    profile = _runtime_browser_profile(js, seed_profile)
+    runtime_screen = _runtime_screen(js)
+    runtime_viewport = _runtime_viewport(js)
+    if _is_ios_webkit_profile(profile):
+        # about:blank has no viewport meta tag, so Chromium's mobile emulation
+        # reports the synthetic 980px layout viewport there.  The protected
+        # PayPal document has a mobile viewport and must be opened at the
+        # supplied 480x854 CSS geometry instead.
+        screen_options = _merged_context_dict(SCREEN, screen)
+        viewport_options = _merged_context_dict(VIEWPORT, viewport)
+        runtime_screen = {
+            "colorDepth": _int_value(screen_options.get("colorDepth"), 24),
+            "pixelDepth": _int_value(screen_options.get("pixelDepth"), 24),
+            "height": _int_value(screen_options.get("height"), 854),
+            "width": _int_value(screen_options.get("width"), 480),
+            "availHeight": _int_value(screen_options.get("availHeight"), _int_value(screen_options.get("height"), 854)),
+            "availWidth": _int_value(screen_options.get("availWidth"), _int_value(screen_options.get("width"), 480)),
+        }
+        runtime_viewport = {
+            "width": _int_value(viewport_options.get("width"), 480),
+            "height": _int_value(viewport_options.get("height"), 854),
+        }
+        profile.update(
+            {
+                "inner_width": runtime_viewport["width"],
+                "inner_height": runtime_viewport["height"],
+                "outer_width": runtime_screen["width"],
+                "outer_height": runtime_screen["height"],
+            }
+        )
     return {
-        "browser_profile": _runtime_browser_profile(js, seed_profile),
-        "screen": _runtime_screen(js),
-        "viewport": _runtime_viewport(js),
+        "browser_profile": profile,
+        "screen": runtime_screen,
+        "viewport": runtime_viewport,
         "device_fingerprint": _runtime_device_fingerprint(js),
     }
 
@@ -455,6 +498,26 @@ def _merged_context_dict(defaults: object, overrides: JsonObject | None) -> Json
     if overrides:
         merged.update(overrides)
     return merged
+
+
+def _is_ios_webkit_profile(profile: JsonObject) -> bool:
+    """Return whether a local context must keep an iPhone/WebKit identity.
+
+    Local Playwright still uses Chromium underneath, but the iOS profile is a
+    complete browser identity rather than just a User-Agent override.  Keep the
+    predicate deliberately strict: generic mobile/Android profiles must retain
+    their Chromium client hints and UA-data behaviour.
+    """
+    user_agent = _str_value(profile.get("user_agent") or profile.get("userAgent"))
+    preset = _str_value(profile.get("device_preset") or profile.get("devicePreset")).lower().replace("-", "_")
+    platform = _str_value(profile.get("platform")).lower()
+    return bool(
+        profile.get("is_ios_webkit")
+        or profile.get("ios_webkit")
+        or preset in {"ios", "iphone", "ios_phone", "headless_ios"}
+        or re.search(r"\b(?:iphone|ipad|ipod)\b", user_agent, re.I)
+        or platform in {"iphone", "ipad", "ipod"}
+    )
 
 
 def _context_options(
@@ -467,6 +530,7 @@ def _context_options(
     viewport_options = _merged_context_dict(VIEWPORT, viewport)
     screen_options = _merged_context_dict(SCREEN, screen)
     language = str(profile.get("language") or "pt-BR")
+    ios_webkit = _is_ios_webkit_profile(profile)
     return {
         "user_agent": str(profile.get("user_agent") or USER_AGENT),
         "viewport": {
@@ -480,8 +544,8 @@ def _context_options(
         "locale": language,
         "timezone_id": str(profile.get("timezone") or "America/Sao_Paulo"),
         "device_scale_factor": _float_value(profile.get("device_pixel_ratio"), 1.0),
-        "is_mobile": False,
-        "has_touch": False,
+        "is_mobile": ios_webkit or bool(profile.get("is_mobile", False)),
+        "has_touch": ios_webkit or bool(profile.get("has_touch", False)),
         "java_script_enabled": True,
     }
 
@@ -711,6 +775,13 @@ def _sec_ch_ua_header_from_metadata(metadata: JsonObject, *, full: bool = False)
 
 
 def _headless_extra_http_headers(profile: JsonObject) -> dict[str, str]:
+    if _is_ios_webkit_profile(profile):
+        # Safari/iOS never emits Chromium UA Client Hints.  Merely replacing
+        # the User-Agent while retaining Sec-CH-* is a detectable mixed
+        # identity and is the direct cause of the local DataDome challenge.
+        language = str(profile.get("language") or "en-US")
+        language_base = language.split("-", 1)[0].split("_", 1)[0] or "en"
+        return {"Accept-Language": f"{language},{language_base};q=0.9"}
     metadata = _chrome_user_agent_metadata(profile)
     language = str(profile.get("language") or "pt-BR")
     bitness = str(metadata.get("bitness") or profile.get("sec_ch_bitness") or "64")
@@ -741,6 +812,7 @@ def _stealth_init_script(
     screen_options = _merged_context_dict(SCREEN, screen)
     language = str(profile.get("language") or "pt-BR")
     user_agent = str(profile.get("user_agent") or USER_AGENT)
+    ios_webkit = _is_ios_webkit_profile(profile)
     ua_data = _ua_data_script_config(profile)
     configured_webgl_vendor = _env_text("PAYPAL_HEADLESS_WEBGL_VENDOR")
     configured_webgl_renderer = _env_text("PAYPAL_HEADLESS_WEBGL_RENDERER")
@@ -755,9 +827,12 @@ def _stealth_init_script(
         "appVersion": user_agent.split("Mozilla/", 1)[-1] if user_agent.startswith("Mozilla/") else user_agent,
         "languages": _headless_language_list(language),
         "language": language,
-        "platform": str(profile.get("platform") or "Linux x86_64"),
-        "hardwareConcurrency": _int_value(profile.get("hardware_concurrency"), 8),
-        "deviceMemory": _int_value(profile.get("device_memory"), 8),
+        "platform": "iPhone" if ios_webkit else str(profile.get("platform") or "Linux x86_64"),
+        "vendor": "Apple Computer, Inc." if ios_webkit else str(profile.get("vendor") or "Google Inc."),
+        "hardwareConcurrency": _int_value(profile.get("hardware_concurrency"), 6 if ios_webkit else 8),
+        "deviceMemory": None if ios_webkit else _int_value(profile.get("device_memory"), 8),
+        "maxTouchPoints": _int_value(profile.get("max_touch_points"), 5 if ios_webkit else 0),
+        "iosWebKit": ios_webkit,
         "screenWidth": _int_value(screen_options.get("width"), 1536),
         "screenHeight": _int_value(screen_options.get("height"), 864),
         "screenAvailWidth": _int_value(screen_options.get("availWidth"), _int_value(screen_options.get("width"), 1536)),
@@ -784,6 +859,7 @@ def _stealth_init_script(
     return fn;
   }};
   const makeUAData = () => {{
+    if (cfg.iosWebKit) return undefined;
     const data = cfg.uaData || {{}};
     const values = {{
       brands: (data.brands || []).map((item) => Object.assign({{}}, item)),
@@ -821,9 +897,16 @@ def _stealth_init_script(
     defineGetter(proto, "language", () => cfg.language);
     defineGetter(proto, "languages", () => cfg.languages.slice());
     defineGetter(proto, "platform", () => cfg.platform);
+    defineGetter(proto, "vendor", () => cfg.vendor);
     defineGetter(proto, "hardwareConcurrency", () => cfg.hardwareConcurrency);
-    defineGetter(proto, "deviceMemory", () => cfg.deviceMemory);
-    defineGetter(proto, "userAgentData", () => makeUAData());
+    if (cfg.iosWebKit) {{
+      defineGetter(proto, "maxTouchPoints", () => cfg.maxTouchPoints);
+      defineGetter(proto, "deviceMemory", () => undefined);
+      defineGetter(proto, "userAgentData", () => undefined);
+    }} else {{
+      defineGetter(proto, "deviceMemory", () => cfg.deviceMemory);
+      defineGetter(proto, "userAgentData", () => makeUAData());
+    }}
   }};
   const patchWebGL = (root) => {{
     try {{
@@ -893,6 +976,7 @@ def _stealth_init_script(
       const defineValue = (obj, prop, value) => {{ try {{ Object.defineProperty(obj, prop, {{ value, configurable: true, writable: true }}); }} catch (_e) {{}} }};
       const patchToString = (fn, name) => {{ try {{ Object.defineProperty(fn, "toString", {{ value: () => nativeSource(name), configurable: true }}); }} catch (_e) {{}} return fn; }};
       const makeUAData = () => {{
+        if (cfg.iosWebKit) return undefined;
         const data = cfg.uaData || {{}};
         const values = {{
           brands: (data.brands || []).map((item) => Object.assign({{}}, item)), mobile: !!data.mobile, platform: data.platform || "",
@@ -911,8 +995,13 @@ def _stealth_init_script(
           defineGetter(proto, "languages", () => cfg.languages.slice());
           defineGetter(proto, "platform", () => cfg.platform);
           defineGetter(proto, "hardwareConcurrency", () => cfg.hardwareConcurrency);
-          defineGetter(proto, "deviceMemory", () => cfg.deviceMemory);
-          defineGetter(proto, "userAgentData", () => makeUAData());
+          if (cfg.iosWebKit) {{
+            defineGetter(proto, "deviceMemory", () => undefined);
+            defineGetter(proto, "userAgentData", () => undefined);
+          }} else {{
+            defineGetter(proto, "deviceMemory", () => cfg.deviceMemory);
+            defineGetter(proto, "userAgentData", () => makeUAData());
+          }}
           defineGetter(proto, "webdriver", () => undefined);
         }}
       }} catch (_e) {{}}
@@ -964,23 +1053,25 @@ def _apply_cdp_stealth_overrides(
 ) -> None:
     profile = _merged_context_dict(BROWSER_PROFILE, browser_profile)
     language = str(profile.get("language") or "pt-BR")
+    ios_webkit = _is_ios_webkit_profile(profile)
     try:
         cdp = context.new_cdp_session(page)
     except Exception as exc:
         logger.debug("Local headless CDP stealth session unavailable: {}", exc)
         return
-    try:
-        cdp.send(
-            "Network.setUserAgentOverride",
-            {
-                "userAgent": str(profile.get("user_agent") or USER_AGENT),
-                "acceptLanguage": f"{language},pt;q=0.9,en-US;q=0.8,en;q=0.7",
-                "platform": str(profile.get("platform") or "Linux x86_64"),
-                "userAgentMetadata": _chrome_user_agent_metadata(profile),
-            },
-        )
-    except Exception as exc:
-        logger.debug("Local headless UA metadata override failed: {}", exc)
+    if not ios_webkit:
+        try:
+            cdp.send(
+                "Network.setUserAgentOverride",
+                {
+                    "userAgent": str(profile.get("user_agent") or USER_AGENT),
+                    "acceptLanguage": f"{language},pt;q=0.9,en-US;q=0.8,en;q=0.7",
+                    "platform": str(profile.get("platform") or "Linux x86_64"),
+                    "userAgentMetadata": _chrome_user_agent_metadata(profile),
+                },
+            )
+        except Exception as exc:
+            logger.debug("Local headless UA metadata override failed: {}", exc)
     try:
         cdp.send("Emulation.setTimezoneOverride", {"timezoneId": str(profile.get("timezone") or "America/Sao_Paulo")})
     except Exception:
@@ -1064,8 +1155,17 @@ def _base_launch_kwargs(proxy_url: str | None, *, channel: str) -> JsonObject:
         args.insert(0, f"--use-angle={angle_backend}")
     if _env_bool("PAYPAL_HEADLESS_ENABLE_SWIFTSHADER", False) or _env_bool("PAYPAL_LOCAL_HEADLESS_ENABLE_SWIFTSHADER", False):
         args.append("--enable-unsafe-swiftshader")
+    visible_raw = _env_text(
+        "PAYPAL_LOCAL_HEADLESS_VISIBLE",
+        "PAYPAL_HEADLESS_VISIBLE",
+        "PAYPAL_LOCAL_BROWSER_VISIBLE",
+    ).strip().lower()
+    # A visible Chromium keeps the same local-browser workflow but avoids the
+    # unmistakable Chrome headless execution path used by edge challenges.
+    # It remains opt-in so existing unattended jobs keep their current mode.
+    visible = visible_raw in {"1", "true", "yes", "on", "visible", "headed"}
     kwargs: JsonObject = {
-        "headless": True,
+        "headless": not visible,
         "ignore_default_args": ["--enable-automation"],
         "args": args,
     }
@@ -1998,6 +2098,9 @@ class LocalHeadlessSession:
         self._owned_pages: list[Any] = []
         self._reset_events()
 
+    def _uses_ios_webkit_identity(self) -> bool:
+        return _is_ios_webkit_profile(_merged_context_dict(BROWSER_PROFILE, self.browser_profile))
+
     @property
     def debug_log_path(self) -> str:
         return self.debug_log.path
@@ -2072,11 +2175,12 @@ class LocalHeadlessSession:
             else:
                 self._context = self._browser.new_context(**options)
             profile = _merged_context_dict(BROWSER_PROFILE, self.browser_profile)
-            try:
-                self._context.set_extra_http_headers(_headless_extra_http_headers(profile))
-            except Exception as exc:
-                logger.debug("Local headless extra headers install failed: {}", exc)
-            self._install_stealth_context()
+            if not self.roxy_browser:
+                try:
+                    self._context.set_extra_http_headers(_headless_extra_http_headers(profile))
+                except Exception as exc:
+                    logger.debug("Local headless extra headers install failed: {}", exc)
+                self._install_stealth_context()
             cached_cookies = [] if self.roxy_browser else _load_headless_cached_cookies(self.proxy_url, profile)
             sanitized = _merge_cookie_lists(_sanitize_cookies(self.cookies), cached_cookies)
             if sanitized:
@@ -2103,7 +2207,7 @@ class LocalHeadlessSession:
 
     def _prepare_page_for_runtime(self, page: Any) -> None:
         self._attach_page_listeners(page)
-        if self._context is not None:
+        if self._context is not None and not self.roxy_browser:
             _apply_cdp_stealth_overrides(self._context, page, browser_profile=self.browser_profile)
 
     def close(self) -> None:
@@ -2234,6 +2338,18 @@ class LocalHeadlessSession:
                 except Exception:
                     pass
                 self.debug_log.record(record)
+                if self._uses_ios_webkit_identity():
+                    try:
+                        headers = dict(getattr(request, "headers", {}) or {})
+                        stripped = [name for name in headers if name.lower().startswith("sec-ch-")]
+                        if stripped:
+                            for name in stripped:
+                                headers.pop(name, None)
+                            record["ios_removed_client_hints"] = sorted(stripped)
+                            raw_route.continue_(headers=headers)
+                            return
+                    except Exception as exc:
+                        logger.debug("Local iOS header normalization failed; continuing request unchanged: {}", exc)
                 raw_route.continue_()
                 return
             self.policy.blocked.append(record)
@@ -2556,7 +2672,13 @@ class LocalHeadlessSession:
         self.debug_log.record({"event": "browser_activity", **result})
         return result
 
-    def solve_datadome(self, url: str, *, wait_seconds: float | None = None) -> JsonObject:
+    def solve_datadome(
+        self,
+        url: str,
+        *,
+        wait_seconds: float | None = None,
+        accept_clean_page: bool = False,
+    ) -> JsonObject:
         page = self._new_or_existing_page()
         wait_seconds = wait_seconds if wait_seconds is not None else headless_optimized_datadome_wait_seconds()
         wait_ms = max(1000, int(wait_seconds * 1000))
@@ -2659,7 +2781,8 @@ class LocalHeadlessSession:
         cookies = self.browser_cookies()
         self._persist_cookie_cache(cookies)
         datadome = self._datadome_cookie()
-        ok = bool(datadome and not blocked_by_datadome)
+        clean_page = bool(not blocked_by_datadome and 200 <= status < 400)
+        ok = bool(datadome and not blocked_by_datadome) or bool(accept_clean_page and clean_page)
         result: JsonObject = {
             "ok": ok,
             "runtime": self.runtime,
@@ -2669,6 +2792,7 @@ class LocalHeadlessSession:
             "datadome": datadome,
             "clientid": _extract_datadome_clientid_from_html(html),
             "blocked_by_datadome": blocked_by_datadome,
+            "clean_page": clean_page,
             "debug_log_path": self.debug_log_path,
             "intercept": self.intercept_summary(),
         }
@@ -3321,7 +3445,7 @@ class LocalHeadlessSession:
 LocalHeadlessOptimizedSession = LocalHeadlessSession
 
 
-def run_local_headless_mtr_phase1(
+def _run_local_headless_mtr_phase1_direct(
     page_url: str,
     *,
     dfp_config: JsonObject,
@@ -3374,6 +3498,69 @@ def run_local_headless_mtr_phase1(
     finally:
         if owns_session:
             active_session.close()
+
+
+def run_local_headless_mtr_phase1(
+    page_url: str,
+    *,
+    dfp_config: JsonObject,
+    dfp_script_url: str,
+    cookies: list[JsonObject] | None = None,
+    wait_seconds: float | None = None,
+    mtr_wait_seconds: float | None = None,
+    datadome_wait_seconds: float | None = None,
+    proxy_url: str | None = None,
+    browser_profile: JsonObject | None = None,
+    screen: JsonObject | None = None,
+    viewport: JsonObject | None = None,
+    app_id: str = "IWC_NEXT_CHECKOUT",
+    correlation_id: str = "",
+    session: LocalHeadlessSession | None = None,
+    stage: str = "checkout",
+    new_page: bool = False,
+    run_mtr: bool = True,
+    roxy_browser: JsonObject | None = None,
+    runtime: str | None = None,
+    document_html: str = "",
+    document_status: int = 200,
+) -> JsonObject:
+    """Run phase-1 browser work without nesting sync Playwright managers.
+
+    Calls with an explicit live ``session`` must remain on that session's
+    thread.  Calls that create their own session (the Roxy/local one-shot
+    runners) are safe to move to a worker when another Playwright dispatcher
+    already owns the current thread.
+    """
+    def run() -> JsonObject:
+        return _run_local_headless_mtr_phase1_direct(
+            page_url,
+            dfp_config=dfp_config,
+            dfp_script_url=dfp_script_url,
+            cookies=cookies,
+            wait_seconds=wait_seconds,
+            mtr_wait_seconds=mtr_wait_seconds,
+            datadome_wait_seconds=datadome_wait_seconds,
+            proxy_url=proxy_url,
+            browser_profile=browser_profile,
+            screen=screen,
+            viewport=viewport,
+            app_id=app_id,
+            correlation_id=correlation_id,
+            session=session,
+            stage=stage,
+            new_page=new_page,
+            run_mtr=run_mtr,
+            roxy_browser=roxy_browser,
+            runtime=runtime,
+            document_html=document_html,
+            document_status=document_status,
+        )
+
+    # A caller-provided session may have an active sync Playwright manager on
+    # this same thread, so it cannot be transferred to another thread.
+    if session is not None:
+        return run()
+    return run_sync_playwright_operation(run, label="local-headless-phase1")
 
 
 def run_headless_optimized_mtr_phase1(*args: Any, **kwargs: Any) -> JsonObject:
@@ -3801,7 +3988,7 @@ async () => {
 """
 
 
-def capture_runtime_fingerprint_with_local_headless(
+def _capture_runtime_fingerprint_with_local_headless_direct(
     *,
     wait_seconds: float = 12.0,
     proxy_url: str | None = None,
@@ -3840,7 +4027,12 @@ def capture_runtime_fingerprint_with_local_headless(
             value = page.evaluate(_RUNTIME_FINGERPRINT_SCRIPT)
             if not isinstance(value, dict):
                 raise LocalHeadlessRuntimeError("local headless fingerprint probe returned no data")
-            runtime = _runtime_profile_from_js(cast(JsonObject, value), browser_profile)
+            runtime = _runtime_profile_from_js(
+                cast(JsonObject, value),
+                browser_profile,
+                screen=screen,
+                viewport=viewport,
+            )
             logger.info(
                 "Local headless fingerprint captured: ua={} screen={}x{} viewport={}x{}",
                 str(cast(JsonObject, runtime["browser_profile"]).get("user_agent") or "")[:80],
@@ -3852,6 +4044,27 @@ def capture_runtime_fingerprint_with_local_headless(
             return runtime
         finally:
             browser.close()
+
+
+def capture_runtime_fingerprint_with_local_headless(
+    *,
+    wait_seconds: float = 12.0,
+    proxy_url: str | None = None,
+    browser_profile: JsonObject | None = None,
+    screen: JsonObject | None = None,
+    viewport: JsonObject | None = None,
+) -> JsonObject:
+    """Capture a runtime fingerprint without nesting sync Playwright loops."""
+    return run_sync_playwright_operation(
+        lambda: _capture_runtime_fingerprint_with_local_headless_direct(
+            wait_seconds=wait_seconds,
+            proxy_url=proxy_url,
+            browser_profile=browser_profile,
+            screen=screen,
+            viewport=viewport,
+        ),
+        label="local-headless-fingerprint",
+    )
 
 
 def capture_local_headless_runtime_profile(
@@ -3950,18 +4163,21 @@ def solve_datadome_with_local_headless(
     The former legacy implementation has been removed; this now delegates to
     the shared local-headless session and reports runtime=headless.
     """
-    session = LocalHeadlessSession(
-        cookies=cookies,
-        proxy_url=proxy_url,
-        browser_profile=browser_profile,
-        screen=screen,
-        viewport=viewport,
-        runtime="headless",
-    )
-    try:
-        return session.solve_datadome(url, wait_seconds=wait_seconds)
-    finally:
-        session.close()
+    def run() -> JsonObject:
+        session = LocalHeadlessSession(
+            cookies=cookies,
+            proxy_url=proxy_url,
+            browser_profile=browser_profile,
+            screen=screen,
+            viewport=viewport,
+            runtime="headless",
+        )
+        try:
+            return session.solve_datadome(url, wait_seconds=wait_seconds)
+        finally:
+            session.close()
+
+    return run_sync_playwright_operation(run, label="local-headless-datadome")
 
 
 def _extract_mtr_response_data(value: object) -> JsonObject:
