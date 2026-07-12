@@ -586,15 +586,16 @@ class PayPalFlow:
         ).strip().lower()
         if raw:
             return raw in {"1", "true", "yes", "on", "enable", "enabled"}
-        # A protocol navigation cannot reproduce an iOS WebKit HTTP identity.
-        # When the local iOS preset is active, open the protected document in
-        # that context first instead of deliberately generating a protocol
-        # 403 before the browser has established its cookie/session.
-        profile = self.state.browser_profile or {}
-        local_ios = bool(profile.get("is_ios_webkit")) or str(
-            profile.get("device_preset") or ""
-        ).strip().lower().replace("-", "_") in {"ios", "iphone", "ios_phone", "headless_ios"}
-        return self._datadome_mode_raw() == "roxy_ios" or local_ios
+        # Keep the expensive browser preflight opt-in for local headless iOS.
+        # A 403 from that probe is commonly harmless: the following protocol
+        # request can still load normally, while waiting for the browser probe
+        # to resolve consumes its full DataDome timeout.  If the protocol
+        # request really is challenged, Phase 0 still invokes the browser
+        # runtime through its normal HTTP-403 fallback path.
+        #
+        # Roxy iOS remains browser-first because it has a native iOS browser
+        # identity rather than a locally emulated WebKit surface.
+        return self._datadome_mode_raw() == "roxy_ios"
 
     @staticmethod
     def _headless_datadome_roxy_fallback_enabled() -> bool:

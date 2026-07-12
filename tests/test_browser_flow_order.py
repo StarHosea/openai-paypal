@@ -2708,11 +2708,13 @@ class BrowserFlowOrderTest(unittest.TestCase):
         self.assertEqual(flow.state.datadome_cookie, "dd-headless")
         self.assertNotIn("html", flow.state.datadome_browser_result)
 
-    def test_phase0_headless_skips_slow_datadome_preflight_by_default_when_protocol_get_succeeds(self):
+    def test_phase0_local_ios_headless_skips_slow_datadome_preflight_by_default_when_protocol_get_succeeds(self):
         with patch.dict(os.environ, {"PAYPAL_FINGERPRINT_SOURCE": "random"}, clear=True):
             flow, fake = make_flow()
-        setattr(flow, "datadome_mode", "headless")
+        setattr(flow, "datadome_mode", "headless_ios")
+        flow.state.browser_profile.update({"is_ios_webkit": True, "device_preset": "ios_phone"})
         phase0 = cast(Callable[[], None], getattr(flow, "_phase0_initial_load"))
+        preflight_enabled = cast(Callable[[], bool], getattr(flow, "_datadome_phase0_preflight_enabled"))
         html = """
         <html>
           <head><title>PayPal checkout</title></head>
@@ -2733,6 +2735,7 @@ class BrowserFlowOrderTest(unittest.TestCase):
             patch.object(fake, "get", side_effect=get_approval_page),
             patch.object(flow, "_solve_datadome_with_roxy_browser", side_effect=AssertionError("slow preflight should not run")),
         ):
+            self.assertFalse(preflight_enabled())
             phase0()
 
         self.assertEqual(fake.requests, [("GET", "https://www.paypal.com/agreements/approve?ba_token=BA-TESTTOKEN123")])
