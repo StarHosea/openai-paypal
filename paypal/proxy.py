@@ -11,10 +11,11 @@ from __future__ import annotations
 
 import os
 import random
+import re
 from datetime import datetime, timezone
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Mapping
 from urllib.parse import quote
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -126,6 +127,360 @@ class ProxyConfig:
         return self.entry.masked
 
 
+# A browser locale is not a checkout locale.  The former is part of the
+# device/network fingerprint and should describe the proxy exit, while the
+# latter is selected by the checkout flow.  Keep this intentionally small and
+# use the geo provider's advertised language when it is available; the table
+# supplies a sensible BCP-47 fallback for providers that only return a country
+# code.
+_COUNTRY_LANGUAGE_DEFAULTS: dict[str, str] = {
+    "AE": "ar-AE",
+    "AR": "es-AR",
+    "AT": "de-AT",
+    "AU": "en-AU",
+    "BE": "nl-BE",
+    "BG": "bg-BG",
+    "BO": "es-BO",
+    "BR": "pt-BR",
+    "CA": "en-CA",
+    "CH": "de-CH",
+    "CL": "es-CL",
+    "CN": "zh-CN",
+    "CO": "es-CO",
+    "CR": "es-CR",
+    "CZ": "cs-CZ",
+    "DE": "de-DE",
+    "DK": "da-DK",
+    "DO": "es-DO",
+    "EC": "es-EC",
+    "EE": "et-EE",
+    "EG": "ar-EG",
+    "ES": "es-ES",
+    "FI": "fi-FI",
+    "FR": "fr-FR",
+    "GB": "en-GB",
+    "GR": "el-GR",
+    "GT": "es-GT",
+    "HK": "zh-HK",
+    "HN": "es-HN",
+    "HR": "hr-HR",
+    "HU": "hu-HU",
+    "ID": "id-ID",
+    "IE": "en-IE",
+    "IL": "he-IL",
+    "IN": "en-IN",
+    "IS": "is-IS",
+    "IT": "it-IT",
+    "JP": "ja-JP",
+    "KE": "en-KE",
+    "KR": "ko-KR",
+    "LT": "lt-LT",
+    "LU": "fr-LU",
+    "LV": "lv-LV",
+    "MA": "ar-MA",
+    "MX": "es-MX",
+    "MY": "ms-MY",
+    "NG": "en-NG",
+    "NL": "nl-NL",
+    "NO": "nb-NO",
+    "NZ": "en-NZ",
+    "PA": "es-PA",
+    "PE": "es-PE",
+    "PH": "en-PH",
+    "PK": "en-PK",
+    "PL": "pl-PL",
+    "PR": "es-PR",
+    "PT": "pt-PT",
+    "RO": "ro-RO",
+    "RS": "sr-RS",
+    "RU": "ru-RU",
+    "SA": "ar-SA",
+    "SE": "sv-SE",
+    "SG": "en-SG",
+    "SI": "sl-SI",
+    "SK": "sk-SK",
+    "TH": "th-TH",
+    "TR": "tr-TR",
+    "TW": "zh-TW",
+    "UA": "uk-UA",
+    "US": "en-US",
+    "UY": "es-UY",
+    "VE": "es-VE",
+    "VN": "vi-VN",
+    "ZA": "en-ZA",
+}
+
+_LANGUAGE_TAG_RE = re.compile(r"^[A-Za-z]{2,3}(?:-[A-Za-z]{2,4})?$")
+
+
+def _first_text(mapping: Mapping[str, object], *keys: str) -> str:
+    for key in keys:
+        value = mapping.get(key)
+        if value is not None and str(value).strip():
+            return str(value).strip()
+    return ""
+
+
+def _normalise_country_code(value: object) -> str:
+    country = str(value or "").strip().upper()
+    return country if re.fullmatch(r"[A-Z]{2}", country) else ""
+
+
+def _normalise_language_tag(value: object, country: str = "") -> str:
+    """Return one safe browser language tag from a geo-provider value."""
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    # ipapi.co returns e.g. ``en-US,es-US,haw``.  The first language is the
+    # provider's primary locale and is a better choice than guessing solely
+    # from the country.
+    raw = re.split(r"[,;\s]+", raw, maxsplit=1)[0].replace("_", "-")
+    if not _LANGUAGE_TAG_RE.fullmatch(raw):
+        return ""
+    parts = raw.split("-", 1)
+    language = parts[0].lower()
+    region = parts[1].upper() if len(parts) == 2 and len(parts[1]) == 2 else ""
+    if not region and country:
+        # Avoid emitting a bare ``en`` / ``pt`` locale when a country is
+        # known.  Browsers conventionally expose the country-specific form.
+        return f"{language}-{country}"
+    return f"{language}-{region}" if region else language
+
+
+def _language_profile(country: str, advertised_languages: object = "") -> dict[str, object]:
+    """Build coherent navigator/Accept-Language values for a country."""
+    language = _normalise_language_tag(advertised_languages, country)
+    if not language:
+        language = _COUNTRY_LANGUAGE_DEFAULTS.get(country, "en-US")
+    language_root = language.split("-", 1)[0]
+    values: list[str] = []
+    for item in (language, language_root, "en-US", "en"):
+        if item and item not in values:
+            values.append(item)
+    return {
+        "language": language,
+        "locale": language.replace("-", "_"),
+        "languages": values,
+    }
+
+
+def _number_or_none(value: object, *, minimum: float, maximum: float) -> float | None:
+    try:
+        number = float(str(value))
+    except (TypeError, ValueError):
+        return None
+    if not minimum <= number <= maximum:
+        return None
+    # Geo-IP precision is neither reliable nor useful beyond this level.  It
+    # also prevents a provider's noisy precision from making profiles differ
+    # unnecessarily between otherwise identical exit locations.
+    return round(number, 4)
+
+
+def _timezone_from_payload(payload: Mapping[str, object]) -> str:
+    raw = payload.get("timezone")
+    if isinstance(raw, Mapping):
+        raw = _first_text(raw, "id", "name", "timezone")
+    candidate = str(raw or _first_text(payload, "time_zone", "timeZone") or "").strip()
+    if not candidate:
+        return ""
+    try:
+        return ZoneInfo(candidate).key
+    except (ZoneInfoNotFoundError, ValueError):
+        return ""
+
+
+def normalize_proxy_geo_payload(payload: object) -> dict[str, object]:
+    """Normalize common Geo-IP response formats into browser-safe fields.
+
+    Supported shapes include ipapi.co, ipwho.is, ipinfo.io, ip-api.com and a
+    simple custom endpoint.  Invalid/incomplete values are discarded instead
+    of being copied into browser-visible profile fields.
+    """
+    if not isinstance(payload, Mapping):
+        return {}
+    # ipwho.is and ip-api.com explicitly report an unsuccessful lookup.
+    if payload.get("success") is False or str(payload.get("status") or "").lower() == "fail":
+        return {}
+
+    country = _normalise_country_code(
+        _first_text(payload, "country_code", "countryCode", "country", "countryCode2")
+    )
+    # Some endpoints expose a country object instead of a code.
+    raw_country = payload.get("country")
+    if not country and isinstance(raw_country, Mapping):
+        country = _normalise_country_code(
+            _first_text(raw_country, "code", "iso_code", "isoCode", "country_code")
+        )
+    country_name = ""
+    if isinstance(raw_country, str) and not _normalise_country_code(raw_country):
+        country_name = raw_country.strip()
+    if not country_name:
+        country_name = _first_text(payload, "country_name", "countryName")
+    if isinstance(raw_country, Mapping) and not country_name:
+        country_name = _first_text(raw_country, "name", "country_name")
+
+    ip = _first_text(payload, "ip", "query", "ip_address", "ipAddress")
+    timezone_name = _timezone_from_payload(payload)
+    region = _first_text(payload, "region", "region_name", "regionName", "state", "province")
+    region_code = _first_text(payload, "region_code", "regionCode", "state_code", "stateCode")
+    city = _first_text(payload, "city", "town")
+    postal_code = _first_text(payload, "postal", "postal_code", "postalCode", "zip")
+    latitude = _number_or_none(
+        payload.get("latitude", payload.get("lat")), minimum=-90, maximum=90
+    )
+    longitude = _number_or_none(
+        payload.get("longitude", payload.get("lon", payload.get("lng"))), minimum=-180, maximum=180
+    )
+    # ipinfo.io exposes coordinates as ``loc: \"latitude,longitude\"``.
+    if latitude is None or longitude is None:
+        loc = _first_text(payload, "loc", "location")
+        if "," in loc:
+            lat_text, lon_text = loc.split(",", 1)
+            latitude = latitude if latitude is not None else _number_or_none(lat_text, minimum=-90, maximum=90)
+            longitude = longitude if longitude is not None else _number_or_none(lon_text, minimum=-180, maximum=180)
+
+    connection = payload.get("connection")
+    connection_data = connection if isinstance(connection, Mapping) else {}
+    asn = _first_text(payload, "asn", "as", "org") or _first_text(connection_data, "asn", "org", "isp")
+    isp = _first_text(payload, "isp", "org") or _first_text(connection_data, "isp", "org")
+    advertised_languages = _first_text(payload, "languages", "language", "locale")
+
+    result: dict[str, object] = {}
+    if ip:
+        result["ip"] = ip
+    if country:
+        result["country"] = country
+    if country_name:
+        result["country_name"] = country_name
+    if region:
+        result["region"] = region
+    if region_code:
+        result["region_code"] = region_code
+    if city:
+        result["city"] = city
+    if postal_code:
+        result["postal_code"] = postal_code
+    if timezone_name:
+        result["timezone"] = timezone_name
+    if latitude is not None and longitude is not None:
+        result["latitude"] = latitude
+        result["longitude"] = longitude
+    if asn:
+        result["asn"] = asn
+    if isp:
+        result["isp"] = isp
+    if advertised_languages:
+        result["languages"] = advertised_languages
+    return result
+
+
+def lookup_proxy_geo(proxy: ProxyConfig) -> dict[str, object]:
+    """Look up the selected proxy's exit location through that same proxy."""
+    if not proxy.enabled or not proxy.url:
+        return {}
+    endpoint = _load_dotenv_value("PAYPAL_PROXY_GEO_URL") or "https://ipapi.co/json/"
+    try:
+        timeout = float(_load_dotenv_value("PAYPAL_PROXY_GEO_TIMEOUT_SECONDS") or "4")
+    except ValueError:
+        timeout = 4.0
+    try:
+        import httpx
+
+        with httpx.Client(proxy=proxy.url, timeout=max(0.5, timeout)) as client:
+            payload = client.get(endpoint).json()
+        return normalize_proxy_geo_payload(payload)
+    except Exception:
+        # Geo-IP enrichment is optional.  A temporary provider/proxy failure
+        # must never prevent a browser session from being created.
+        return {}
+
+
+def _proxy_geo_lookup_enabled() -> bool:
+    # ``parse_bool(\"\", True)`` intentionally treats an explicitly empty
+    # boolean as false for generic config flags.  Geo lookup is documented as
+    # opt-out, though, so an absent/blank value must retain its default-on
+    # behaviour rather than silently skipping IP-based fingerprinting.
+    raw = _load_dotenv_value("PAYPAL_PROXY_GEO_LOOKUP")
+    return parse_bool(raw, True) if str(raw).strip() else True
+
+
+def _apply_proxy_geo_metadata(profile: dict[str, object], geo: Mapping[str, object]) -> None:
+    """Attach non-browser metadata without leaking provider-specific keys."""
+    if not geo:
+        return
+    profile["proxy_geo"] = dict(geo)
+    profile["proxy_geo_resolved"] = True
+    if geo.get("ip"):
+        profile["proxy_exit_ip"] = str(geo["ip"])
+    for source, target in (
+        ("country", "proxy_country"),
+        ("region", "proxy_region"),
+        ("region_code", "proxy_region_code"),
+        ("city", "proxy_city"),
+        ("asn", "proxy_asn"),
+        ("isp", "proxy_isp"),
+    ):
+        if geo.get(source):
+            profile[target] = geo[source]
+    latitude = geo.get("latitude")
+    longitude = geo.get("longitude")
+    if isinstance(latitude, (int, float)) and isinstance(longitude, (int, float)):
+        profile["geolocation"] = {
+            "latitude": float(latitude),
+            "longitude": float(longitude),
+            # City-level Geo-IP typically has kilometre-scale uncertainty.
+            "accuracy": 25_000,
+        }
+
+
+def proxy_fingerprint_profile(proxy: ProxyConfig, fallback: Mapping[str, object]) -> dict[str, object]:
+    """Return browser fingerprint overrides aligned with the proxy exit IP.
+
+    The checkout region is intentionally kept in ``checkout_*`` fields by the
+    caller.  This function updates browser-facing country/language/locale,
+    timezone and optional geolocation only, so a US checkout can still be
+    selected explicitly when the user is travelling behind another country's
+    proxy.
+
+    ``PAYPAL_PROXY_FINGERPRINT_GEO=0`` retains the legacy behaviour of using
+    only the proxy timezone while still recording no country/locale override.
+    ``PAYPAL_PROXY_TIMEZONE`` always wins over Geo-IP timezone data.
+    """
+    profile = dict(fallback)
+    configured_timezone = _load_dotenv_value("PAYPAL_PROXY_TIMEZONE")
+    if configured_timezone:
+        try:
+            profile.update(timezone_profile(configured_timezone))
+        except ValueError:
+            # Keep the regional fallback if an operator supplied an invalid
+            # override; this matches the failure-tolerant lookup behaviour.
+            pass
+
+    if not proxy.enabled or not proxy.url or not _proxy_geo_lookup_enabled():
+        return profile
+
+    geo = lookup_proxy_geo(proxy)
+    if not geo:
+        return profile
+    _apply_proxy_geo_metadata(profile, geo)
+
+    if not configured_timezone and isinstance(geo.get("timezone"), str):
+        try:
+            profile.update(timezone_profile(str(geo["timezone"])))
+        except ValueError:
+            pass
+
+    fingerprint_geo = _load_dotenv_value("PAYPAL_PROXY_FINGERPRINT_GEO")
+    if str(fingerprint_geo).strip() and not parse_bool(fingerprint_geo, True):
+        return profile
+    country = _normalise_country_code(geo.get("country"))
+    if country:
+        profile["country"] = country
+        profile.update(_language_profile(country, geo.get("languages", "")))
+    return profile
+
+
 def timezone_profile(timezone_name: str, *, now: datetime | None = None) -> dict[str, object]:
     """Return browser timezone fields for an IANA timezone.
 
@@ -163,27 +518,16 @@ def proxy_timezone_profile(proxy: ProxyConfig, fallback: dict[str, object]) -> d
         return timezone_profile(configured)
     if not proxy.enabled or not proxy.url:
         return dict(fallback)
-    if not parse_bool(_load_dotenv_value("PAYPAL_PROXY_GEO_LOOKUP"), True):
+    if not _proxy_geo_lookup_enabled():
         return dict(fallback)
 
-    endpoint = _load_dotenv_value("PAYPAL_PROXY_GEO_URL") or "https://ipapi.co/json/"
-    try:
-        timeout = float(_load_dotenv_value("PAYPAL_PROXY_GEO_TIMEOUT_SECONDS") or "4")
-    except ValueError:
-        timeout = 4.0
-    try:
-        import httpx
-
-        with httpx.Client(proxy=proxy.url, timeout=max(0.5, timeout)) as client:
-            payload = client.get(endpoint).json()
-        raw_timezone = payload.get("timezone") if isinstance(payload, dict) else None
-        if isinstance(raw_timezone, dict):
-            raw_timezone = raw_timezone.get("id")
-        if isinstance(raw_timezone, str) and raw_timezone.strip():
-            return timezone_profile(raw_timezone.strip())
-    except Exception:
-        # A geo-IP service must never prevent a checkout session from starting.
-        pass
+    geo = lookup_proxy_geo(proxy)
+    raw_timezone = geo.get("timezone") if geo else None
+    if isinstance(raw_timezone, str) and raw_timezone:
+        try:
+            return timezone_profile(raw_timezone)
+        except ValueError:
+            pass
     return dict(fallback)
 
 

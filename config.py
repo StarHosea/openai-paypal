@@ -15,8 +15,9 @@ SCREEN = {
 VIEWPORT = {"width": 1365, "height": 768}
 
 # Baseline profile retained for programmatic BR callers.  PayPalFlow applies a
-# regional override and, when a proxy is enabled, derives the IANA timezone and
-# JavaScript offset from the proxy exit IP before any browser runtime is opened.
+# regional override and, when a proxy is enabled, derives browser geography
+# (IANA timezone/DST, country, language, locale and city-level geolocation)
+# from the proxy exit IP before any browser runtime is opened.
 BROWSER_PROFILE = {
     "country": "BR",
     "language": "pt-BR",

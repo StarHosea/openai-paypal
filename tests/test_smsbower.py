@@ -4,10 +4,11 @@ import time
 import unittest
 from pathlib import Path
 from typing import final
+from unittest.mock import patch
 
 from paypal.models import BillingAddress, CardInfo, UserInfo
 from paypal.flow import PayPalFlow
-from web import WebJob, WebPayPalFlow
+from web import JOBS, WebJob, WebPayPalFlow, create_job
 
 smsbower_module = importlib.import_module("paypal.smsbower")
 SMSBowerActivationStore = getattr(smsbower_module, "SMSBowerActivationStore")
@@ -112,6 +113,43 @@ class SMSBowerProviderTest(unittest.TestCase):
             self.assertEqual(activation.provider_id, "20")
             self.assertEqual(client.number_requests, ["20"])
 
+    def test_no_reuse_always_reserves_a_new_number_and_skips_cache_write(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cache_path = Path(tmp) / "smsbower.json"
+            store = SMSBowerActivationStore(cache_path)
+            store.remember_success(
+                activation_id="old-1",
+                phone_number="+5511987654321",
+                provider_id="10",
+                price=0.35,
+                expires_at=time.time() + 600,
+            )
+            client = FakeSMSBowerClient()
+            provider = SMSBowerOtpProvider(
+                client=client,
+                store=store,
+                wait_seconds=0.01,
+                poll_interval_seconds=0.01,
+                activation_ttl_seconds=1200,
+                reuse_numbers=False,
+            )
+
+            activation = provider.reserve_number()
+            code = provider.wait_for_code(activation)
+            provider.register_confirmation_result(activation, confirmed=True)
+            cached_rows = store.load()["activations"]
+
+            self.assertFalse(activation.reused)
+            self.assertNotEqual(activation.activation_id, "old-1")
+            self.assertEqual(client.number_requests, ["10"])
+            self.assertNotIn(("old-1", 3), client.status_changes)
+            self.assertEqual(code, "654321")
+            self.assertIsInstance(cached_rows, list)
+            self.assertEqual(
+                [str(row.get("activation_id")) for row in cached_rows if isinstance(row, dict)],
+                ["old-1"],
+            )
+
 
 class SMSBowerFlowTest(unittest.TestCase):
     def test_flow_uses_smsbower_code_without_manual_prompt(self) -> None:
@@ -146,6 +184,30 @@ class SMSBowerFlowTest(unittest.TestCase):
 
             self.assertEqual(flow.confirmed_codes, ["654321"])
             self.assertFalse(job.waited_for_input)
+
+    def test_web_job_carries_no_reuse_sms_setting(self) -> None:
+        class NoopThread:
+            def __init__(self, *_args: object, **_kwargs: object) -> None:
+                pass
+
+            def start(self) -> None:
+                pass
+
+        with patch("web.threading.Thread", NoopThread):
+            job = create_job(
+                owner_device_id="a" * 32,
+                ba_token="BA-TESTTOKEN123",
+                phone="+5511987654321",
+                debug=False,
+                max_card_attempts=1,
+                sms_provider="manual",
+                sms_reuse_numbers=False,
+            )
+        try:
+            self.assertFalse(job.sms_reuse_numbers)
+            self.assertFalse(job.to_dict(include_logs=False)["sms_reuse_numbers"])
+        finally:
+            JOBS.pop(job.id, None)
 
 
 class AutoSmsFlow(PayPalFlow):

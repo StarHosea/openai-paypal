@@ -45,10 +45,16 @@ def _smsbower_module():
     return importlib.import_module("paypal.smsbower")
 
 
-def _build_smsbower_provider(enabled: bool, *, region: str = "US"):
+def _build_smsbower_provider(
+    enabled: bool,
+    *,
+    region: str = "US",
+    reuse_numbers: bool = True,
+):
     return getattr(_smsbower_module(), "build_smsbower_provider")(
         enabled=enabled,
         region=region,
+        reuse_numbers=reuse_numbers,
     )
 
 
@@ -343,6 +349,7 @@ class WebJob:
     phone: str
     region: str = "US"
     sms_provider: str = "manual"
+    sms_reuse_numbers: bool = True
     debug: bool = False
     max_card_attempts: int = 5
     max_flow_attempts: int = 1
@@ -475,6 +482,7 @@ class WebJob:
                 "phone": mask_phone(self.phone),
                 "region": self.region,
                 "sms_provider": self.sms_provider,
+                "sms_reuse_numbers": self.sms_reuse_numbers,
                 "debug": self.debug and ALLOW_DEBUG_LOGS,
                 "max_card_attempts": self.max_card_attempts,
                 "max_flow_attempts": self.max_flow_attempts,
@@ -701,6 +709,7 @@ def create_job(
     max_card_attempts: int,
     region: str = "BR",
     sms_provider: str = "manual",
+    sms_reuse_numbers: bool = True,
     max_flow_attempts: int = 1,
     max_authorize_attempts: int = 3,
     card_retry_delay_seconds: float = 6.0,
@@ -720,6 +729,7 @@ def create_job(
     phone = re.sub(r"[\s().-]+", "", (phone or "").strip())
     region_profile = get_region(region, default="US")
     sms_provider = (sms_provider or "manual").strip().lower()
+    sms_reuse_numbers = bool(sms_reuse_numbers)
     if sms_provider not in SMS_PROVIDER_CHOICES:
         raise ValueError("短信接码方式不正确")
     if not ba_token:
@@ -736,7 +746,11 @@ def create_job(
         except ValueError as exc:
             raise ValueError(f"手机号必须是 {region_profile.display_name} 号码：{exc}") from exc
     if sms_provider == "smsbower":
-        _build_smsbower_provider(enabled=True, region=region_profile.code)
+        _build_smsbower_provider(
+            enabled=True,
+            region=region_profile.code,
+            reuse_numbers=sms_reuse_numbers,
+        )
     try:
         max_card_attempts = int(max_card_attempts)
     except Exception as exc:
@@ -807,6 +821,7 @@ def create_job(
         phone=phone,
         region=region_profile.code,
         sms_provider=sms_provider,
+        sms_reuse_numbers=sms_reuse_numbers,
         debug=debug,
         max_card_attempts=max_card_attempts,
         max_flow_attempts=max_flow_attempts,
@@ -870,8 +885,16 @@ def run_job(job: WebJob) -> None:
             region = get_region(job.region, default="US")
             sms_provider = None
             if job.sms_provider == "smsbower":
-                sms_provider = _build_smsbower_provider(enabled=True, region=region.code)
-                logger.info("SMS provider: SMSBower auto mode region={}", region.code)
+                sms_provider = _build_smsbower_provider(
+                    enabled=True,
+                    region=region.code,
+                    reuse_numbers=job.sms_reuse_numbers,
+                )
+                logger.info(
+                    "SMS provider: SMSBower auto mode region={} reuse_numbers={}",
+                    region.code,
+                    job.sms_reuse_numbers,
+                )
             job.proxy_enabled = proxy_config.enabled
             job.proxy_label = proxy_config.label
             user = generate_user(job.phone or region.fallback_phone, region=region.code)
@@ -894,8 +917,9 @@ def run_job(job: WebJob) -> None:
                 logger.info("Phone: {}", mask_phone(user.phone))
             else:
                 logger.info(
-                    "Phone: SMSBower auto mode will reserve a {} PayPal number before OTP",
+                    "Phone: SMSBower auto mode will reserve a {} PayPal number before OTP (reuse_numbers={})",
                     region.display_name,
+                    job.sms_reuse_numbers,
                 )
             logger.info(
                 "Address generated: {}, {}-{}",
@@ -1092,6 +1116,7 @@ class WebHandler(BaseHTTPRequestHandler):
                     debug=bool(data.get("debug", False)),
                     max_card_attempts=int(data.get("max_card_attempts", 5) or 5),
                     sms_provider=str(data.get("sms_provider", "manual") or "manual"),
+                    sms_reuse_numbers=bool(data.get("sms_reuse_numbers", True)),
                     max_flow_attempts=int(data.get("max_flow_attempts", 1) or 1),
                     max_authorize_attempts=int(data.get("max_authorize_attempts", 3) or 3),
                     card_retry_delay_seconds=float(data.get("card_retry_delay_seconds", 6) or 0),

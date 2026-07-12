@@ -205,6 +205,26 @@ def captcha_frontend_disable_enabled() -> bool:
     return paypal_captcha_bypass_mode() == CAPTCHA_FRONTEND_DISABLE_MODE
 
 
+def _accept_language_header(profile: dict[str, object]) -> str:
+    """Format a browser-like Accept-Language header from one profile."""
+    language = str(profile.get("language") or "pt-BR").strip() or "pt-BR"
+    raw_languages = profile.get("languages")
+    values: list[str] = []
+    if isinstance(raw_languages, (list, tuple)):
+        for item in raw_languages:
+            value = str(item or "").strip()
+            if value and "," not in value and ";" not in value and value not in values:
+                values.append(value)
+    language_base = language.split("-", 1)[0].split("_", 1)[0] or "en"
+    for value in (language, language_base, "en-US", "en"):
+        if value and value not in values:
+            values.append(value)
+    return ",".join(
+        value if index == 0 else f"{value};q={1 - (index * 0.1):.1f}"
+        for index, value in enumerate(values[:4])
+    )
+
+
 def build_common_headers(state: SessionState | None = None) -> dict[str, str]:
     """Low-entropy Client Hints only.
 
@@ -221,23 +241,21 @@ def build_common_headers(state: SessionState | None = None) -> dict[str, str]:
         else None
     ) or BROWSER_PROFILE)
     user_agent = str(profile.get("user_agent") or USER_AGENT)
-    language = str(profile.get("language") or "pt-BR")
     is_ios_webkit = bool(profile.get("is_mobile")) or bool(
         re.search(r"\b(?:iPhone|iPad|iPod)\b", user_agent, re.I)
     )
     if is_ios_webkit:
         # Roxy's iOS core is WebKit/CriOS. It does not send Chromium UA Client
         # Hints, so desktop sec-ch-* values would contradict its runtime.
-        language_base = language.split("-", 1)[0].split("_", 1)[0] or "en"
         return {
             "User-Agent": user_agent,
             "Accept": "*/*",
-            "Accept-Language": f"{language},{language_base};q=0.9",
+            "Accept-Language": _accept_language_header(profile),
         }
     return {
         "User-Agent": user_agent,
         "Accept": "*/*",
-        "Accept-Language": f"{language},pt;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Accept-Language": _accept_language_header(profile),
         "sec-ch-ua": _format_sec_ch_ua(_low_entropy_ua_brands(profile)),
         "sec-ch-ua-mobile": "?0",
         "sec-ch-ua-platform": str(profile.get("sec_ch_platform") or '"Linux"'),
@@ -1258,8 +1276,11 @@ class PayPalSession:
             "X-Requested-With": "fetch",
             "PayPal-Client-Context": context_token,
             "PayPal-Client-Metadata-Id": metadata_id,
-            "X-Country": str(profile.get("country") or "BR"),
-            "X-Locale": str(profile.get("locale") or "pt_BR"),
+            # Browser fingerprint geography may follow the proxy exit IP.
+            # Checkout routing remains the region explicitly selected for this
+            # flow, retained under checkout_* by PayPalFlow.
+            "X-Country": str(profile.get("checkout_country") or profile.get("country") or "BR"),
+            "X-Locale": str(profile.get("checkout_locale") or profile.get("locale") or "pt_BR"),
             "Origin": "https://www.paypal.com",
             "Referer": referer,
             "Sec-Fetch-Site": "same-origin",

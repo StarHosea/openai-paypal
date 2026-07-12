@@ -28,11 +28,18 @@ def _smsbower_enabled() -> bool:
     return bool(getattr(_smsbower_module(), "smsbower_enabled")())
 
 
-def _build_smsbower_provider(enabled: bool, api_key: str | None, *, region: str):
+def _build_smsbower_provider(
+    enabled: bool,
+    api_key: str | None,
+    *,
+    region: str,
+    reuse_numbers: bool | None = None,
+):
     return getattr(_smsbower_module(), "build_smsbower_provider")(
         enabled=enabled,
         api_key=api_key,
         region=region,
+        reuse_numbers=reuse_numbers,
     )
 
 
@@ -64,6 +71,11 @@ def main():
         "--smsbower-api-key",
         default=None,
         help="SMSBower API key. Defaults to SMSBOWER_API_KEY or PAYPAL_SMSBOWER_API_KEY from .env/environment",
+    )
+    parser.add_argument(
+        "--smsbower-no-reuse",
+        action="store_true",
+        help="Always reserve a fresh SMSBower number; do not read or write the local number-reuse cache",
     )
     parser.add_argument(
         "--debug", action="store_true",
@@ -195,6 +207,7 @@ def main():
         enabled=sms_provider_requested,
         api_key=args.smsbower_api_key,
         region=region.code,
+        reuse_numbers=False if args.smsbower_no_reuse else None,
     )
     if not args.phone and sms_provider is None:
         parser.error("--phone is required unless --smsbower or SMSBOWER_ENABLED=1 is set")
@@ -209,8 +222,9 @@ def main():
         logger.info("Phone: {}", sanitize_for_log({"phone": user.phone})["phone"])
     else:
         logger.info(
-            "Phone: SMSBower auto mode will reserve a {} PayPal number before OTP",
+            "Phone: SMSBower auto mode will reserve a {} PayPal number before OTP (reuse_numbers={})",
             region.display_name,
+            bool(getattr(sms_provider, "reuse_numbers", not args.smsbower_no_reuse)),
         )
     if region.requires_identity_document:
         logger.info("CPF: <redacted>")

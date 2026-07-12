@@ -386,6 +386,22 @@ def _font_stack_for_profile(profile: Mapping[str, Any]) -> list[str]:
     return list(_LINUX_FONT_STACK)
 
 
+def _browser_languages(profile: Mapping[str, Any]) -> list[str]:
+    configured = profile.get("languages")
+    values: list[str] = []
+    if isinstance(configured, Sequence) and not isinstance(configured, (str, bytes)):
+        for item in configured:
+            value = str(item or "").strip()
+            if value and value not in values:
+                values.append(value)
+    language = str(profile.get("language") or "en-US").strip() or "en-US"
+    language_base = language.split("-", 1)[0].split("_", 1)[0] or "en"
+    for item in (language, language_base, "en-US", "en"):
+        if item and item not in values:
+            values.append(item)
+    return values
+
+
 def _random_chrome_full_version() -> str:
     total = sum(weight for _version, weight in _CHROME_VERSION_CHOICES)
     point = random.randint(1, total)
@@ -477,6 +493,10 @@ def _build_device_fingerprint(profile: Mapping[str, Any], screen: Mapping[str, A
         "platform": profile.get("platform"),
         "chrome": profile.get("chrome_full_version"),
         "language": profile.get("language"),
+        "languages": _browser_languages(profile),
+        "locale": profile.get("locale"),
+        "country": profile.get("country"),
+        "timezone": profile.get("timezone"),
         "screen": screen,
         "viewport": viewport,
         "dpr": profile.get("device_pixel_ratio"),
@@ -788,6 +808,7 @@ def _generate_synthetic_runtime_profile(
             "device_pixel_ratio": device_pixel_ratio,
             "connection_rtt": connection_rtt,
             "connection_downlink": connection_downlink,
+            "languages": _browser_languages(base_profile),
         }
     )
     fp = _build_device_fingerprint(profile, screen, viewport)

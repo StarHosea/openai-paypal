@@ -354,6 +354,21 @@ class SMSBowerActivationStore:
             failures[self._provider_failure_key(str(provider_id), str(country or SMSBOWER_DEFAULT_COUNTRY))] = 0
         self.save(data)
 
+    def record_success(
+        self,
+        provider_id: str,
+        *,
+        country: str = SMSBOWER_DEFAULT_COUNTRY,
+    ) -> None:
+        """Clear a provider's transient failure count without caching a number."""
+        data = self.load()
+        failures = data.get("provider_failures")
+        if not isinstance(failures, dict):
+            failures = {}
+            data["provider_failures"] = failures
+        failures[self._provider_failure_key(str(provider_id), str(country or SMSBOWER_DEFAULT_COUNTRY))] = 0
+        self.save(data)
+
     def abandon(self, activation_id: str) -> None:
         data = self.load()
         activations = data.get("activations")
@@ -415,6 +430,7 @@ class SMSBowerOtpProvider:
         max_channel_failures: int = SMSBOWER_DEFAULT_MAX_CHANNEL_FAILURES,
         activation_ttl_seconds: int = SMSBOWER_DEFAULT_ACTIVATION_TTL_SECONDS,
         max_attempts: int = SMSBOWER_DEFAULT_MAX_ATTEMPTS,
+        reuse_numbers: bool = True,
     ) -> None:
         self.client = client
         self.store = store or SMSBowerActivationStore()
@@ -426,14 +442,36 @@ class SMSBowerOtpProvider:
         self.max_channel_failures = max(1, int(max_channel_failures))
         self.activation_ttl_seconds = max(60, int(activation_ttl_seconds))
         self.max_attempts = max(1, int(max_attempts))
+        self.reuse_numbers = bool(reuse_numbers)
 
     def reserve_number(self) -> SMSBowerActivation:
-        reusable = self.store.reusable_activation(country=self.country)
-        if reusable is not None:
-            logger.info("Reusing active SMSBower phone from provider {}", reusable.provider_id)
-            self._set_status(reusable.activation_id, 3)
-            return reusable
+        if self.reuse_numbers:
+            reusable = self.store.reusable_activation(country=self.country)
+            if reusable is not None:
+                logger.info("Reusing active SMSBower phone from provider {}", reusable.provider_id)
+                self._set_status(reusable.activation_id, 3)
+                return reusable
+        else:
+            logger.info("SMSBower number reuse is disabled; reserving a fresh number")
         return self._purchase_new_number()
+
+    def _remember_success(self, activation: SMSBowerActivation) -> None:
+        if self.reuse_numbers:
+            self.store.remember_success(
+                activation_id=activation.activation_id,
+                phone_number=activation.phone_number,
+                provider_id=activation.provider_id,
+                price=activation.price,
+                expires_at=activation.expires_at,
+                country=activation.country or self.country,
+            )
+            return
+        # A successful fresh-only activation is still a successful provider
+        # attempt, but its number/activation must never enter the reuse cache.
+        self.store.record_success(
+            activation.provider_id,
+            country=activation.country or self.country,
+        )
 
     def _purchase_new_number(self) -> SMSBowerActivation:
         prices = self._get_provider_prices()
@@ -485,14 +523,7 @@ class SMSBowerOtpProvider:
             status = self._get_status(activation.activation_id)
             code = self._code_from_status(status)
             if code:
-                self.store.remember_success(
-                    activation_id=activation.activation_id,
-                    phone_number=activation.phone_number,
-                    provider_id=activation.provider_id,
-                    price=activation.price,
-                    expires_at=activation.expires_at,
-                    country=activation.country or self.country,
-                )
+                self._remember_success(activation)
                 return code
             if status in {"STATUS_CANCEL", "NO_ACTIVATION"}:
                 self.store.abandon(activation.activation_id)
@@ -519,14 +550,7 @@ class SMSBowerOtpProvider:
 
     def register_confirmation_result(self, activation: SMSBowerActivation, confirmed: bool) -> None:
         if confirmed:
-            self.store.remember_success(
-                activation_id=activation.activation_id,
-                phone_number=activation.phone_number,
-                provider_id=activation.provider_id,
-                price=activation.price,
-                expires_at=activation.expires_at,
-                country=activation.country or self.country,
-            )
+            self._remember_success(activation)
             return
         self.abandon(activation, "paypal_rejected_code")
 
@@ -589,6 +613,7 @@ def build_smsbower_provider(
     enabled: bool | None = None,
     api_key: str | None = None,
     region: str | PayPalRegion = "BR",
+    reuse_numbers: bool | None = None,
 ) -> SMSBowerOtpProvider | None:
     if not smsbower_enabled(enabled):
         return None
@@ -599,6 +624,12 @@ def build_smsbower_provider(
     )
     profile = region if isinstance(region, PayPalRegion) else get_region(region)
     client = SMSBowerClient(resolved_key)
+    if reuse_numbers is None:
+        no_reuse = _env_bool("PAYPAL_SMSBOWER_NO_REUSE") or _env_bool("SMSBOWER_NO_REUSE")
+        reuse_numbers = not no_reuse and _env_bool(
+            "PAYPAL_SMSBOWER_REUSE_NUMBERS",
+            _env_bool("SMSBOWER_REUSE_NUMBERS", True),
+        )
     return SMSBowerOtpProvider(
         client=client,
         region=profile,
@@ -632,6 +663,7 @@ def build_smsbower_provider(
             24 * 60 * 60,
         ),
         max_attempts=_env_int("SMSBOWER_MAX_ATTEMPTS", SMSBOWER_DEFAULT_MAX_ATTEMPTS, 1, 100),
+        reuse_numbers=reuse_numbers,
     )
 
 

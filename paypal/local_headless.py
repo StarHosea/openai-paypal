@@ -327,7 +327,7 @@ def _runtime_browser_profile(js: JsonObject, seed_profile: JsonObject | None = N
             "timezone": _str_value(js.get("timezone"), str(BROWSER_PROFILE.get("timezone") or "America/Sao_Paulo")),
             "timezone_offset_minutes": timezone_offset_minutes,
             "timezone_offset_ms": timezone_offset_minutes * 60 * 1000,
-            "dst": bool(BROWSER_PROFILE.get("dst", False)),
+            "dst": bool(profile.get("dst", BROWSER_PROFILE.get("dst", False))),
             "chrome_major": 0 if ios_webkit else chrome_major,
             "chrome_full_version": "" if ios_webkit else _full_version_from_ua_data(ua_data, user_agent, chrome_major, seed),
             "platform": platform,
@@ -531,7 +531,7 @@ def _context_options(
     screen_options = _merged_context_dict(SCREEN, screen)
     language = str(profile.get("language") or "pt-BR")
     ios_webkit = _is_ios_webkit_profile(profile)
-    return {
+    options: JsonObject = {
         "user_agent": str(profile.get("user_agent") or USER_AGENT),
         "viewport": {
             "width": _int_value(viewport_options.get("width"), 567),
@@ -548,6 +548,24 @@ def _context_options(
         "has_touch": ios_webkit or bool(profile.get("has_touch", False)),
         "java_script_enabled": True,
     }
+    location = _dict_value(profile.get("geolocation"))
+    try:
+        latitude = float(location.get("latitude"))
+        longitude = float(location.get("longitude"))
+        accuracy = max(1.0, float(location.get("accuracy") or 25_000))
+    except (TypeError, ValueError):
+        latitude = longitude = 999.0
+        accuracy = 0.0
+    if -90 <= latitude <= 90 and -180 <= longitude <= 180:
+        # Keep the context's optional geolocation at the same city-level
+        # precision as the proxy Geo-IP lookup.  Permission remains prompt,
+        # matching a normal browser until a page explicitly requests it.
+        options["geolocation"] = {
+            "latitude": latitude,
+            "longitude": longitude,
+            "accuracy": accuracy,
+        }
+    return options
 
 
 def _chrome_version_parts(profile: JsonObject) -> tuple[int, str]:
@@ -753,12 +771,26 @@ def _save_headless_cached_cookies(proxy_url: str, profile: JsonObject, cookies: 
             pass
 
 
-def _headless_language_list(language: str) -> list[str]:
+def _headless_language_list(language: str, configured: object = None) -> list[str]:
     values: list[str] = []
+    if isinstance(configured, (list, tuple)):
+        for item in configured:
+            value = str(item or "").strip()
+            if value and "," not in value and ";" not in value and value not in values:
+                values.append(value)
     for item in (language, language.split("-", 1)[0] if "-" in language else "", "en-US", "en"):
         if item and item not in values:
             values.append(item)
     return values
+
+
+def _headless_accept_language_header(profile: JsonObject, *, default_language: str) -> str:
+    language = str(profile.get("language") or default_language).strip() or default_language
+    values = _headless_language_list(language, profile.get("languages"))
+    return ",".join(
+        value if index == 0 else f"{value};q={1 - (index * 0.1):.1f}"
+        for index, value in enumerate(values[:4])
+    )
 
 
 def _sec_ch_ua_header_from_metadata(metadata: JsonObject, *, full: bool = False) -> str:
@@ -779,15 +811,12 @@ def _headless_extra_http_headers(profile: JsonObject) -> dict[str, str]:
         # Safari/iOS never emits Chromium UA Client Hints.  Merely replacing
         # the User-Agent while retaining Sec-CH-* is a detectable mixed
         # identity and is the direct cause of the local DataDome challenge.
-        language = str(profile.get("language") or "en-US")
-        language_base = language.split("-", 1)[0].split("_", 1)[0] or "en"
-        return {"Accept-Language": f"{language},{language_base};q=0.9"}
+        return {"Accept-Language": _headless_accept_language_header(profile, default_language="en-US")}
     metadata = _chrome_user_agent_metadata(profile)
-    language = str(profile.get("language") or "pt-BR")
     bitness = str(metadata.get("bitness") or profile.get("sec_ch_bitness") or "64")
     platform_version = str(metadata.get("platformVersion") or profile.get("sec_ch_platform_version") or "").strip('"')
     return {
-        "Accept-Language": f"{language},pt;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Accept-Language": _headless_accept_language_header(profile, default_language="pt-BR"),
         "Sec-CH-UA": _sec_ch_ua_header_from_metadata(metadata),
         "Sec-CH-UA-Mobile": "?0",
         "Sec-CH-UA-Platform": str(profile.get("sec_ch_platform") or '"Linux"'),
@@ -825,7 +854,7 @@ def _stealth_init_script(
     config = {
         "userAgent": user_agent,
         "appVersion": user_agent.split("Mozilla/", 1)[-1] if user_agent.startswith("Mozilla/") else user_agent,
-        "languages": _headless_language_list(language),
+        "languages": _headless_language_list(language, profile.get("languages")),
         "language": language,
         "platform": "iPhone" if ios_webkit else str(profile.get("platform") or "Linux x86_64"),
         "vendor": "Apple Computer, Inc." if ios_webkit else str(profile.get("vendor") or "Google Inc."),

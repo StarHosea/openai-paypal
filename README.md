@@ -57,9 +57,11 @@ cp .env.example .env
 ```env
 PAYPAL_PROXY_ENABLED=1
 PAYPAL_PROXY_URL=http://user:pass@host:port
-# 默认经代理出口查询 IANA timezone；也可固定为代理所在地时区。
+# 默认经代理出口查询 IP 地理信息，并将浏览器时区、DST、国家/语言/locale
+# 以及 city 级 geolocation 与出口 IP 对齐；checkout 地区仍由 --region 决定。
 PAYPAL_PROXY_GEO_LOOKUP=1
 # PAYPAL_PROXY_TIMEZONE=America/Los_Angeles
+# 如仅需旧版时区同步：PAYPAL_PROXY_FINGERPRINT_GEO=0
 
 PAYPAL_FINGERPRINT_SOURCE=headless
 PAYPAL_DATADOME_MODE=headless
@@ -123,6 +125,8 @@ PAYPAL_ROXY_DELETE_AUTO_WORKSPACE=0
 SMSBOWER_ENABLED=1
 SMSBOWER_API_KEY=your_smsbower_api_key
 SMSBOWER_WAIT_SECONDS=30
+# 默认允许复用有效 activation；网页勾选“不复用号码”会为当前任务强制新取号。
+PAYPAL_SMSBOWER_REUSE_NUMBERS=1
 ```
 
 US 抓包对应配置：`PAYPAL_REGION=US`，SMSBower 国家 ID 为 `12`，号码以 `+1` 和 10 位本地号码提交。也可以不配置 SMSBower，运行时通过 `--phone` 使用手动验证码。
@@ -165,6 +169,7 @@ python main.py \
 | `--region` | checkout、手机号、地址和 SMSBower 使用的地区：`US`（默认）或 `BR` |
 | `--phone` | 手动手机号，未启用 SMSBower 时必填 |
 | `--smsbower` | 启用 SMSBower 自动取号和收码 |
+| `--smsbower-no-reuse` | 强制每次从 SMSBower 新取号码，不读取或写入号码复用缓存 |
 | `--proxy` / `--no-proxy` | 启用或禁用代理 |
 | `--proxy-url` | 本次运行指定代理 URL 或 `host:port:user:pass` |
 | `--proxy-index` | 从 `PAYPAL_PROXY_POOL` 选择指定代理 |

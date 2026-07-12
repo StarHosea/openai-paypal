@@ -86,8 +86,9 @@ class PayPalRegion:
         }
 
 
-# Region entries provide a fallback timezone only.  A proxied flow replaces it
-# with the exit IP's IANA timezone before the browser profile is created.
+# Region entries provide checkout defaults.  A proxied flow keeps those under
+# checkout_* while replacing browser-facing geography from the exit IP before
+# the runtime profile is created.
 _REGIONS: Mapping[str, PayPalRegion] = {
     "US": PayPalRegion(
         code="US",

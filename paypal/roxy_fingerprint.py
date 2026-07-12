@@ -443,7 +443,13 @@ def load_roxy_capture_config(
             if ios_phone
             else _env_str("PAYPAL_ROXY_TIMEZONE", timezone)
         ),
-        follow_ip=_env_bool("PAYPAL_ROXY_FOLLOW_IP", ios_phone),
+        # When the flow has already resolved this exact proxy exit, let Roxy
+        # apply the same IP-derived language/timezone/position policy to its
+        # native profile instead of retaining a stale desktop default.
+        follow_ip=_env_bool(
+            "PAYPAL_ROXY_FOLLOW_IP",
+            ios_phone or bool(profile.get("proxy_geo_resolved")),
+        ),
         core_version=_env_str("PAYPAL_ROXY_CORE_VERSION", ""),
         core_type=_env_str("PAYPAL_ROXY_CORE_TYPE", str(profile.get("core_type") or "Chrome")),
         os_name=_env_str("PAYPAL_ROXY_OS", str(profile.get("os_name") or "Windows")),

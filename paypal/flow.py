@@ -49,7 +49,7 @@ from paypal.mtr import MTR_RUNTIME_PYTHON_GENERATED, extract_dfp_script_url, ext
 from paypal.proxy import (
     build_proxy_config,
     ProxyConfig,
-    proxy_timezone_profile,
+    proxy_fingerprint_profile,
     timezone_profile,
     _load_dotenv_value as _load_proxy_dotenv_value,
 )
@@ -173,6 +173,17 @@ class PayPalFlow:
         # A flow must not combine a US phone/provider with BR checkout headers.
         self.address.country = self.region.code
         self._regional_browser_profile = self.region.browser_profile_overrides()
+        # Checkout routing remains an explicit user choice.  Browser-facing
+        # country/language/locale may subsequently be replaced from the proxy
+        # exit IP, so retain the checkout values under separate keys for URLs,
+        # GraphQL headers and compliance payloads.
+        self._regional_browser_profile.update(
+            {
+                "checkout_country": self.region.code,
+                "checkout_language": self.region.language,
+                "checkout_locale": self.region.locale,
+            }
+        )
         self.user = user
         if not self.user.email:
             self.user.email = generate_random_email(self.region.code)
@@ -186,12 +197,13 @@ class PayPalFlow:
             enabled=proxy_enabled,
             index=proxy_index,
         )
-        # Keep the browser's IANA zone and both offset fields tied to the
-        # proxy exit, not to the host running this process.  Locale/country
-        # remain the selected checkout region and are deliberately untouched.
+        # Build browser-facing timezone, locale, language and optional
+        # geolocation from the same proxy exit IP used by outbound requests.
+        # ``checkout_*`` values above remain stable for the selected checkout
+        # region, while FraudNet/MTR/browser runtime fields reflect the IP.
         regional_timezone = timezone_profile(self.region.timezone)
         self._regional_browser_profile.update(regional_timezone)
-        self._regional_browser_profile = proxy_timezone_profile(
+        self._regional_browser_profile = proxy_fingerprint_profile(
             self.proxy_config,
             self._regional_browser_profile,
         )
@@ -393,14 +405,27 @@ class PayPalFlow:
         return str((self.state.browser_profile or {}).get("user_agent") or USER_AGENT)
 
     def _profile_country(self) -> str:
-        return str((self.state.browser_profile or {}).get("country") or self.address.country or self.region.code)
+        profile = self.state.browser_profile or {}
+        return str(
+            profile.get("checkout_country")
+            or self.address.country
+            or profile.get("country")
+            or self.region.code
+        )
 
     def _profile_locale(self) -> str:
-        return str((self.state.browser_profile or {}).get("locale") or self.region.locale)
+        profile = self.state.browser_profile or {}
+        return str(profile.get("checkout_locale") or profile.get("locale") or self.region.locale or "")
 
     def _profile_lang(self) -> str:
         locale = self._profile_locale()
-        return str((self.state.browser_profile or {}).get("language") or locale.replace("_", "-") or self.region.language)
+        profile = self.state.browser_profile or {}
+        return str(
+            profile.get("checkout_language")
+            or locale.replace("_", "-")
+            or profile.get("language")
+            or self.region.language
+        )
 
     def _checkout_language_code(self) -> str:
         return self._profile_lang().split("-", 1)[0].split("_", 1)[0].lower()
@@ -481,13 +506,17 @@ class PayPalFlow:
         screen = self.state.screen or {}
         viewport = self.state.viewport or {}
         logger.info(
-            "Browser profile: source={} country={} locale={} language={} timezone={} offset={} ua={} screen={}x{} viewport={}x{} cmid={}",
+            "Browser profile: source={} country={} locale={} language={} timezone={} offset={} checkout={}/{} proxy_country={} proxy_city={} ua={} screen={}x{} viewport={}x{} cmid={}",
             profile.get("fingerprint_source") or getattr(self.state, "fingerprint_source", "") or "random",
             profile.get("country"),
             profile.get("locale"),
             profile.get("language"),
             profile.get("timezone"),
             profile.get("timezone_offset_minutes"),
+            profile.get("checkout_country"),
+            profile.get("checkout_locale"),
+            profile.get("proxy_country"),
+            profile.get("proxy_city"),
             str(profile.get("user_agent") or USER_AGENT)[:80],
             screen.get("width"),
             screen.get("height"),

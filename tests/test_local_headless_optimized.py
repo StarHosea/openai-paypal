@@ -5,6 +5,8 @@ from typing import Any, Protocol, cast
 
 import paypal.fingerprint as fingerprint
 import paypal.local_headless as local_headless
+import paypal.session as paypal_session
+from paypal.models import SessionState
 
 
 class MarkObservabilityAsDatadog(Protocol):
@@ -199,6 +201,20 @@ def test_local_ios_route_removes_chromium_client_hints() -> None:
     normalized = cast(dict[str, object], route.continued["headers"])
     assert "user-agent" in normalized
     assert not any(name.lower().startswith("sec-ch-") for name in normalized)
+
+
+def test_ios_protocol_session_uses_safari_transport_and_no_client_hints() -> None:
+    runtime = fingerprint._generate_ios_phone_runtime_profile({"language": "en-US"})
+    state = SessionState(ba_token="BA-TEST")
+    state.browser_profile = cast(dict[str, object], runtime["browser_profile"])
+
+    assert paypal_session._default_curl_impersonation(state) == "safari260_ios"
+    assert paypal_session.build_common_headers(state) == {
+        "User-Agent": fingerprint.IOS_PHONE_USER_AGENT,
+        "Accept": "*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    assert paypal_session.build_high_entropy_hints(state) == {}
 
 
 def test_paypal_observability_route_urls_can_fulfill_datadog_after_counter_reset() -> None:
