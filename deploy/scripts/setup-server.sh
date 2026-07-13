@@ -22,6 +22,15 @@ detect_web_stack() {
   WEB_TEST_CMD="nginx -t"
   WEB_RELOAD_CMD="systemctl reload nginx"
 
+  if ss -ltn 2>/dev/null | grep -q ':80 '; then
+    if ss -ltnp 2>/dev/null | grep ':80 ' | grep -qi openresty; then
+      WEB_TEST_CMD="openresty -t"
+      WEB_RELOAD_CMD="systemctl reload openresty"
+      echo "Detected OpenResty listening on port 80."
+      return
+    fi
+  fi
+
   if systemctl is-active --quiet openresty 2>/dev/null || command -v openresty >/dev/null 2>&1; then
     WEB_TEST_CMD="openresty -t"
     WEB_RELOAD_CMD="systemctl reload openresty"
@@ -37,11 +46,27 @@ detect_web_stack() {
   echo "No active web server detected; nginx will be installed and started."
 }
 
+wait_for_apt() {
+  local attempts=0
+  while sudo fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 \
+    || sudo fuser /var/lib/apt/lists/lock >/dev/null 2>&1; do
+    attempts=$((attempts + 1))
+    if [[ "${attempts}" -gt 60 ]]; then
+      echo "Timed out waiting for apt lock." >&2
+      exit 1
+    fi
+    echo "Waiting for apt lock (${attempts}/60)..."
+    sleep 5
+  done
+}
+
 install_web_packages() {
   local packages=(git python3 python3-venv python3-pip certbot curl ca-certificates)
-  if ! systemctl is-active --quiet openresty 2>/dev/null; then
+  if ! ss -ltnp 2>/dev/null | grep ':80 ' | grep -qi openresty \
+    && ! systemctl is-active --quiet openresty 2>/dev/null; then
     packages+=(nginx python3-certbot-nginx)
   fi
+  wait_for_apt
   sudo apt-get update
   sudo apt-get install -y "${packages[@]}"
 }
@@ -88,6 +113,7 @@ issue_certificate() {
 
 detect_web_stack
 echo "==> Installing system packages"
+wait_for_apt
 install_web_packages
 
 echo "==> Preparing app directory: ${APP_DIR}"
