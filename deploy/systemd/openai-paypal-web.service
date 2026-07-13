@@ -1,0 +1,21 @@
+[Unit]
+Description=OpenAI PayPal Web UI
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=muhaoxing
+Group=muhaoxing
+WorkingDirectory=/opt/openai-paypal
+EnvironmentFile=-/opt/openai-paypal/.env
+ExecStart=/opt/openai-paypal/.venv/bin/python web.py --host 127.0.0.1 --port 8080
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+
+# Headless Chromium can be memory-heavy.
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
