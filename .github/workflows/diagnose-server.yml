@@ -1,0 +1,43 @@
+name: Diagnose Server
+
+on:
+  workflow_dispatch:
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Inspect server
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          password: ${{ secrets.DEPLOY_SSH_PASSWORD }}
+          port: ${{ secrets.DEPLOY_SSH_PORT || 22 }}
+          script: |
+            set -x
+            echo '=== process on 80/443/8080 ==='
+            sudo ss -ltnp | grep -E ':80 |:443 |:8080 ' || true
+            echo '=== systemd ==='
+            systemctl status openai-paypal-web --no-pager -l || true
+            echo '=== health ==='
+            curl -sv http://127.0.0.1:8080/api/health || true
+            curl -sv http://127.0.0.1:8080/ || true
+            echo '=== openresty paths ==='
+            which openresty nginx || true
+            openresty -V 2>&1 | head -20 || true
+            ls -la /usr/local/openresty/nginx/conf/ 2>/dev/null || true
+            ls -la /etc/openresty/ 2>/dev/null || true
+            ls -la /www/server/nginx/conf/ 2>/dev/null || true
+            ls -la /www/server/panel/vhost/nginx/ 2>/dev/null || true
+            echo '=== nginx conf includes ==='
+            sudo nginx -T 2>/dev/null | head -80 || true
+            openresty -T 2>/dev/null | head -80 || true
+            echo '=== find conf ==='
+            sudo find /etc /usr/local /www -name 'nginx.conf' 2>/dev/null | head -20
+            echo '=== journal ==='
+            sudo journalctl -u openai-paypal-web -n 40 --no-pager || true
+            echo '=== app dir ==='
+            ls -la /opt/openai-paypal | head -30
+            systemctl is-active openai-paypal-web || true
+            ps aux | grep -E 'web.py|python' | grep -v grep || true
