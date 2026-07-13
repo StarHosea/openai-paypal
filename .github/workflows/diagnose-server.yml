@@ -15,29 +15,32 @@ jobs:
           password: ${{ secrets.DEPLOY_SSH_PASSWORD }}
           port: ${{ secrets.DEPLOY_SSH_PORT || 22 }}
           script: |
-            OUT=/tmp/paypal-diagnose.txt
+            OUT=/tmp/paypal-diagnose2.txt
             {
-              echo '=== ports ==='
-              sudo ss -ltnp | grep -E ':80 |:443 |:8080 |:18080 ' || true
-              echo '=== openresty exe ==='
-              PID=$(pgrep -o openresty || true)
-              echo "pid=$PID"
-              if [[ -n "$PID" ]]; then
-                sudo readlink -f "/proc/$PID/exe" || true
-                sudo tr '\0' ' ' < "/proc/$PID/cmdline"; echo
-              fi
-              echo '=== find hhao config ==='
-              sudo grep -RIl 'hhao\.shuangdeng\.space' /etc /www /usr/local /opt 2>/dev/null | head -30
-              echo '=== hhao config contents ==='
-              for f in $(sudo grep -RIl 'hhao\.shuangdeng\.space' /etc /www /usr/local /opt 2>/dev/null | head -10); do
-                echo "----- $f -----"
-                sudo sed -n '1,220p' "$f"
+              echo '=== 1panel conf.d ==='
+              ls -la /opt/1panel/www/conf.d/ || true
+              echo '=== list shuangdeng ==='
+              ls -la /opt/1panel/www/conf.d/*shuangdeng* 2>/dev/null || true
+              echo '=== find hhao again ==='
+              sudo find /opt/1panel -iname '*hhao*' 2>/dev/null | head -40
+              sudo grep -RIl 'hhao' /opt/1panel/www 2>/dev/null | head -20
+              echo '=== sample site configs ==='
+              for f in /opt/1panel/www/conf.d/*.conf; do
+                echo "FILE=$f"
               done
-              echo '=== find pix config ==='
-              sudo grep -RIl 'pix\.shuangdeng\.space' /etc /www /usr/local /opt 2>/dev/null | head -20
-              echo '=== docker ports ==='
-              docker ps --format 'table {{.Names}}\t{{.Ports}}\t{{.Image}}' || true
-              echo '=== journal ==='
-              sudo journalctl -u openai-paypal-web -n 20 --no-pager || true
+              echo '=== pix current ==='
+              sudo sed -n '1,260p' /opt/1panel/www/conf.d/pix.shuangdeng.space.conf || true
+              echo '=== first few other configs ==='
+              for f in $(ls /opt/1panel/www/conf.d/*.conf 2>/dev/null | head -5); do
+                echo "----- $f -----"
+                sudo sed -n '1,200p' "$f"
+              done
+              echo '=== health ==='
+              curl -fsS http://127.0.0.1:18080/api/health || true
+              echo
+              echo '=== certs ==='
+              sudo ls -la /etc/letsencrypt/live/pix.shuangdeng.space/ 2>/dev/null || true
+              sudo ls -la /opt/1panel/www/sites/ 2>/dev/null | head || true
+              sudo find /opt/1panel -path '*pix*' 2>/dev/null | head -40
             } >"$OUT" 2>&1
             cat "$OUT"
