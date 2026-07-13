@@ -1,0 +1,51 @@
+name: Bootstrap Server
+
+on:
+  workflow_dispatch:
+
+jobs:
+  bootstrap:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install deploy key and run setup
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          password: ${{ secrets.DEPLOY_SSH_PASSWORD }}
+          port: ${{ secrets.DEPLOY_SSH_PORT || 22 }}
+          command_timeout: 45m
+          script: |
+            set -euo pipefail
+            APP_DIR="${{ secrets.DEPLOY_APP_DIR || '/opt/openai-paypal' }}"
+            DEPLOY_KEY='${{ secrets.DEPLOY_SSH_KEY }}'
+
+            mkdir -p ~/.ssh
+            chmod 700 ~/.ssh
+            AUTH_KEYS=~/.ssh/authorized_keys
+            touch "${AUTH_KEYS}"
+            chmod 600 "${AUTH_KEYS}"
+            PUB_LINE="$(printf '%s' "${DEPLOY_KEY}" | ssh-keygen -y -f /dev/stdin)"
+            if ! grep -Fq "${PUB_LINE}" "${AUTH_KEYS}"; then
+              echo "${PUB_LINE}" >> "${AUTH_KEYS}"
+            fi
+
+            if [[ ! -d "${APP_DIR}/.git" ]]; then
+              sudo mkdir -p "${APP_DIR}"
+              sudo chown "$(whoami):$(whoami)" "${APP_DIR}"
+              git clone https://github.com/StarHosea/openai-paypal.git "${APP_DIR}"
+            fi
+
+            cd "${APP_DIR}"
+            git fetch origin main
+            git reset --hard origin/main
+            bash deploy/scripts/setup-server.sh
+
+      - name: Verify public health endpoint
+        run: |
+          sleep 10
+          curl -fsS "https://pix.shuangdeng.space/api/health"
