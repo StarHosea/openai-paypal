@@ -36,5 +36,5 @@ sudo systemctl enable "${SERVICE_NAME}"
 sudo systemctl restart "${SERVICE_NAME}"
 sudo systemctl --no-pager --full status "${SERVICE_NAME}" || true
 
-curl -fsS "http://127.0.0.1:8080/api/health" >/dev/null
+curl -fsS "http://127.0.0.1:18080/api/health" >/dev/null
 echo "Deploy finished. Health check passed."

@@ -15,29 +15,29 @@ jobs:
           password: ${{ secrets.DEPLOY_SSH_PASSWORD }}
           port: ${{ secrets.DEPLOY_SSH_PORT || 22 }}
           script: |
-            set -x
-            echo '=== process on 80/443/8080 ==='
-            sudo ss -ltnp | grep -E ':80 |:443 |:8080 ' || true
-            echo '=== systemd ==='
-            systemctl status openai-paypal-web --no-pager -l || true
-            echo '=== health ==='
-            curl -sv http://127.0.0.1:8080/api/health || true
-            curl -sv http://127.0.0.1:8080/ || true
-            echo '=== openresty paths ==='
-            which openresty nginx || true
-            openresty -V 2>&1 | head -20 || true
-            ls -la /usr/local/openresty/nginx/conf/ 2>/dev/null || true
-            ls -la /etc/openresty/ 2>/dev/null || true
-            ls -la /www/server/nginx/conf/ 2>/dev/null || true
-            ls -la /www/server/panel/vhost/nginx/ 2>/dev/null || true
-            echo '=== nginx conf includes ==='
-            sudo nginx -T 2>/dev/null | head -80 || true
-            openresty -T 2>/dev/null | head -80 || true
-            echo '=== find conf ==='
-            sudo find /etc /usr/local /www -name 'nginx.conf' 2>/dev/null | head -20
-            echo '=== journal ==='
-            sudo journalctl -u openai-paypal-web -n 40 --no-pager || true
-            echo '=== app dir ==='
-            ls -la /opt/openai-paypal | head -30
-            systemctl is-active openai-paypal-web || true
-            ps aux | grep -E 'web.py|python' | grep -v grep || true
+            OUT=/tmp/paypal-diagnose.txt
+            {
+              echo '=== ports ==='
+              sudo ss -ltnp | grep -E ':80 |:443 |:8080 |:18080 ' || true
+              echo '=== openresty exe ==='
+              PID=$(pgrep -o openresty || true)
+              echo "pid=$PID"
+              if [[ -n "$PID" ]]; then
+                sudo readlink -f "/proc/$PID/exe" || true
+                sudo tr '\0' ' ' < "/proc/$PID/cmdline"; echo
+              fi
+              echo '=== find hhao config ==='
+              sudo grep -RIl 'hhao\.shuangdeng\.space' /etc /www /usr/local /opt 2>/dev/null | head -30
+              echo '=== hhao config contents ==='
+              for f in $(sudo grep -RIl 'hhao\.shuangdeng\.space' /etc /www /usr/local /opt 2>/dev/null | head -10); do
+                echo "----- $f -----"
+                sudo sed -n '1,220p' "$f"
+              done
+              echo '=== find pix config ==='
+              sudo grep -RIl 'pix\.shuangdeng\.space' /etc /www /usr/local /opt 2>/dev/null | head -20
+              echo '=== docker ports ==='
+              docker ps --format 'table {{.Names}}\t{{.Ports}}\t{{.Image}}' || true
+              echo '=== journal ==='
+              sudo journalctl -u openai-paypal-web -n 20 --no-pager || true
+            } >"$OUT" 2>&1
+            cat "$OUT"

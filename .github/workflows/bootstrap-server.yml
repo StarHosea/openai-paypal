@@ -42,7 +42,7 @@ jobs:
             git fetch origin main
             git reset --hard origin/main
             bash deploy/scripts/setup-server.sh
-            curl -fsS "http://127.0.0.1:8080/api/health"
+            curl -fsS "http://127.0.0.1:18080/api/health"
 
       - name: Verify public health endpoint
         run: |
