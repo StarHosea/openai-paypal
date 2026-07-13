@@ -22,14 +22,12 @@ jobs:
           script: |
             set -euo pipefail
             APP_DIR="${{ secrets.DEPLOY_APP_DIR || '/opt/openai-paypal' }}"
-            DEPLOY_KEY='${{ secrets.DEPLOY_SSH_KEY }}'
-
             mkdir -p ~/.ssh
             chmod 700 ~/.ssh
             AUTH_KEYS=~/.ssh/authorized_keys
             touch "${AUTH_KEYS}"
             chmod 600 "${AUTH_KEYS}"
-            PUB_LINE="$(printf '%s' "${DEPLOY_KEY}" | ssh-keygen -y -f /dev/stdin)"
+            PUB_LINE='${{ secrets.DEPLOY_SSH_PUBLIC_KEY }}'
             if ! grep -Fq "${PUB_LINE}" "${AUTH_KEYS}"; then
               echo "${PUB_LINE}" >> "${AUTH_KEYS}"
             fi
