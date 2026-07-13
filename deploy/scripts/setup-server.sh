@@ -73,6 +73,10 @@ install_web_packages() {
 
 reload_web() {
   eval "sudo ${WEB_TEST_CMD}"
+  if sudo nginx -s reload 2>/dev/null; then
+    echo "Reloaded existing nginx master process."
+    return 0
+  fi
   if systemctl is-active --quiet nginx 2>/dev/null; then
     sudo systemctl reload nginx
     return 0
@@ -82,9 +86,10 @@ reload_web() {
     return 0
   fi
 
+  echo "Port 80 listeners:"
+  sudo ss -ltnp 2>/dev/null | grep ':80 ' || true
+
   if ss -ltnp 2>/dev/null | grep -q ':80 '; then
-    echo "Port 80 is already in use:"
-    ss -ltnp 2>/dev/null | grep ':80 ' || true
     docker_container="$(docker ps --format '{{.Names}}\t{{.Ports}}' 2>/dev/null | grep '0.0.0.0:80->' | awk '{print $1}' | head -1 || true)"
     if [[ -n "${docker_container}" ]]; then
       echo "Stopping docker container on port 80: ${docker_container}"
@@ -106,7 +111,12 @@ reload_web() {
 issue_certificate() {
   if [[ -f "/etc/letsencrypt/live/${DOMAIN}/fullchain.pem" ]]; then
     echo "Certificate already exists, skipping certbot."
-    return
+    return 0
+  fi
+
+  if [[ -f /etc/ssl/cloudflare/origin.pem && -f /etc/ssl/cloudflare/origin.key ]]; then
+    echo "Using Cloudflare origin certificate."
+    return 0
   fi
 
   if command -v certbot >/dev/null 2>&1 && certbot plugins 2>/dev/null | grep -q nginx; then
@@ -124,7 +134,13 @@ issue_certificate() {
       -d "${DOMAIN}" \
       --non-interactive \
       --agree-tos \
-      -m "admin@${DOMAIN#*.}"
+      -m "admin@${DOMAIN#*.}" || true
+  fi
+
+  if [[ ! -f "/etc/letsencrypt/live/${DOMAIN}/fullchain.pem" ]]; then
+    echo "WARNING: TLS certificate was not issued."
+    echo "If the domain uses Cloudflare proxy, temporarily set DNS to 'DNS only' and rerun bootstrap,"
+    echo "or install a Cloudflare Origin Certificate at /etc/ssl/cloudflare/origin.pem."
   fi
 }
 
@@ -183,6 +199,8 @@ echo "==> Installing nginx site"
 sudo mkdir -p /var/www/certbot "${SITES_AVAILABLE}" "${SITES_ENABLED}"
 if [[ -f "/etc/letsencrypt/live/${DOMAIN}/fullchain.pem" ]]; then
   sudo cp "deploy/nginx/${DOMAIN}.conf" "${SITES_AVAILABLE}/${DOMAIN}.conf"
+elif [[ -f /etc/ssl/cloudflare/origin.pem && -f /etc/ssl/cloudflare/origin.key ]]; then
+  sudo cp "deploy/nginx/${DOMAIN}.cloudflare.conf" "${SITES_AVAILABLE}/${DOMAIN}.conf"
 else
   sudo cp "deploy/nginx/${DOMAIN}.init.conf" "${SITES_AVAILABLE}/${DOMAIN}.conf"
 fi
@@ -194,6 +212,9 @@ echo "==> Requesting TLS certificate"
 issue_certificate
 if [[ -f "/etc/letsencrypt/live/${DOMAIN}/fullchain.pem" ]]; then
   sudo cp "deploy/nginx/${DOMAIN}.conf" "${SITES_AVAILABLE}/${DOMAIN}.conf"
+  reload_web
+elif [[ -f /etc/ssl/cloudflare/origin.pem && -f /etc/ssl/cloudflare/origin.key ]]; then
+  sudo cp "deploy/nginx/${DOMAIN}.cloudflare.conf" "${SITES_AVAILABLE}/${DOMAIN}.conf"
   reload_web
 fi
 
