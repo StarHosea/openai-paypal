@@ -15,32 +15,22 @@ jobs:
           password: ${{ secrets.DEPLOY_SSH_PASSWORD }}
           port: ${{ secrets.DEPLOY_SSH_PORT || 22 }}
           script: |
-            OUT=/tmp/paypal-diagnose2.txt
+            OUT=/tmp/paypal-hao-diagnose.txt
             {
-              echo '=== 1panel conf.d ==='
-              ls -la /opt/1panel/www/conf.d/ || true
-              echo '=== list shuangdeng ==='
-              ls -la /opt/1panel/www/conf.d/*shuangdeng* 2>/dev/null || true
-              echo '=== find hhao again ==='
-              sudo find /opt/1panel -iname '*hhao*' 2>/dev/null | head -40
-              sudo grep -RIl 'hhao' /opt/1panel/www 2>/dev/null | head -20
-              echo '=== sample site configs ==='
-              for f in /opt/1panel/www/conf.d/*.conf; do
-                echo "FILE=$f"
-              done
-              echo '=== pix current ==='
-              sudo sed -n '1,260p' /opt/1panel/www/conf.d/pix.shuangdeng.space.conf || true
-              echo '=== first few other configs ==='
-              for f in $(ls /opt/1panel/www/conf.d/*.conf 2>/dev/null | head -5); do
+              echo '=== find hao ==='
+              sudo find /opt/1panel /etc /www -iname '*hao.shuangdeng*' 2>/dev/null | head -40
+              sudo grep -RIl 'hao\.shuangdeng\.space' /opt/1panel /etc/nginx /www 2>/dev/null | head -30
+              echo '=== conf.d listing ==='
+              ls -la /opt/1panel/www/conf.d/ 2>/dev/null || true
+              echo '=== hao config ==='
+              for f in $(sudo grep -RIl 'hao\.shuangdeng\.space' /opt/1panel /etc/nginx /www 2>/dev/null | head -15); do
                 echo "----- $f -----"
-                sudo sed -n '1,200p' "$f"
+                sudo sed -n '1,260p' "$f"
               done
+              echo '=== pix config ==='
+              sudo sed -n '1,260p' /opt/1panel/www/conf.d/pix.shuangdeng.space.conf 2>/dev/null || true
               echo '=== health ==='
-              curl -fsS http://127.0.0.1:18080/api/health || true
-              echo
-              echo '=== certs ==='
-              sudo ls -la /etc/letsencrypt/live/pix.shuangdeng.space/ 2>/dev/null || true
-              sudo ls -la /opt/1panel/www/sites/ 2>/dev/null | head || true
-              sudo find /opt/1panel -path '*pix*' 2>/dev/null | head -40
+              curl -fsS http://127.0.0.1:18080/api/health; echo
+              systemctl is-active openai-paypal-web; echo
             } >"$OUT" 2>&1
             cat "$OUT"
