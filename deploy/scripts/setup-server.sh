@@ -16,18 +16,79 @@ if [[ "${EUID}" -eq 0 ]]; then
   exit 1
 fi
 
+detect_web_stack() {
+  SITES_AVAILABLE="/etc/nginx/sites-available"
+  SITES_ENABLED="/etc/nginx/sites-enabled"
+  WEB_TEST_CMD="nginx -t"
+  WEB_RELOAD_CMD="systemctl reload nginx"
+
+  if systemctl is-active --quiet openresty 2>/dev/null || command -v openresty >/dev/null 2>&1; then
+    WEB_TEST_CMD="openresty -t"
+    WEB_RELOAD_CMD="systemctl reload openresty"
+    echo "Detected OpenResty as the active web server."
+    return
+  fi
+
+  if systemctl is-active --quiet nginx 2>/dev/null || command -v nginx >/dev/null 2>&1; then
+    echo "Detected Nginx as the active web server."
+    return
+  fi
+
+  echo "No active web server detected; nginx will be installed and started."
+}
+
+install_web_packages() {
+  local packages=(git python3 python3-venv python3-pip certbot curl ca-certificates)
+  if ! systemctl is-active --quiet openresty 2>/dev/null; then
+    packages+=(nginx python3-certbot-nginx)
+  fi
+  sudo apt-get update
+  sudo apt-get install -y "${packages[@]}"
+}
+
+reload_web() {
+  eval "sudo ${WEB_TEST_CMD}"
+  if systemctl is-active --quiet openresty 2>/dev/null; then
+    sudo systemctl reload openresty
+  elif systemctl is-active --quiet nginx 2>/dev/null; then
+    sudo systemctl reload nginx
+  elif systemctl list-unit-files | grep -q '^nginx.service'; then
+    sudo systemctl enable nginx
+    sudo systemctl restart nginx
+  else
+    sudo systemctl enable openresty
+    sudo systemctl restart openresty
+  fi
+}
+
+issue_certificate() {
+  if [[ -f "/etc/letsencrypt/live/${DOMAIN}/fullchain.pem" ]]; then
+    echo "Certificate already exists, skipping certbot."
+    return
+  fi
+
+  if command -v certbot >/dev/null 2>&1 && certbot plugins 2>/dev/null | grep -q nginx; then
+    sudo certbot --nginx \
+      -d "${DOMAIN}" \
+      --non-interactive \
+      --agree-tos \
+      -m "admin@${DOMAIN#*.}" \
+      --redirect || true
+  fi
+
+  if [[ ! -f "/etc/letsencrypt/live/${DOMAIN}/fullchain.pem" ]]; then
+    sudo certbot certonly --webroot \
+      -w /var/www/certbot \
+      -d "${DOMAIN}" \
+      --non-interactive \
+      --agree-tos \
+      -m "admin@${DOMAIN#*.}"
+  fi
+}
+
+detect_web_stack
 echo "==> Installing system packages"
-sudo apt-get update
-sudo apt-get install -y \
-  git \
-  python3 \
-  python3-venv \
-  python3-pip \
-  nginx \
-  certbot \
-  python3-certbot-nginx \
-  curl \
-  ca-certificates
+install_web_packages
 
 echo "==> Preparing app directory: ${APP_DIR}"
 sudo mkdir -p "${APP_DIR}"
@@ -36,7 +97,8 @@ sudo chown "${DEPLOY_USER}:${DEPLOY_USER}" "${APP_DIR}"
 if [[ ! -d "${APP_DIR}/.git" ]]; then
   git clone "${REPO_URL}" "${APP_DIR}"
 else
-  git -C "${APP_DIR}" pull --ff-only
+  git -C "${APP_DIR}" fetch origin main
+  git -C "${APP_DIR}" reset --hard origin/main
 fi
 
 cd "${APP_DIR}"
@@ -75,35 +137,25 @@ sudo systemctl enable "${SERVICE_NAME}"
 sudo systemctl restart "${SERVICE_NAME}"
 
 echo "==> Installing nginx site"
-sudo mkdir -p /var/www/certbot
+sudo mkdir -p /var/www/certbot "${SITES_AVAILABLE}" "${SITES_ENABLED}"
 if [[ -f "/etc/letsencrypt/live/${DOMAIN}/fullchain.pem" ]]; then
-  sudo cp "deploy/nginx/${DOMAIN}.conf" "/etc/nginx/sites-available/${DOMAIN}.conf"
+  sudo cp "deploy/nginx/${DOMAIN}.conf" "${SITES_AVAILABLE}/${DOMAIN}.conf"
 else
-  sudo cp "deploy/nginx/${DOMAIN}.init.conf" "/etc/nginx/sites-available/${DOMAIN}.conf"
+  sudo cp "deploy/nginx/${DOMAIN}.init.conf" "${SITES_AVAILABLE}/${DOMAIN}.conf"
 fi
-sudo ln -sf "/etc/nginx/sites-available/${DOMAIN}.conf" "/etc/nginx/sites-enabled/${DOMAIN}.conf"
-sudo rm -f /etc/nginx/sites-enabled/default
-sudo nginx -t
-sudo systemctl enable nginx
-sudo systemctl restart nginx
+sudo ln -sf "${SITES_AVAILABLE}/${DOMAIN}.conf" "${SITES_ENABLED}/${DOMAIN}.conf"
+sudo rm -f "${SITES_ENABLED}/default"
+reload_web
 
 echo "==> Requesting TLS certificate"
-if [[ ! -f "/etc/letsencrypt/live/${DOMAIN}/fullchain.pem" ]]; then
-  sudo certbot --nginx \
-    -d "${DOMAIN}" \
-    --non-interactive \
-    --agree-tos \
-    -m "admin@${DOMAIN#*.}" \
-    --redirect
-  sudo cp "deploy/nginx/${DOMAIN}.conf" "/etc/nginx/sites-available/${DOMAIN}.conf"
-  sudo nginx -t
-  sudo systemctl reload nginx
-else
-  echo "Certificate already exists, skipping certbot."
+issue_certificate
+if [[ -f "/etc/letsencrypt/live/${DOMAIN}/fullchain.pem" ]]; then
+  sudo cp "deploy/nginx/${DOMAIN}.conf" "${SITES_AVAILABLE}/${DOMAIN}.conf"
+  reload_web
 fi
 
-sudo systemctl enable certbot.timer
-sudo systemctl start certbot.timer
+sudo systemctl enable certbot.timer || true
+sudo systemctl start certbot.timer || true
 
 echo "==> Done"
 echo "Service: sudo systemctl status ${SERVICE_NAME}"

@@ -21,9 +21,14 @@ pip install -r requirements-headless.txt
 python -m playwright install chromium
 python -m playwright install-deps chromium || true
 
-if command -v nginx >/dev/null 2>&1; then
-  sudo nginx -t
-  sudo systemctl reload nginx
+if command -v nginx >/dev/null 2>&1 || command -v openresty >/dev/null 2>&1; then
+  if systemctl is-active --quiet openresty 2>/dev/null; then
+    sudo openresty -t
+    sudo systemctl reload openresty
+  elif systemctl is-active --quiet nginx 2>/dev/null; then
+    sudo nginx -t
+    sudo systemctl reload nginx
+  fi
 fi
 
 sudo systemctl daemon-reload
