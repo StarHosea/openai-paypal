@@ -73,17 +73,34 @@ install_web_packages() {
 
 reload_web() {
   eval "sudo ${WEB_TEST_CMD}"
+  if systemctl is-active --quiet nginx 2>/dev/null; then
+    sudo systemctl reload nginx
+    return 0
+  fi
   if systemctl is-active --quiet openresty 2>/dev/null; then
     sudo systemctl reload openresty
-  elif systemctl is-active --quiet nginx 2>/dev/null; then
-    sudo systemctl reload nginx
-  elif systemctl list-unit-files | grep -q '^nginx.service'; then
-    sudo systemctl enable nginx
-    sudo systemctl restart nginx
-  else
-    sudo systemctl enable openresty
-    sudo systemctl restart openresty
+    return 0
   fi
+
+  if ss -ltnp 2>/dev/null | grep -q ':80 '; then
+    echo "Port 80 is already in use:"
+    ss -ltnp 2>/dev/null | grep ':80 ' || true
+    docker_container="$(docker ps --format '{{.Names}}\t{{.Ports}}' 2>/dev/null | grep '0.0.0.0:80->' | awk '{print $1}' | head -1 || true)"
+    if [[ -n "${docker_container}" ]]; then
+      echo "Stopping docker container on port 80: ${docker_container}"
+      docker stop "${docker_container}" || true
+    fi
+  fi
+
+  if systemctl list-unit-files 2>/dev/null | grep -q '^nginx\.service'; then
+    if sudo systemctl enable nginx && sudo systemctl restart nginx; then
+      echo "Started nginx."
+      return 0
+    fi
+  fi
+
+  echo "WARNING: Could not activate nginx/openresty. Web UI remains on http://127.0.0.1:8080"
+  return 0
 }
 
 issue_certificate() {
